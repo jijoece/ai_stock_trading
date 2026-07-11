@@ -1,0 +1,36 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RedditRecord",
+  "type": "object",
+  "required": ["source_type", "subreddit", "post_id", "title", "body", "author_hash", "created_at", "retrieved_at", "score", "comment_count", "permalink", "query", "sort", "is_comment"],
+  "additionalProperties": false,
+  "properties": {
+    "source_type": {"const": "reddit"},
+    "subreddit": {"type": "string"},
+    "post_id": {"type": "string"},
+    "comment_id": {"type": ["string", "null"]},
+    "title": {"type": "string"},
+    "body": {"type": "string"},
+    "author_hash": {"type": "string"},
+    "created_at": {"type": "string"},
+    "retrieved_at": {"type": "string"},
+    "score": {"type": "integer"},
+    "comment_count": {"type": "integer"},
+    "permalink": {"type": "string"},
+    "query": {"type": "string"},
+    "sort": {"type": "string"},
+    "time_filter": {"type": "string"},
+    "is_comment": {"type": "boolean"},
+    "parent_id": {"type": ["string", "null"]},
+    "injection": {
+      "type": "object",
+      "required": ["prompt_injection_risk", "matched_patterns", "safe_for_summarization"],
+      "additionalProperties": false,
+      "properties": {
+        "prompt_injection_risk": {"enum": ["none", "low", "medium", "high"]},
+        "matched_patterns": {"type": "array", "items": {"type": "string"}},
+        "safe_for_summarization": {"type": "boolean"}
+      }
+    }
+  }
+}

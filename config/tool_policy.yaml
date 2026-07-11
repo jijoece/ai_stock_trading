@@ -1,0 +1,112 @@
+# Deterministic MCP tool classification policy.
+#
+# Precedence per server: denylist_patterns (substring match, case-insensitive)
+# always wins > allowlist (exact name match) > read_name_patterns (prefix/substring
+# heuristic) > unknown fallback. Unknown tools are always prohibited — this project
+# fails closed, not open, on anything it cannot positively classify as read-only.
+
+robinhood:
+  allowlist:
+    - get_accounts
+    - get_earnings_calendar
+    - get_earnings_results
+    - get_equity_fundamentals
+    - get_equity_historicals
+    - get_equity_orders
+    - get_equity_positions
+    - get_equity_quotes
+    - get_equity_tax_lots
+    - get_equity_technical_indicators
+    - get_equity_tradability
+    - get_index_quotes
+    - get_indexes
+    - get_option_chains
+    - get_option_historicals
+    - get_option_instruments
+    - get_option_orders
+    - get_option_positions
+    - get_option_quotes
+    - get_option_watchlist
+    - get_pnl_trade_history
+    - get_popular_watchlists
+    - get_portfolio
+    - get_realized_pnl
+    - get_scans
+    - get_watchlist_items
+    - get_watchlists
+    - search
+    - run_scan
+    - get_equity_orders
+    - get_option_orders
+  denylist_patterns:
+    - place
+    - submit
+    - execute
+    - buy
+    - sell
+    - cancel
+    - replace
+    - review
+    - transfer
+    - deposit
+    - withdraw
+    - create_order
+    - preview_order
+    - modify_watchlist
+    - add_to_watchlist
+    - remove_from_watchlist
+    - add_option_to_watchlist
+    - remove_option_from_watchlist
+    - create_watchlist
+    - update_watchlist
+    - follow_watchlist
+    - unfollow_watchlist
+    - create_scan
+    - update_scan
+    - delete
+    - close_position
+
+reddit:
+  allowlist:
+    - search_reddit
+    - browse_subreddit
+    - get_top_posts
+    - get_reddit_post
+    - get_post_comments
+    - get_more_comments
+    - get_subreddit_info
+    - get_subreddit_rules
+    - get_user_info
+    - get_user_posts
+    - get_user_comments
+    - get_trending_subreddits
+    - get_post_flairs
+    - get_me
+    - get_my_overview
+    - get_my_saved
+    - test_reddit_mcp_server
+  denylist_patterns:
+    - create_post
+    - reply_to_post
+    - reply
+    - edit_post
+    - edit_comment
+    - delete_post
+    - delete_comment
+    - vote
+    - message
+    - moderat
+    - ban
+    - report
+    - submit
+
+# Fallback heuristics applied only when a tool is on neither list for its server,
+# used to explain (not to grant research access to) borderline tools.
+read_name_patterns:
+  - get_
+  - search_
+  - list_
+  - browse_
+  - fetch_
+  - describe_
+  - inspect_

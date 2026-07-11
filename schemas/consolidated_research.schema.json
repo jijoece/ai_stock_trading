@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ConsolidatedResearch",
+  "type": "object",
+  "required": ["run_id", "generated_at", "workstreams", "conflicts", "source_index", "open_questions"],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string"},
+    "generated_at": {"type": "string"},
+    "workstreams": {"type": "array", "items": {"type": "object"}},
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["topic", "position_a", "position_b"],
+        "properties": {
+          "topic": {"type": "string"},
+          "position_a": {"type": "string"},
+          "position_b": {"type": "string"},
+          "source_ids_a": {"type": "array", "items": {"type": "string"}},
+          "source_ids_b": {"type": "array", "items": {"type": "string"}},
+          "workstream_a": {"type": "string"},
+          "workstream_b": {"type": "string"},
+          "recommended_resolution": {"type": "string"},
+          "remaining_uncertainty": {"type": "string"}
+        }
+      }
+    },
+    "source_index": {"type": "array", "items": {"type": "object"}},
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "invalid_workstreams": {"type": "array", "items": {"type": "object"}}
+  }
+}

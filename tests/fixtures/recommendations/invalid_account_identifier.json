@@ -1,0 +1,59 @@
+{
+  "rec_id": "fx-1006",
+  "run_id": "run-fx-1",
+  "symbol": "SOFI",
+  "side": "buy_candidate",
+  "ts": "2026-07-11T14:00:00+00:00",
+  "price_at_rec": 14.25,
+  "score": 62.5,
+  "confidence": "low",
+  "status": "active",
+  "acted": false,
+  "rationale_text": "Fixture record for schema validation tests.",
+  "factors": [
+    {
+      "factor": "revenue_growth_yoy",
+      "raw_value": 0.31,
+      "normalized": 0.62,
+      "weight": 0.35,
+      "contribution": 21.7
+    },
+    {
+      "factor": "reddit_net_sentiment",
+      "raw_value": 0.2,
+      "normalized": 0.2,
+      "weight": 0.1,
+      "contribution": 2.0
+    }
+  ],
+  "risk_plan": {
+    "shares": 70,
+    "entry_price": 14.25,
+    "stop_price": 13.11,
+    "target_price": 16.53,
+    "risk_per_share": 1.14,
+    "dollars_at_risk": 79.8,
+    "position_value": 997.5,
+    "reward_risk": 2.0,
+    "warnings": []
+  },
+  "warnings": [],
+  "missing_data_reasons": [],
+  "data_timestamps": {
+    "quote(fixture)": "2026-07-11T13:59:00+00:00"
+  },
+  "reddit_component": {
+    "weight": 0.1,
+    "net_sentiment": 0.2,
+    "total_mentions": 12,
+    "unique_authors": 9,
+    "note": "sentiment, not fact; untrusted source; capped at 10% of score"
+  },
+  "model_version": "poc-0.1",
+  "prompt_version": "none-deterministic",
+  "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "frozen": true,
+  "disclaimer": "Research output only. Not financial advice. Not an instruction to trade.",
+  "account_id": "RH-000000"
+}

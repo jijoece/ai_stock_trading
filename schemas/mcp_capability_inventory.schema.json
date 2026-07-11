@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "McpCapabilityInventory",
+  "type": "object",
+  "required": ["server_name", "transport", "authentication", "tools", "inventory_timestamp", "warnings"],
+  "additionalProperties": false,
+  "properties": {
+    "server_name": {"type": "string"},
+    "transport": {"enum": ["stdio", "streamable_http", "sse", "unknown"]},
+    "endpoint": {"type": ["string", "null"]},
+    "authentication": {"enum": ["oauth", "bearer", "none", "unknown"]},
+    "tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "description", "classification", "risk", "allowed_for_research", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {"type": "string"},
+          "description": {"type": "string"},
+          "classification": {"enum": ["read", "write", "unknown"]},
+          "risk": {"enum": ["low", "medium", "high", "prohibited"]},
+          "allowed_for_research": {"type": "boolean"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "inventory_timestamp": {"type": "string"},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

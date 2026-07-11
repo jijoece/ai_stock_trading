@@ -1,0 +1,31 @@
+{
+  "rec_id": "fx-0002",
+  "run_id": "run-fx-1",
+  "symbol": "XXXXX",
+  "side": "no_action",
+  "ts": "2026-07-11T14:00:00+00:00",
+  "price_at_rec": null,
+  "score": null,
+  "confidence": null,
+  "status": "active",
+  "acted": false,
+  "rationale_text": "Fixture record for schema validation tests.",
+  "factors": [],
+  "risk_plan": null,
+  "warnings": [
+    "ZZZZZ is not in the verified ticker universe \u2014 rejected"
+  ],
+  "missing_data_reasons": [
+    "symbol not in verified ticker universe"
+  ],
+  "data_timestamps": {
+    "quote(fixture)": "2026-07-11T13:59:00+00:00"
+  },
+  "reddit_component": null,
+  "model_version": "poc-0.1",
+  "prompt_version": "none-deterministic",
+  "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "frozen": true,
+  "disclaimer": "Research output only. Not financial advice. Not an instruction to trade."
+}

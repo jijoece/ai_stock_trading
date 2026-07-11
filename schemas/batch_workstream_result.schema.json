@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "BatchWorkstreamResult",
+  "type": "object",
+  "required": ["workstream_id", "title", "summary", "confirmed_facts", "reddit_observations", "contradictions", "recommendations", "risks", "open_questions", "sources"],
+  "additionalProperties": false,
+  "properties": {
+    "workstream_id": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "summary": {"type": "string"},
+    "confirmed_facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["claim", "evidence", "source_ids", "source_type", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "claim": {"type": "string"},
+          "evidence": {"type": "string"},
+          "source_ids": {"type": "array", "items": {"type": "string"}},
+          "source_type": {"enum": ["official", "repository", "paper", "reddit", "other"]},
+          "confidence": {"enum": ["high", "medium", "low"]},
+          "limitations": {"type": "string"}
+        }
+      }
+    },
+    "reddit_observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["observation", "source_ids", "support_level", "subreddits", "approximate_dates", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "observation": {"type": "string"},
+          "source_ids": {"type": "array", "items": {"type": "string"}},
+          "support_level": {"enum": ["repeated", "single-opinion", "disputed"]},
+          "subreddits": {"type": "array", "items": {"type": "string"}},
+          "approximate_dates": {"type": "array", "items": {"type": "string"}},
+          "potential_bias": {"type": "string"},
+          "confidence": {"enum": ["high", "medium", "low"]}
+        }
+      }
+    },
+    "contradictions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["topic", "position_a", "position_b", "source_ids_a", "source_ids_b"],
+        "additionalProperties": false,
+        "properties": {
+          "topic": {"type": "string"},
+          "position_a": {"type": "string"},
+          "position_b": {"type": "string"},
+          "source_ids_a": {"type": "array", "items": {"type": "string"}},
+          "source_ids_b": {"type": "array", "items": {"type": "string"}},
+          "assessment": {"type": "string"}
+        }
+      }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["recommendation", "rationale", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "recommendation": {"type": "string"},
+          "rationale": {"type": "string"},
+          "confidence": {"enum": ["high", "medium", "low"]},
+          "dependencies": {"type": "array", "items": {"type": "string"}},
+          "risks": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["risk", "severity", "likelihood"],
+        "additionalProperties": false,
+        "properties": {
+          "risk": {"type": "string"},
+          "severity": {"enum": ["low", "medium", "high", "critical"]},
+          "likelihood": {"enum": ["low", "medium", "high"]},
+          "mitigation": {"type": "string"}
+        }
+      }
+    },
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source_id", "title", "source_type", "reliability", "verified_or_anecdotal"],
+        "additionalProperties": false,
+        "properties": {
+          "source_id": {"type": "string"},
+          "title": {"type": "string"},
+          "url": {"type": "string"},
+          "date": {"type": "string"},
+          "source_type": {"type": "string"},
+          "reliability": {"enum": ["high", "medium", "low"]},
+          "verified_or_anecdotal": {"enum": ["verified", "anecdotal", "mixed"]},
+          "key_finding": {"type": "string"}
+        }
+      }
+    }
+  }
+}
