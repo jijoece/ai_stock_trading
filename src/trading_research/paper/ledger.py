@@ -133,6 +133,56 @@ class PaperLedger:
         """
         if qty <= 0:
             raise LedgerError("qty must be positive")
+        price, half_spread, slip = self.fill_model.fill_price(side, bid, ask)
+        return self._apply_fill(
+            symbol, side, qty, price, idempotency_key, rec_id=rec_id, stop=stop, target=target,
+            spread_cost_per_share=half_spread, slippage_cost_per_share=slip, now=now,
+        )
+
+    def apply_external_fill(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        idempotency_key: str,
+        rec_id: str | None = None,
+        now: datetime | None = None,
+    ) -> dict:
+        """Apply one fill whose price was already determined externally
+        (Milestone 3: a normalized `PaperExecutionEvent.fill_price` from the
+        LumiBot paper adapter or its deterministic test double) — as opposed
+        to `submit_and_fill`, which derives the price itself from a bid/ask
+        quote via `self.fill_model`.
+
+        Shares the same cash/position bookkeeping, idempotency-key dedup
+        (`DuplicateOrderError`), and T+1 settlement as `submit_and_fill` —
+        only the price source differs, so ledger invariants are identical.
+        No spread/slippage cost is recorded here: any such cost is already
+        embedded in the externally-supplied `price` by the adapter that
+        produced it.
+        """
+        if qty <= 0:
+            raise LedgerError("qty must be positive")
+        if price <= 0:
+            raise LedgerError(f"invalid external fill price {price}")
+        return self._apply_fill(symbol, side, qty, price, idempotency_key, rec_id=rec_id, now=now)
+
+    def _apply_fill(
+        self,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        idempotency_key: str,
+        *,
+        rec_id: str | None = None,
+        stop: float | None = None,
+        target: float | None = None,
+        spread_cost_per_share: float = 0.0,
+        slippage_cost_per_share: float = 0.0,
+        now: datetime | None = None,
+    ) -> dict:
         now = now or datetime.now(timezone.utc)
         self.settle(now)
 
@@ -143,7 +193,6 @@ class PaperLedger:
         if dup is not None:
             raise DuplicateOrderError(f"idempotency key {idempotency_key!r} already used")
 
-        price, half_spread, slip = self.fill_model.fill_price(side, bid, ask)
         state = self._load_cash()
 
         pos = self.conn.execute(
@@ -178,7 +227,7 @@ class PaperLedger:
         self.conn.execute(
             "INSERT INTO simulated_fills (order_id, ts, price, qty, spread_cost, slippage_cost) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, ts, price, qty, half_spread * qty, slip * qty),
+            (order_id, ts, price, qty, spread_cost_per_share * qty, slippage_cost_per_share * qty),
         )
 
         # Position update
@@ -217,8 +266,8 @@ class PaperLedger:
             "side": side,
             "qty": qty,
             "fill_price": round(price, 4),
-            "spread_cost": round(half_spread * qty, 4),
-            "slippage_cost": round(slip * qty, 4),
+            "spread_cost": round(spread_cost_per_share * qty, 4),
+            "slippage_cost": round(slippage_cost_per_share * qty, 4),
         }
 
     # -- reporting -----------------------------------------------------------

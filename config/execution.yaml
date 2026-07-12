@@ -1,0 +1,29 @@
+# Paper-execution and trading-mode policy (Milestone 3, architecture §12/§21).
+#
+# `trading_mode` gates every execution code path (services/
+# execute_paper_recommendation.py, execution/live_gateway.py). An absent or
+# unrecognized value fails closed — it is never interpreted as "live".
+# Not overridable by an LLM, Reddit content, runtime natural language, or an
+# environment variable (see execution/config.py::load_execution_config —
+# there is deliberately no os.environ read for trading_mode or
+# live_trading_enabled).
+version: 1
+
+trading_mode: paper              # only "paper" is implemented; anything else fails closed
+live_trading_enabled: false      # hard-coded off for this milestone; see execution/live_gateway.py
+human_approval_required: true    # reserved for the future live-execution slice
+
+# Global paper-execution kill switch. When true, execute_paper_recommendation
+# rejects every recommendation regardless of eligibility, before an intent is
+# ever built.
+kill_switch_enabled: false
+
+paper_execution:
+  policy_version: "milestone3-0.1"
+  execution_version: "lumibot-paper-0.1"
+  # How long a frozen recommendation remains eligible for paper execution
+  # after its `ts` (recommendation freeze time).
+  recommendation_ttl_minutes: 60
+  # Required freshness of the recommendation's recorded market-data
+  # timestamp (data_timestamps.market) at the moment of paper execution.
+  max_price_staleness_seconds: 900.0

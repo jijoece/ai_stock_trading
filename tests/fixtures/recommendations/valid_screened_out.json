@@ -1,0 +1,29 @@
+{
+  "rec_id": "fx-0003",
+  "run_id": "run-fx-1",
+  "symbol": "SHELX",
+  "side": "screened_out",
+  "ts": "2026-07-11T14:00:00+00:00",
+  "price_at_rec": null,
+  "score": null,
+  "confidence": null,
+  "status": "active",
+  "acted": false,
+  "rationale_text": "Fixture record for schema validation tests: screener excluded this candidate.",
+  "factors": [],
+  "risk_plan": null,
+  "warnings": [
+    "screened out: exclude_shell_company (shell_company_flag=True)"
+  ],
+  "missing_data_reasons": [],
+  "data_timestamps": {
+    "fundamentals(fixture)": "2026-07-11T13:59:00+00:00"
+  },
+  "reddit_component": null,
+  "model_version": "poc-0.1",
+  "prompt_version": "none-deterministic",
+  "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "frozen": true,
+  "disclaimer": "Research output only. Not financial advice. Not an instruction to trade."
+}

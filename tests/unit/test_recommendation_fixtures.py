@@ -26,6 +26,7 @@ VALID_FIXTURES = [
     "valid_active_buy_candidate.json",
     "valid_no_action.json",
     "valid_analysis_incomplete.json",
+    "valid_screened_out.json",
 ]
 
 INVALID_FIXTURES = [
@@ -38,6 +39,7 @@ INVALID_FIXTURES = [
     "invalid_missing_git_sha.json",
     "invalid_bad_symbol.json",
     "invalid_wrong_disclaimer.json",
+    "invalid_screened_out_with_risk_plan.json",
 ]
 
 

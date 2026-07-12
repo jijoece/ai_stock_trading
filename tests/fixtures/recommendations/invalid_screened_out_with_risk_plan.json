@@ -1,0 +1,37 @@
+{
+  "rec_id": "fx-0004",
+  "run_id": "run-fx-1",
+  "symbol": "SHELX",
+  "side": "screened_out",
+  "ts": "2026-07-11T14:00:00+00:00",
+  "price_at_rec": 3.5,
+  "score": null,
+  "confidence": null,
+  "status": "active",
+  "acted": false,
+  "rationale_text": "Invalid fixture: a screened-out result must never carry executable order details.",
+  "factors": [],
+  "risk_plan": {
+    "shares": 10,
+    "entry_price": 3.5,
+    "stop_price": 3.2,
+    "target_price": 4.1,
+    "risk_per_share": 0.3,
+    "dollars_at_risk": 3.0,
+    "position_value": 35.0,
+    "reward_risk": 2.0,
+    "warnings": []
+  },
+  "warnings": [],
+  "missing_data_reasons": [],
+  "data_timestamps": {
+    "fundamentals(fixture)": "2026-07-11T13:59:00+00:00"
+  },
+  "reddit_component": null,
+  "model_version": "poc-0.1",
+  "prompt_version": "none-deterministic",
+  "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "git_sha": "0123456789abcdef0123456789abcdef01234567",
+  "frozen": true,
+  "disclaimer": "Research output only. Not financial advice. Not an instruction to trade."
+}

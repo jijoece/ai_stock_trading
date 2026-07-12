@@ -185,6 +185,9 @@ def analyze(symbol: str) -> dict:
                 stop_price=stop,
                 price_as_of_epoch=quote.as_of_epoch,
                 now_epoch=now,
+                existing_position_shares=0,
+                portfolio_exposure_fraction=0.0,
+                account_state_as_of_epoch=account["as_of_epoch"],
                 avg_daily_dollar_volume=(fundamentals or {}).get("avg_daily_dollar_volume"),
                 days_to_earnings=(fundamentals or {}).get("days_to_earnings"),
                 earnings_date_known=bool(fundamentals and "days_to_earnings" in fundamentals),
@@ -222,6 +225,91 @@ def analyze(symbol: str) -> dict:
     return rec
 
 
+def execute_paper(recommendation_id: str, db_path: Path) -> dict:
+    """Milestone 3 CLI entry point: run one frozen recommendation through
+    paper-execution eligibility, intent construction, a deterministic paper
+    fill, ledger update, and reconciliation.
+
+    Uses `runtime.deterministic_adapter.DeterministicPaperAdapter`,
+    auto-registered here to fill immediately at the recommendation's own
+    `price_at_rec` — a deterministic, offline stand-in, NOT a real LumiBot
+    broker round trip (that requires credentials/network this CLI does not
+    have; see `runtime/lumibot/adapter.py` and
+    docs/milestone3-lumibot-paper-integration.md). This is disclosed in the
+    returned dict's `adapter` field, never presented as a real fill.
+    """
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from .execution.adapter_protocol import BrokerExecutionSnapshot
+    from .execution.config import load_execution_config
+    from .execution.eligibility import PaperExecutionEligibilityPolicy
+    from .execution.models import PaperExecutionEvent, PaperExecutionResult, derive_intent_id
+    from .paper.ledger import PaperLedger
+    from .runtime.deterministic_adapter import DeterministicPaperAdapter
+    from .services.execute_paper_recommendation import (
+        RecommendationNotFoundError,
+        execute_paper_recommendation,
+    )
+    from .storage.trading_repositories import load_recommendation
+    from .universe.tickers import default_universe
+
+    exec_config = load_execution_config()  # fails closed if trading_mode != paper (see execution/config.py)
+    now = datetime.now(timezone.utc)
+
+    with session(db_path) as conn:
+        recommendation = load_recommendation(conn, recommendation_id)
+        adapter = DeterministicPaperAdapter()
+
+        if recommendation is not None:
+            intent_id = derive_intent_id(recommendation_id, exec_config.execution_version)
+            risk_plan = recommendation.get("risk_plan") or {}
+            quantity = risk_plan.get("shares")
+            price = recommendation.get("price_at_rec")
+            if quantity and price:
+                price_dec = Decimal(str(price))
+                event = PaperExecutionEvent(
+                    event_id=f"{intent_id}-cli-fill-1", intent_id=intent_id,
+                    recommendation_id=recommendation_id, symbol=recommendation["symbol"],
+                    event_type="FILLED", broker_order_id=f"cli-sim-{intent_id}", quantity=quantity,
+                    filled_quantity=quantity, fill_price=price_dec, occurred_at=now, raw_status="fill",
+                )
+                result = PaperExecutionResult(
+                    intent_id=intent_id, recommendation_id=recommendation_id, final_status="FILLED",
+                    requested_quantity=quantity, filled_quantity=quantity, average_fill_price=price_dec,
+                    fees=Decimal("0"), event_ids=(event.event_id,), completed_at=now,
+                )
+                adapter.register(intent_id, (event,), result)
+                adapter.register_reconciliation(
+                    intent_id,
+                    BrokerExecutionSnapshot(
+                        intent_id=intent_id, broker_quantity=quantity, broker_notional=price_dec * quantity,
+                        broker_status="fill", as_of=now,
+                    ),
+                )
+
+        ledger = PaperLedger(conn)
+        policy = PaperExecutionEligibilityPolicy(universe=default_universe(), config=exec_config)
+
+        try:
+            outcome = execute_paper_recommendation(
+                recommendation_id, conn=conn, execution_config=exec_config, ledger=ledger, adapter=adapter,
+                eligibility_policy=policy, git_sha=_git_sha(), clock=lambda: now,
+            )
+        except RecommendationNotFoundError as exc:
+            return {"mode": exec_config.trading_mode, "error": str(exc)}
+
+        return {
+            "mode": exec_config.trading_mode,
+            "adapter": "deterministic-cli-simulator (not a real LumiBot broker round trip)",
+            "status": outcome.status,
+            "eligibility_reasons": list(outcome.eligibility.reasons) if outcome.eligibility else [],
+            "intent_id": outcome.intent.intent_id if outcome.intent else None,
+            "result_status": outcome.result.final_status if outcome.result else None,
+            "reconciliation_status": outcome.reconciliation.status if outcome.reconciliation else None,
+        }
+
+
 def paper_status(db_path: Path) -> dict:
     from .paper.ledger import PaperLedger
 
@@ -247,6 +335,11 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("paper-status", help="Show paper ledger state")
 
+    p_execute_paper = sub.add_parser(
+        "execute-paper", help="Run one frozen recommendation through paper execution (Milestone 3)"
+    )
+    p_execute_paper.add_argument("--recommendation-id", required=True)
+
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
@@ -264,6 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         print(json.dumps(paper_status(cfg.research_database_path), indent=2, default=str))
         return 0
+
+    if args.command == "execute-paper":
+        cfg = load_config()
+        outcome = execute_paper(args.recommendation_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
 
     return 1
 

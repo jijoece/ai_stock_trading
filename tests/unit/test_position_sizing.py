@@ -17,6 +17,9 @@ def base_inputs(**overrides) -> RiskInputs:
         stop_price=18.0,
         price_as_of_epoch=NOW - 10,
         now_epoch=NOW,
+        existing_position_shares=0,
+        portfolio_exposure_fraction=0.0,
+        account_state_as_of_epoch=NOW - 10,
         earnings_date_known=True,
         days_to_earnings=30.0,
     )
@@ -98,3 +101,96 @@ def test_sector_concentration_blocks_entry():
 def test_zero_settled_cash_no_shares():
     plan = compute_position_plan(base_inputs(settled_cash=0.0))
     assert plan.shares == 0 and not plan.actionable
+
+
+def test_unknown_current_position_fails_closed():
+    with pytest.raises(IncompleteStateError, match="existing_position_shares"):
+        compute_position_plan(base_inputs(existing_position_shares=None))
+
+
+def test_unknown_portfolio_exposure_fails_closed():
+    with pytest.raises(IncompleteStateError, match="portfolio_exposure_fraction"):
+        compute_position_plan(base_inputs(portfolio_exposure_fraction=None))
+
+
+def test_stale_account_state_fails_closed():
+    with pytest.raises(IncompleteStateError, match="account state stale"):
+        compute_position_plan(base_inputs(account_state_as_of_epoch=NOW - 7200))
+
+
+def test_duplicate_position_blocks_entry():
+    plan = compute_position_plan(base_inputs(existing_position_shares=10))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "duplicate_position"
+
+
+def test_averaging_allowed_when_enabled():
+    plan = compute_position_plan(
+        base_inputs(existing_position_shares=10, allow_averaging_into_existing_position=True)
+    )
+    assert plan.shares == 250
+    assert plan.no_action_reason is None
+
+
+def test_portfolio_exposure_breach_blocks_entry():
+    plan = compute_position_plan(base_inputs(portfolio_exposure_fraction=0.95))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "portfolio_exposure_breach"
+
+
+def test_daily_loss_breach_blocks_entry():
+    plan = compute_position_plan(base_inputs(current_daily_loss_fraction=-0.05))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "daily_loss_breach"
+
+
+def test_drawdown_breach_blocks_entry():
+    plan = compute_position_plan(base_inputs(current_drawdown_fraction=-0.20))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "drawdown_breach"
+
+
+def test_wide_spread_blocks_entry():
+    plan = compute_position_plan(base_inputs(current_spread_bps=150.0))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "wide_spread"
+
+
+def test_reward_risk_below_floor_blocks_entry():
+    # entry 20, stop 18 -> risk/share 2; a technical target of 21 implies R:R 0.5,
+    # below the 2:1 floor, even though every other input is fine.
+    plan = compute_position_plan(base_inputs(technical_target_price=21.0))
+    assert plan.shares == 0
+    assert plan.no_action_reason == "reward_risk_below_floor"
+
+
+def test_technical_target_used_when_above_floor():
+    # target 30 -> R:R (30-20)/2 = 5.0, above the 2:1 floor -> honored as-is.
+    plan = compute_position_plan(base_inputs(technical_target_price=30.0))
+    assert plan.target_price == 30.0
+    assert plan.reward_risk == 5.0
+
+
+def test_stop_above_entry_has_reason_code():
+    plan = compute_position_plan(base_inputs(stop_price=21.0))
+    assert plan.no_action_reason == "stop_at_or_above_entry"
+
+
+def test_zero_shares_at_caps_has_reason_code():
+    plan = compute_position_plan(base_inputs(settled_cash=0.0))
+    assert plan.no_action_reason == "zero_shares_at_caps"
+
+
+def test_property_final_quantity_never_negative():
+    for equity in (0.0,):
+        pass  # account_equity <= 0 raises; covered separately.
+    plan = compute_position_plan(base_inputs(settled_cash=0.0))
+    assert plan.shares >= 0
+
+
+def test_property_position_value_never_exceeds_cap():
+    for equity in (5_000, 50_000, 500_000):
+        plan = compute_position_plan(
+            base_inputs(account_equity=float(equity), settled_cash=float(equity))
+        )
+        assert plan.position_value <= equity * 0.05 + 1e-9

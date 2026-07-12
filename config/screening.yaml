@@ -1,0 +1,38 @@
+# Version-controlled screening thresholds (architecture §14).
+#
+# The screener applies HARD eligibility gates only — it never ranks and
+# never produces a trade recommendation. Every gate in this file excludes a
+# candidate on failure (all gates are "hard" in this slice; see
+# docs/milestone2-analysis-layer.md for why no soft/warning-only gate is
+# implemented yet). Thresholds are not overridable by an LLM, Reddit
+# content, or runtime natural language — only by editing this file.
+version: 1
+
+# Price / liquidity / maturity gates
+max_share_price: 25.0
+min_market_cap: 150000000          # $150M
+min_avg_daily_dollar_volume: 2000000  # $2M
+min_operating_history_years: 1.0
+
+# Listing-quality gates
+exclude_otc: true
+exclude_inactive: true
+
+# Distress / integrity gates
+exclude_bankruptcy_or_distress: true
+exclude_going_concern_warning: true
+exclude_shell_company: true
+
+# Capital-structure gates
+exclude_recent_reverse_split: true
+max_dilution_share_growth_yoy: 0.20   # exclude if shares outstanding grew >20% YoY
+min_cash_runway_quarters: 4.0
+
+# Event / volatility / execution-quality gates
+earnings_blackout_days: 3.0           # exclude if inside N days of earnings
+max_realized_volatility: 0.08         # exclude if 20d daily-return stdev exceeds this
+exclude_recent_halt: true
+max_bid_ask_spread_bps: 100.0         # exclude if quoted spread exceeds 100bps (1%)
+
+# Data-quality gate
+max_data_staleness_seconds: 900.0     # 15 minutes

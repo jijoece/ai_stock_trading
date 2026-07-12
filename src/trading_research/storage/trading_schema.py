@@ -376,6 +376,15 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
     "recommendations": {
         "config_hash": "TEXT NOT NULL DEFAULT ''",
         "git_sha": "TEXT NOT NULL DEFAULT ''",
+        # Full frozen payload (risk_plan, warnings, missing_data_reasons,
+        # data_timestamps, reddit_component, disclaimer, ...) — the flat
+        # columns above never carried these, so Milestone 3's paper-execution
+        # eligibility/intent path (which needs risk_plan) has something to
+        # read back verbatim instead of reconstructing it lossily from
+        # recommendation_factors. NULL for any row written before this
+        # column existed; readers must treat NULL as "unavailable", never
+        # reconstruct a guessed payload.
+        "payload_json": "TEXT",
     },
     "reddit_ticker_mentions": {
         "span_start": "INTEGER",

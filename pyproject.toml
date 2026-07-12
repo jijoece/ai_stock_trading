@@ -20,6 +20,17 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
+# Milestone 3: LumiBot paper-execution runtime adapter, isolated behind
+# src/trading_research/runtime/lumibot/ (see docs/milestone3-lumibot-paper-integration.md).
+# Deliberately NOT a base dependency: lumibot pulls ~140 transitive packages
+# unrelated to this project (langchain, google-adk, kubernetes client,
+# openai, ...) and its own pins downgrade jsonschema/python-dotenv below the
+# floor declared above. Install in an isolated environment; the full test
+# suite never requires this extra (lumibot-specific tests use
+# pytest.importorskip).
+paper = [
+    "lumibot==4.5.74",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

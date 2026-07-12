@@ -4,6 +4,56 @@ Continue implementing the AI-driven stock research and paper-trading project usi
 * `docs/AI-Stock-Trading-Implementation-Plan.md`
 * `docs/AI-Stock-Trading-Research-Sources.md`
 
+## Verified baseline from the completed foundation slice
+
+The preceding implementation slice is complete, and 102 of 102 tests pass.
+
+Treat the following as the current repository baseline:
+
+* The research-pipeline table formerly named `recommendations` was renamed to `research_recommendations`.
+* The trading system owns the `recommendations` table keyed by `rec_id`.
+* A legacy shape-detection migration safely renames old research tables.
+* Do not reintroduce the previous table-name collision.
+* `database.connect()` applies both research and trading schemas.
+* Frozen recommendation rows are protected against UPDATE and DELETE by SQLite triggers.
+* The reserved `real_orders` table is protected against INSERT, UPDATE, and DELETE.
+* Preserve these protections and add regression tests if this slice touches them.
+* Trading recommendations already contain `config_hash` and `git_sha`.
+* The recommendation JSON schema already enforces:
+
+  * `ANALYSIS_INCOMPLETE` requires missing-data reasons.
+  * `ANALYSIS_INCOMPLETE` cannot contain a risk plan.
+  * `NO_ACTION` cannot contain a risk plan.
+* Use the existing schema rather than creating an incompatible replacement.
+* The verified ticker universe provides:
+
+  * `normalize_symbol()`
+  * `TickerUniverse.require()`
+  * `UnknownSymbolError`
+  * active/inactive and source metadata
+* The ticker extractor returns:
+
+  * start and end spans
+  * deterministic confidence category
+  * ambiguity status
+  * contextual-confirmation status
+  * rejection reason
+* Company-name token matching intentionally excludes the ticker symbol itself to prevent ambiguous symbols such as `ON` from self-confirming.
+* Preserve this behavior.
+* Existing recommendation fixtures include valid and invalid cases. Extend them rather than replacing them.
+* Run the existing 102-test suite before making changes and again after implementation.
+* Any regression in the foundation behavior must be fixed before completing this slice.
+
+This run implements only:
+
+* 1B.2 — deterministic sentiment aggregation
+* 1C.1 — screener
+* 1C.2 — composite scorer
+* 1C.3 — deterministic risk engine
+* 1C.4 — frozen recommendation builder and offline candidate-analysis service
+
+Do not proceed into simulated fills, paper-order execution, evaluator implementation, live market-data retrieval, or broker integration.
+
 This is the second implementation slice of Milestone 1.
 
 Run the task synchronously from beginning to end.

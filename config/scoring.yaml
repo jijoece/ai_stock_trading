@@ -1,0 +1,20 @@
+# Version-controlled composite-scoring weights (architecture §14).
+#
+# Weights must sum to exactly 1.0. `weights.reddit` is hard-capped at
+# `reddit_weight_cap` — the loader raises rather than silently renormalizing
+# a config that exceeds the cap (see scorer.py). Not overridable by an LLM,
+# Reddit content, or runtime natural language — only by editing this file.
+version: 1
+
+weights:
+  fundamentals: 0.35
+  technicals: 0.30
+  catalysts: 0.25
+  reddit: 0.10
+
+reddit_weight_cap: 0.10
+
+# Points-of-total-score threshold above which Reddit's contribution is
+# reported as having "materially changed" the score (see
+# CompositeScore.reddit_materially_changed_score).
+reddit_materiality_threshold_points: 2.0

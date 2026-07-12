@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from .execution_schema import apply_execution_schema
 from .migrations import apply_schema
 from .trading_schema import apply_trading_schema
 
@@ -16,6 +17,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     apply_schema(conn)
     apply_trading_schema(conn)
+    apply_execution_schema(conn)
     return conn
 
 
