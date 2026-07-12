@@ -39,3 +39,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+    "paper_broker: opt-in real credentialed paper-broker smoke test (Milestone 4) — requires RUN_PAPER_BROKER_TESTS=true and real Alpaca paper credentials; skipped by default, never run automatically just because credentials happen to be present.",
+]

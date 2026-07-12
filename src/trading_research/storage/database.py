@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from .evaluation_schema import apply_evaluation_schema
 from .execution_schema import apply_execution_schema
 from .migrations import apply_schema
 from .trading_schema import apply_trading_schema
@@ -18,6 +19,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     apply_schema(conn)
     apply_trading_schema(conn)
     apply_execution_schema(conn)
+    apply_evaluation_schema(conn)
     return conn
 
 

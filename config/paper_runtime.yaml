@@ -1,0 +1,49 @@
+# Isolated paper-broker runtime configuration (Milestone 4, docs/milestone-4.md
+# Step 14). Absent/unrecognized values fail closed — `mode` other than
+# "paper" and `real_money_enabled: true` are refused by
+# `runtime.paper_runtime_config.load_paper_runtime_config`, mirroring
+# `execution/config.py`'s posture for `trading_mode`/`live_trading_enabled`.
+# No environment variable can override `mode` or `real_money_enabled` here;
+# environment variables supply credentials only (see .env.example), never
+# new capabilities.
+version: 1
+
+paper_runtime:
+  protocol_version: paper-runtime.v1
+  transport: stdio
+  command:
+    - python3
+    - -m
+    - trading_paper_runtime
+  startup_timeout_seconds: 15
+  request_timeout_seconds: 30
+
+paper_broker:
+  provider: alpaca
+  mode: paper                 # only "paper" is implemented; anything else fails closed
+  real_money_enabled: false   # hard-coded off for this milestone
+  asset_types:
+    - equity
+  allowed_sides:
+    - BUY
+  allowed_order_types:
+    - LIMIT
+    - MARKET
+  allow_fractional: false
+  allow_shorting: false
+  allow_margin: false
+  allow_extended_hours: false
+
+order_monitoring:
+  poll_interval_seconds: 10
+  max_poll_attempts: 30
+  stale_order_minutes: 390
+
+evaluation:
+  benchmark: SPY
+  horizons_trading_days:
+    - 1
+    - 5
+    - 10
+    - 20
+    - 60

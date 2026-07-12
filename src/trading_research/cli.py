@@ -225,18 +225,239 @@ def analyze(symbol: str) -> dict:
     return rec
 
 
-def execute_paper(recommendation_id: str, db_path: Path) -> dict:
-    """Milestone 3 CLI entry point: run one frozen recommendation through
-    paper-execution eligibility, intent construction, a deterministic paper
-    fill, ledger update, and reconciliation.
+def _paper_runtime_command_env() -> dict:
+    """Adds this repository's `paper_runtime/src` to PYTHONPATH so the
+    default `config/paper_runtime.yaml` command (`python3 -m
+    trading_paper_runtime`) works out of the box in this development
+    checkout, without requiring a separate `pip install` step. A real
+    deployment overrides `paper_runtime.command` in the config to point at
+    an isolated virtualenv's interpreter instead — this convenience wiring
+    changes nothing about process isolation (the main process still never
+    imports lumibot itself)."""
+    import os
 
-    Uses `runtime.deterministic_adapter.DeterministicPaperAdapter`,
+    env = os.environ.copy()
+    paper_runtime_src = REPO_ROOT / "paper_runtime" / "src"
+    if paper_runtime_src.is_dir():
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(paper_runtime_src) + (os.pathsep + existing if existing else "")
+    return env
+
+
+def _build_runtime_client():
+    from .runtime.client.process_client import RuntimeClient
+    from .runtime.paper_runtime_config import load_paper_runtime_config
+
+    config = load_paper_runtime_config()
+    client = RuntimeClient(
+        command=list(config.command), startup_timeout_seconds=config.startup_timeout_seconds,
+        request_timeout_seconds=config.request_timeout_seconds, cwd=str(REPO_ROOT),
+        env=_paper_runtime_command_env(),
+    )
+    return client, config
+
+
+def paper_runtime_health() -> dict:
+    """`paper-runtime health` CLI command (docs/milestone-4.md Step 15).
+    Starts the isolated runtime, health-checks it, and reports the result —
+    never prints a credential value, only presence booleans (from the
+    runtime's own `health` response)."""
+    client, config = _build_runtime_client()
+    try:
+        client.start()
+    except Exception as exc:
+        return {"broker_provider": config.broker_provider, "available": False, "error": str(exc)}
+    try:
+        return {
+            "broker_provider": config.broker_provider, "available": True,
+            "health": client.last_health, "capabilities": client.last_capabilities,
+        }
+    finally:
+        client.shutdown()
+
+
+def sync_paper_orders_cli(db_path: Path) -> dict:
+    """`sync-paper-orders` CLI command (docs/milestone-4.md Step 15). One
+    bounded pass over every unresolved credentialed submission — does not
+    loop and does not imply this process keeps running after it exits."""
+    from datetime import datetime, timezone
+
+    from .paper.ledger import PaperLedger
+    from .services.sync_paper_orders import sync_paper_orders
+
+    client, _config = _build_runtime_client()
+    with session(db_path) as conn:
+        try:
+            client.start()
+        except Exception as exc:
+            return {"error": f"paper runtime unavailable: {exc}"}
+        try:
+            ledger = PaperLedger(conn)
+            outcomes = sync_paper_orders(
+                conn=conn, ledger=ledger, client=client, clock=lambda: datetime.now(timezone.utc),
+            )
+        finally:
+            client.shutdown()
+        return {
+            "synced": [
+                {
+                    "intent_id": o.intent_id, "outcome": o.outcome,
+                    "submission_status": o.submission_status, "new_events": o.new_events,
+                }
+                for o in outcomes
+            ]
+        }
+
+
+def reconcile_paper_cli(db_path: Path) -> dict:
+    """`reconcile-paper` CLI command (docs/milestone-4.md Step 15). Account
+    and per-symbol position reconciliation against the credentialed paper
+    broker — reports mismatches, never silently repairs them."""
+    from datetime import datetime, timezone
+
+    from .paper.ledger import PaperLedger
+    from .services.reconcile_paper import reconcile_paper_account_and_positions
+
+    client, _config = _build_runtime_client()
+    with session(db_path) as conn:
+        try:
+            client.start()
+        except Exception as exc:
+            return {"error": f"paper runtime unavailable: {exc}"}
+        try:
+            ledger = PaperLedger(conn)
+            report = reconcile_paper_account_and_positions(
+                conn=conn, ledger=ledger, client=client, clock=lambda: datetime.now(timezone.utc),
+            )
+        finally:
+            client.shutdown()
+        return {
+            "account": {
+                "status": report.account.status, "broker_cash": str(report.account.broker_cash),
+                "ledger_cash": str(report.account.ledger_cash), "reasons": list(report.account.reasons),
+            },
+            "positions": [
+                {
+                    "symbol": p.symbol, "status": p.status, "broker_quantity": str(p.broker_quantity),
+                    "ledger_quantity": str(p.ledger_quantity), "reasons": list(p.reasons),
+                }
+                for p in report.positions
+            ],
+        }
+
+
+def evaluate_recommendations_cli(db_path: Path, recommendation_ids: list[str]) -> dict:
+    """`evaluate-recommendations` CLI command (docs/milestone-4.md Step 15).
+
+    No live historical-price data source ships in this milestone (see
+    `evaluation/price_provider.py`'s module docstring) — this command uses
+    an empty `DeterministicPriceProvider` by default, so every horizon will
+    correctly report `DELISTED_OR_UNAVAILABLE`/missing-data rather than a
+    fabricated price. It exists to prove the persistence/orchestration path
+    end-to-end; a future milestone wires in a real point-in-time price
+    source without changing any other code in this path.
+    """
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from .evaluation.evaluation_service import evaluate_recommendation_all_horizons
+    from .evaluation.price_provider import DeterministicPriceProvider
+    from .execution.config import load_execution_config
+    from .runtime.paper_runtime_config import load_paper_runtime_config
+    from .storage import evaluation_repositories as eval_repo
+    from .storage import execution_repositories as exec_repo
+    from .storage.trading_repositories import load_recommendation
+
+    exec_config = load_execution_config()
+    runtime_config = load_paper_runtime_config()
+    now = datetime.now(timezone.utc)
+    price_provider = DeterministicPriceProvider()
+    results = {}
+
+    with session(db_path) as conn:
+        for rec_id in recommendation_ids:
+            recommendation = load_recommendation(conn, rec_id)
+            if recommendation is None:
+                results[rec_id] = {"error": "recommendation not found"}
+                continue
+
+            result = None
+            intent = exec_repo.get_intent_by_recommendation(conn, rec_id, exec_config.execution_version)
+            if intent is not None:
+                result = exec_repo.get_result(conn, intent.intent_id)
+
+            evaluations = evaluate_recommendation_all_horizons(
+                recommendation_id=rec_id, symbol=recommendation["symbol"],
+                recommendation_price=Decimal(str(recommendation["price_at_rec"])) if recommendation.get("price_at_rec") is not None else None,
+                execution_price=result.average_fill_price if result else None,
+                filled_quantity=result.filled_quantity if result else 0,
+                requested_quantity=result.requested_quantity if result else 0,
+                execution_completed_at=result.completed_at if result else None,
+                price_provider=price_provider, now=now,
+                horizons=runtime_config.evaluation_horizons_trading_days,
+                benchmark_symbol=runtime_config.evaluation_benchmark,
+                model_version=recommendation.get("model_version"), prompt_version=recommendation.get("prompt_version"),
+                config_hash=recommendation.get("config_hash"),
+            )
+            for evaluation in evaluations:
+                eval_repo.save_evaluation(conn, evaluation)
+            results[rec_id] = [
+                {"horizon_trading_days": e.horizon_trading_days, "status": e.status,
+                 "net_return": str(e.net_return) if e.net_return is not None else None}
+                for e in evaluations
+            ]
+
+    return {"benchmark": runtime_config.evaluation_benchmark, "evaluations": results}
+
+
+def paper_performance_cli(db_path: Path) -> dict:
+    """`paper-performance` CLI command (docs/milestone-4.md Step 15).
+    Aggregate metrics over every persisted evaluation — insufficient-data
+    and undefined metrics are reported explicitly, never as a misleading
+    zero (see `evaluation/metrics.py`)."""
+    from .evaluation import metrics
+    from .storage import evaluation_repositories as eval_repo
+
+    with session(db_path) as conn:
+        evaluations = eval_repo.list_all_evaluations(conn)
+
+    def _fmt(result) -> dict:
+        return {"status": result.status, "value": str(result.value) if result.value is not None else None,
+                "sample_size": result.sample_size, "reason": result.reason}
+
+    return {
+        "hit_rate": _fmt(metrics.hit_rate(evaluations)),
+        "average_return": _fmt(metrics.average_return(evaluations)),
+        "median_return": _fmt(metrics.median_return(evaluations)),
+        "gain_loss_ratio": _fmt(metrics.gain_loss_ratio(evaluations)),
+        "cumulative_return": _fmt(metrics.cumulative_return(evaluations)),
+        "benchmark_relative_cumulative_return": _fmt(metrics.benchmark_relative_cumulative_return(evaluations)),
+        "sharpe_ratio": _fmt(metrics.sharpe_ratio(evaluations)),
+        "sortino_ratio": _fmt(metrics.sortino_ratio(evaluations)),
+        "max_drawdown": _fmt(metrics.max_drawdown(evaluations)),
+        "calmar_ratio": _fmt(metrics.calmar_ratio(evaluations)),
+    }
+
+
+def execute_paper(recommendation_id: str, db_path: Path, *, adapter: str = "deterministic") -> dict:
+    """Milestone 3/4 CLI entry point: run one frozen recommendation through
+    paper-execution eligibility and intent construction, then either a
+    deterministic fill (`--adapter deterministic`, the default) or a real
+    credentialed paper-broker acknowledgement via the isolated runtime
+    process (`--adapter credentialed`, Milestone 4).
+
+    The deterministic path uses
+    `runtime.deterministic_adapter.DeterministicPaperAdapter`,
     auto-registered here to fill immediately at the recommendation's own
     `price_at_rec` — a deterministic, offline stand-in, NOT a real LumiBot
     broker round trip (that requires credentials/network this CLI does not
     have; see `runtime/lumibot/adapter.py` and
     docs/milestone3-lumibot-paper-integration.md). This is disclosed in the
     returned dict's `adapter` field, never presented as a real fill.
+
+    The credentialed path only acknowledges submission (docs/milestone-
+    4.md's asynchronous submit/poll split) — run `sync-paper-orders`
+    afterward to observe fills.
     """
     from datetime import datetime, timezone
     from decimal import Decimal
@@ -257,9 +478,40 @@ def execute_paper(recommendation_id: str, db_path: Path) -> dict:
     exec_config = load_execution_config()  # fails closed if trading_mode != paper (see execution/config.py)
     now = datetime.now(timezone.utc)
 
+    if adapter == "credentialed":
+        from .services.submit_credentialed_paper_order import submit_credentialed_paper_order
+
+        client, _runtime_config = _build_runtime_client()
+        with session(db_path) as conn:
+            try:
+                client.start()
+            except Exception as exc:
+                return {"mode": exec_config.trading_mode, "adapter": "credentialed", "error": f"paper runtime unavailable: {exc}"}
+            try:
+                policy = PaperExecutionEligibilityPolicy(universe=default_universe(), config=exec_config)
+                try:
+                    outcome = submit_credentialed_paper_order(
+                        recommendation_id, conn=conn, execution_config=exec_config, eligibility_policy=policy,
+                        client=client, git_sha=_git_sha(), clock=lambda: now,
+                    )
+                except RecommendationNotFoundError as exc:
+                    return {"mode": exec_config.trading_mode, "adapter": "credentialed", "error": str(exc)}
+            finally:
+                client.shutdown()
+            return {
+                "mode": exec_config.trading_mode,
+                "adapter": "credentialed-alpaca-paper (real broker acknowledgement via isolated runtime process)",
+                "status": outcome.status,
+                "eligibility_reasons": list(outcome.eligibility.reasons) if outcome.eligibility else [],
+                "intent_id": outcome.intent.intent_id if outcome.intent else None,
+                "client_order_id": outcome.submission.client_order_id if outcome.submission else None,
+                "broker_order_id": outcome.submission.broker_order_id if outcome.submission else None,
+                "submission_status": outcome.submission.submission_status if outcome.submission else None,
+            }
+
     with session(db_path) as conn:
         recommendation = load_recommendation(conn, recommendation_id)
-        adapter = DeterministicPaperAdapter()
+        adapter_impl = DeterministicPaperAdapter()
 
         if recommendation is not None:
             intent_id = derive_intent_id(recommendation_id, exec_config.execution_version)
@@ -279,8 +531,8 @@ def execute_paper(recommendation_id: str, db_path: Path) -> dict:
                     requested_quantity=quantity, filled_quantity=quantity, average_fill_price=price_dec,
                     fees=Decimal("0"), event_ids=(event.event_id,), completed_at=now,
                 )
-                adapter.register(intent_id, (event,), result)
-                adapter.register_reconciliation(
+                adapter_impl.register(intent_id, (event,), result)
+                adapter_impl.register_reconciliation(
                     intent_id,
                     BrokerExecutionSnapshot(
                         intent_id=intent_id, broker_quantity=quantity, broker_notional=price_dec * quantity,
@@ -293,7 +545,7 @@ def execute_paper(recommendation_id: str, db_path: Path) -> dict:
 
         try:
             outcome = execute_paper_recommendation(
-                recommendation_id, conn=conn, execution_config=exec_config, ledger=ledger, adapter=adapter,
+                recommendation_id, conn=conn, execution_config=exec_config, ledger=ledger, adapter=adapter_impl,
                 eligibility_policy=policy, git_sha=_git_sha(), clock=lambda: now,
             )
         except RecommendationNotFoundError as exc:
@@ -336,9 +588,27 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("paper-status", help="Show paper ledger state")
 
     p_execute_paper = sub.add_parser(
-        "execute-paper", help="Run one frozen recommendation through paper execution (Milestone 3)"
+        "execute-paper", help="Run one frozen recommendation through paper execution (Milestone 3/4)"
     )
     p_execute_paper.add_argument("--recommendation-id", required=True)
+    p_execute_paper.add_argument(
+        "--adapter", choices=("deterministic", "credentialed"), default="deterministic",
+        help="deterministic (default, offline) or credentialed (Milestone 4: real Alpaca paper "
+             "broker acknowledgement via the isolated runtime process)",
+    )
+
+    sub.add_parser("paper-runtime-health", help="Health-check the isolated LumiBot paper-runtime process (Milestone 4)")
+
+    sub.add_parser("sync-paper-orders", help="Poll the paper runtime for order-state changes and apply fills (Milestone 4)")
+
+    sub.add_parser("reconcile-paper", help="Reconcile account/positions against the credentialed paper broker (Milestone 4)")
+
+    p_evaluate = sub.add_parser(
+        "evaluate-recommendations", help="Compute forward-performance evaluations for recommendations (Milestone 4)"
+    )
+    p_evaluate.add_argument("--recommendation-id", action="append", dest="recommendation_ids", required=True)
+
+    sub.add_parser("paper-performance", help="Aggregate portfolio/strategy metrics over evaluations (Milestone 4)")
 
     args = parser.parse_args(argv)
 
@@ -360,9 +630,38 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "execute-paper":
         cfg = load_config()
-        outcome = execute_paper(args.recommendation_id, cfg.research_database_path)
+        outcome = execute_paper(args.recommendation_id, cfg.research_database_path, adapter=args.adapter)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-runtime-health":
+        outcome = paper_runtime_health()
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if outcome.get("available") else 2
+
+    if args.command == "sync-paper-orders":
+        cfg = load_config()
+        outcome = sync_paper_orders_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "reconcile-paper":
+        cfg = load_config()
+        outcome = reconcile_paper_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "evaluate-recommendations":
+        cfg = load_config()
+        outcome = evaluate_recommendations_cli(cfg.research_database_path, args.recommendation_ids)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "paper-performance":
+        cfg = load_config()
+        outcome = paper_performance_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
 
     return 1
 

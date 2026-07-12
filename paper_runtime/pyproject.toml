@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-paper-runtime"
+version = "0.1.0"
+description = "Isolated LumiBot/Alpaca paper-broker runtime process (Milestone 4). Speaks paper-runtime.v1 JSON Lines over stdin/stdout to the main trading-desk process; never imported by it."
+requires-python = ">=3.10"
+dependencies = [
+    "lumibot==4.5.74",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

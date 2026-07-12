@@ -16,6 +16,11 @@ import sqlite3
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from ..execution.broker_snapshots import (
+    AccountReconciliationResult,
+    BrokerOrderSubmission,
+    PositionReconciliationResult,
+)
 from ..execution.models import (
     PaperExecutionEvent,
     PaperExecutionResult,
@@ -276,3 +281,144 @@ def record_failure(
         (recommendation_id, intent_id, stage, reason, now.isoformat()),
     )
     conn.commit()
+
+
+# -- broker submissions (Milestone 4, credentialed paper-broker path) -------
+
+
+def _row_to_submission(row: sqlite3.Row) -> BrokerOrderSubmission:
+    return BrokerOrderSubmission(
+        intent_id=row["intent_id"], client_order_id=row["client_order_id"],
+        broker_order_id=row["broker_order_id"], submission_status=row["submission_status"],
+        attempt_count=row["attempt_count"],
+        last_attempt_at=_iso(row["last_attempt_at"]) if row["last_attempt_at"] else None,
+        created_at=_iso(row["created_at"]), updated_at=_iso(row["updated_at"]),
+    )
+
+
+def get_submission(conn: sqlite3.Connection, intent_id: str) -> BrokerOrderSubmission | None:
+    row = conn.execute(
+        "SELECT * FROM paper_broker_submissions WHERE intent_id = ?", (intent_id,)
+    ).fetchone()
+    return _row_to_submission(row) if row else None
+
+
+def get_submission_by_client_order_id(conn: sqlite3.Connection, client_order_id: str) -> BrokerOrderSubmission | None:
+    row = conn.execute(
+        "SELECT * FROM paper_broker_submissions WHERE client_order_id = ?", (client_order_id,)
+    ).fetchone()
+    return _row_to_submission(row) if row else None
+
+
+def create_pending_submission(
+    conn: sqlite3.Connection, *, intent_id: str, client_order_id: str, now: datetime,
+) -> BrokerOrderSubmission:
+    """Persist `PENDING_SUBMISSION` *before* the runtime is ever called
+    (docs/milestone-4.md Step 8: "persist client-order ID before
+    submission"). A no-op returning the existing row if one already exists
+    for this `intent_id` — repeated calls never create a second submission
+    row for the same intent."""
+    existing = get_submission(conn, intent_id)
+    if existing is not None:
+        return existing
+    conn.execute(
+        "INSERT INTO paper_broker_submissions "
+        "(intent_id, client_order_id, broker_order_id, submission_status, attempt_count, "
+        "last_attempt_at, created_at, updated_at) VALUES (?, ?, NULL, 'PENDING_SUBMISSION', 0, NULL, ?, ?)",
+        (intent_id, client_order_id, now.isoformat(), now.isoformat()),
+    )
+    conn.commit()
+    return get_submission(conn, intent_id)
+
+
+def update_submission_status(
+    conn: sqlite3.Connection, *, intent_id: str, submission_status: str,
+    broker_order_id: str | None, now: datetime, increment_attempt: bool = False,
+) -> None:
+    if increment_attempt:
+        conn.execute(
+            "UPDATE paper_broker_submissions SET submission_status = ?, broker_order_id = "
+            "COALESCE(?, broker_order_id), attempt_count = attempt_count + 1, last_attempt_at = ?, "
+            "updated_at = ? WHERE intent_id = ?",
+            (submission_status, broker_order_id, now.isoformat(), now.isoformat(), intent_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE paper_broker_submissions SET submission_status = ?, "
+            "broker_order_id = COALESCE(?, broker_order_id), updated_at = ? WHERE intent_id = ?",
+            (submission_status, broker_order_id, now.isoformat(), intent_id),
+        )
+    conn.commit()
+
+
+def list_unresolved_submissions(conn: sqlite3.Connection) -> list[BrokerOrderSubmission]:
+    """Every submission not yet in a terminal state — the polling loop's
+    work queue (docs/milestone-4.md Step 9)."""
+    rows = conn.execute(
+        "SELECT * FROM paper_broker_submissions WHERE submission_status NOT IN "
+        "('FILLED', 'CANCELLED', 'REJECTED', 'ERROR') ORDER BY created_at"
+    ).fetchall()
+    return [_row_to_submission(r) for r in rows]
+
+
+# -- account/position reconciliation (Milestone 4, Step 10) ------------------
+
+
+def save_account_reconciliation(conn: sqlite3.Connection, result: AccountReconciliationResult) -> None:
+    conn.execute(
+        "INSERT INTO paper_account_reconciliations "
+        "(status, broker_cash, ledger_cash, difference, tolerance, reasons_json, broker_as_of, reconciled_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            result.status, str(result.broker_cash), str(result.ledger_cash), str(result.difference),
+            str(result.tolerance), json.dumps(list(result.reasons)), result.broker_as_of.isoformat(),
+            result.reconciled_at.isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def get_latest_account_reconciliation(conn: sqlite3.Connection) -> AccountReconciliationResult | None:
+    row = conn.execute(
+        "SELECT * FROM paper_account_reconciliations ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return AccountReconciliationResult(
+        status=row["status"], broker_cash=Decimal(row["broker_cash"]), ledger_cash=Decimal(row["ledger_cash"]),
+        difference=Decimal(row["difference"]), tolerance=Decimal(row["tolerance"]),
+        reasons=tuple(json.loads(row["reasons_json"])), broker_as_of=_iso(row["broker_as_of"]),
+        reconciled_at=_iso(row["reconciled_at"]),
+    )
+
+
+def save_position_reconciliation(conn: sqlite3.Connection, result: PositionReconciliationResult) -> None:
+    conn.execute(
+        "INSERT INTO paper_position_reconciliations "
+        "(symbol, status, broker_quantity, ledger_quantity, tolerance, reasons_json, broker_as_of, reconciled_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            result.symbol, result.status, str(result.broker_quantity), str(result.ledger_quantity),
+            str(result.tolerance), json.dumps(list(result.reasons)), result.broker_as_of.isoformat(),
+            result.reconciled_at.isoformat(),
+        ),
+    )
+    conn.commit()
+
+
+def list_latest_position_reconciliations(conn: sqlite3.Connection) -> list[PositionReconciliationResult]:
+    """Most recent reconciliation row per symbol."""
+    rows = conn.execute(
+        "SELECT p.* FROM paper_position_reconciliations p "
+        "INNER JOIN (SELECT symbol, MAX(id) AS max_id FROM paper_position_reconciliations GROUP BY symbol) "
+        "latest ON p.symbol = latest.symbol AND p.id = latest.max_id ORDER BY p.symbol"
+    ).fetchall()
+    return [
+        PositionReconciliationResult(
+            symbol=row["symbol"], status=row["status"], broker_quantity=Decimal(row["broker_quantity"]),
+            ledger_quantity=Decimal(row["ledger_quantity"]), tolerance=Decimal(row["tolerance"]),
+            reasons=tuple(json.loads(row["reasons_json"])), broker_as_of=_iso(row["broker_as_of"]),
+            reconciled_at=_iso(row["reconciled_at"]),
+        )
+        for row in rows
+    ]

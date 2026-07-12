@@ -9,7 +9,7 @@ trigger-protected in `trading_schema.py`, untouched by this module.
 """
 from __future__ import annotations
 
-EXECUTION_SCHEMA_VERSION = 1
+EXECUTION_SCHEMA_VERSION = 2  # Milestone 4 added paper_broker_submissions / *_reconciliations tables
 
 EXECUTION_DDL = """
 CREATE TABLE IF NOT EXISTS paper_execution_intents (
@@ -84,12 +84,55 @@ CREATE TABLE IF NOT EXISTS paper_execution_failures (
     reason TEXT NOT NULL,
     occurred_at TEXT NOT NULL
 );
+
+-- Milestone 4: credentialed paper-broker submission/idempotency tracking
+-- across the process boundary (docs/milestone-4.md Step 8). Additive only
+-- -- nothing above this point is modified by Milestone 4.
+CREATE TABLE IF NOT EXISTS paper_broker_submissions (
+    intent_id TEXT PRIMARY KEY REFERENCES paper_execution_intents(intent_id),
+    client_order_id TEXT NOT NULL UNIQUE,
+    broker_order_id TEXT,
+    submission_status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Milestone 4 Step 10: account-level reconciliation (broker cash/equity vs
+-- the internal paper ledger).
+CREATE TABLE IF NOT EXISTS paper_account_reconciliations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    broker_cash TEXT NOT NULL,
+    ledger_cash TEXT NOT NULL,
+    difference TEXT NOT NULL,
+    tolerance TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    broker_as_of TEXT NOT NULL,
+    reconciled_at TEXT NOT NULL
+);
+
+-- Milestone 4 Step 10: per-symbol position-level reconciliation (broker
+-- position quantity vs the internal paper ledger's position).
+CREATE TABLE IF NOT EXISTS paper_position_reconciliations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    status TEXT NOT NULL,
+    broker_quantity TEXT NOT NULL,
+    ledger_quantity TEXT NOT NULL,
+    tolerance TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    broker_as_of TEXT NOT NULL,
+    reconciled_at TEXT NOT NULL
+);
 """
 
 EXECUTION_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_paper_execution_intents_rec ON paper_execution_intents(recommendation_id);
 CREATE INDEX IF NOT EXISTS idx_paper_execution_events_intent ON paper_execution_events(intent_id);
 CREATE INDEX IF NOT EXISTS idx_paper_execution_failures_rec ON paper_execution_failures(recommendation_id);
+CREATE INDEX IF NOT EXISTS idx_paper_broker_submissions_status ON paper_broker_submissions(submission_status);
 """
 
 
