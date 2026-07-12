@@ -52,6 +52,8 @@ def test_credentialed_alpaca_paper_round_trip(tmp_path):
     from trading_research.paper.ledger import PaperLedger
     from trading_research.runtime.client.models import intent_to_submit_payload
     from trading_research.runtime.client.process_client import RuntimeClient
+    from trading_research.cli import _paper_runtime_command_env
+    from trading_research.config import REPO_ROOT
     from trading_research.runtime.paper_runtime_config import load_paper_runtime_config
     from trading_research.services.reconcile_paper import reconcile_paper_account_and_positions
     from trading_research.storage.database import connect
@@ -59,7 +61,8 @@ def test_credentialed_alpaca_paper_round_trip(tmp_path):
     runtime_config = load_paper_runtime_config()
     client = RuntimeClient(
         command=list(runtime_config.command), startup_timeout_seconds=runtime_config.startup_timeout_seconds,
-        request_timeout_seconds=runtime_config.request_timeout_seconds,
+        request_timeout_seconds=runtime_config.request_timeout_seconds, cwd=str(REPO_ROOT),
+        env=_paper_runtime_command_env(),
     )
 
     # 1-3: health, paper-endpoint, real-money-false — RuntimeClient.start()

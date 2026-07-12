@@ -9,6 +9,7 @@ description = "Isolated LumiBot/Alpaca paper-broker runtime process (Milestone 4
 requires-python = ">=3.10"
 dependencies = [
     "lumibot==4.5.74",
+    "python-dotenv>=1.0.1",
 ]
 
 [project.optional-dependencies]

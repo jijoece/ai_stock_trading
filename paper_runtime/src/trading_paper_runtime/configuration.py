@@ -43,11 +43,34 @@ class RuntimeConfiguration:
         return self.has_api_key and self.has_api_secret
 
 
+def _load_dotenv_if_present() -> None:
+    """Best-effort `.env` discovery, searching from the current working
+    directory upward — mirrors the main project's own
+    `trading_research.config.load_config` behavior (and LumiBot's own
+    `lumibot.credentials` dotenv auto-discovery, which runs too late for
+    this function's purposes if `.env` hasn't been loaded already: LumiBot
+    is imported lazily, inside gateway construction, *after*
+    `load_runtime_configuration()` has already read `os.environ`). Never
+    overrides a variable already set in the real environment
+    (`override=False`) and never raises if `python-dotenv` or a `.env` file
+    is unavailable — environment variables set directly (e.g. by a real
+    deployment's secret manager) always take precedence.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:
+        return
+    path = find_dotenv(usecwd=True)
+    if path:
+        load_dotenv(path, override=False)
+
+
 def load_runtime_configuration() -> RuntimeConfiguration:
     """Read configuration from the environment. Never raises — even total
     absence of credentials is a valid (if unusable-for-submission) state,
     since `health`/`capabilities` must still be answerable so the main
     process can observe *why* submission is unavailable."""
+    _load_dotenv_if_present()
     is_paper_raw = os.environ.get("ALPACA_IS_PAPER", "")
     return RuntimeConfiguration(
         broker_provider=os.environ.get("PAPER_BROKER_PROVIDER", "alpaca").strip().lower(),
