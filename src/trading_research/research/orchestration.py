@@ -20,6 +20,7 @@ from .configuration import MANAGER_ROLE, ResearchConfiguration
 from .errors import (
     EvidenceValidationError,
     MalformedOutputError,
+    ManagerNotConfiguredError,
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderTransientError,
@@ -54,6 +55,13 @@ RUN_STATUS_RUNNING = "RUNNING"
 RUN_STATUS_COMPLETED = "COMPLETED"
 RUN_STATUS_ANALYSIS_INCOMPLETE = "ANALYSIS_INCOMPLETE"
 RUN_STATUS_FAILED = "FAILED"
+# Analyst-only/diagnostic terminal status (fix for the pre-existing "manager invoked
+# unconditionally" issue): every configured analyst role produced a valid report, no
+# manager role was configured, and the caller explicitly opted into this
+# (`require_decision=False`) — a legitimate success state, never conflated with
+# ANALYSIS_INCOMPLETE (which means something failed) or COMPLETED (which implies a
+# decision exists).
+RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER = "ANALYST_REPORTS_COMPLETE_NO_MANAGER"
 
 _RETRYABLE_ERRORS = (ProviderTimeoutError, ProviderRateLimitError, ProviderTransientError, MalformedOutputError, SchemaValidationError)
 _ROLE_OUTPUT_ERRORS = (SchemaValidationError, EvidenceValidationError)
@@ -422,9 +430,29 @@ def analyze_with_research_committee(
     configuration: ResearchConfiguration,
     clock: Callable[[], datetime],
     run_mode: str,
+    require_decision: bool = True,
 ) -> OrchestrationResult:
+    """`require_decision` (default `True`, preserving fail-closed production behavior):
+    when `True` and `configuration.roles` does not include the manager role, raises
+    `ManagerNotConfiguredError` immediately — before any provider call — rather than
+    silently returning something that looks like a decision or making analyst-only calls
+    that could never produce one. Pass `require_decision=False` for an intentional
+    analyst-only/diagnostic run; in that case the manager is never invoked at all, and a
+    successful run returns `RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER` with
+    `decision=None` rather than a fabricated `ResearchDecision`. When the manager role
+    *is* present in `configuration.roles`, `require_decision` has no effect — production
+    behavior (manager invoked once every analyst role succeeds) is unchanged."""
     roles = configuration.roles
     analyst_roles = tuple(r for r in roles if r != MANAGER_ROLE)
+    manager_configured = MANAGER_ROLE in roles
+
+    if require_decision and not manager_configured:
+        raise ManagerNotConfiguredError(
+            f"analyze_with_research_committee requires a final decision (require_decision=True, "
+            f"the default) but {MANAGER_ROLE!r} is not present in configuration.roles={roles!r}. "
+            f"Add 'manager' to roles for a production run, or pass require_decision=False for an "
+            f"intentional analyst-only/diagnostic run."
+        )
 
     research_run_id = compute_research_run_id(
         snapshot_id=snapshot.snapshot_id, provider_name=provider_name, model_name=model_name,
@@ -446,6 +474,13 @@ def analyze_with_research_committee(
                 research_run_id=research_run_id, snapshot_id=snapshot.snapshot_id,
                 status=RUN_STATUS_ANALYSIS_INCOMPLETE, decision=None, role_reports=reports, attempts=(),
                 incomplete_reasons=("reused a previously completed ANALYSIS_INCOMPLETE run",), reused_existing_run=True,
+            )
+        if existing_status == RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER:
+            reports = research_repository.get_role_reports_for_run(research_run_id)
+            return OrchestrationResult(
+                research_run_id=research_run_id, snapshot_id=snapshot.snapshot_id,
+                status=RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER, decision=None, role_reports=reports,
+                attempts=(), incomplete_reasons=(), reused_existing_run=True,
             )
 
     preflight_reasons = validate_snapshot_preconditions(
@@ -519,25 +554,47 @@ def analyze_with_research_committee(
         # The manager is never invoked when a required analyst role failed — persist why,
         # not just the fact that it happened (Step 10: "The manager-skip record should
         # identify which required role failed, ... why invoking the manager would have
-        # violated orchestration policy").
-        manager_skip_failure = new_failure(
-            research_run_id=research_run_id, attempt_id=f"{research_run_id}-manager-skipped", role=MANAGER_ROLE,
-            attempt_number=1, stage=STAGE_MANAGER_SKIPPED, code=CODE_MANAGER_NOT_INVOKED,
-            message=(
-                f"manager not invoked: required role(s) {sorted(failed_required_roles)} failed — invoking the "
-                "manager with incomplete required-role input would violate orchestration policy"
-            ),
-            retryable=False, model_name=model_name, prompt_version="n/a", schema_version="n/a",
-            occurred_at=clock(), metadata={"blocking_role_count": len(failed_required_roles)},
-        )
-        all_failures.append(manager_skip_failure)
+        # violated orchestration policy"). Only persisted when a manager was actually
+        # configured: a "manager skipped" record implies one would otherwise have been
+        # invoked, which is not true for an analyst-only/diagnostic run that never
+        # configured a manager role at all (fabricating this record would be exactly the
+        # kind of misleading diagnostic data this fix exists to prevent).
+        if manager_configured:
+            manager_skip_failure = new_failure(
+                research_run_id=research_run_id, attempt_id=f"{research_run_id}-manager-skipped", role=MANAGER_ROLE,
+                attempt_number=1, stage=STAGE_MANAGER_SKIPPED, code=CODE_MANAGER_NOT_INVOKED,
+                message=(
+                    f"manager not invoked: required role(s) {sorted(failed_required_roles)} failed — invoking the "
+                    "manager with incomplete required-role input would violate orchestration policy"
+                ),
+                retryable=False, model_name=model_name, prompt_version="n/a", schema_version="n/a",
+                occurred_at=clock(), metadata={"blocking_role_count": len(failed_required_roles)},
+            )
+            all_failures.append(manager_skip_failure)
+            if research_repository is not None:
+                research_repository.save_attempt_failures((manager_skip_failure,))
         if research_repository is not None:
-            research_repository.save_attempt_failures((manager_skip_failure,))
             research_repository.mark_run_finished(research_run_id, RUN_STATUS_ANALYSIS_INCOMPLETE, clock())
         return OrchestrationResult(
             research_run_id=research_run_id, snapshot_id=snapshot.snapshot_id,
             status=RUN_STATUS_ANALYSIS_INCOMPLETE, decision=None, role_reports=tuple(valid_reports),
             attempts=tuple(all_attempts), incomplete_reasons=tuple(incomplete_reasons), reused_existing_run=False,
+            failures=tuple(all_failures),
+        )
+
+    if not manager_configured:
+        # `require_decision` was already checked to be False at the top (otherwise this
+        # function would have raised before any provider call was ever made) — every
+        # configured analyst role produced a valid report, and there is no manager to
+        # invoke. This is a legitimate terminal success state, not an error and not
+        # ANALYSIS_INCOMPLETE: no manager call is made, no ResearchDecision is
+        # constructed or fabricated from the analyst reports.
+        if research_repository is not None:
+            research_repository.mark_run_finished(research_run_id, RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER, clock())
+        return OrchestrationResult(
+            research_run_id=research_run_id, snapshot_id=snapshot.snapshot_id,
+            status=RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER, decision=None, role_reports=tuple(valid_reports),
+            attempts=tuple(all_attempts), incomplete_reasons=(), reused_existing_run=False,
             failures=tuple(all_failures),
         )
 

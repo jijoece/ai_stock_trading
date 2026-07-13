@@ -4,10 +4,19 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from trading_research.research.configuration import ResearchConfiguration
 from trading_research.research.deterministic_provider import ScriptedResearchProvider, ScriptedStep
+from trading_research.research.errors import ManagerNotConfiguredError
 from trading_research.research.fixtures import build_fixture_snapshot
-from trading_research.research.orchestration import RUN_STATUS_ANALYSIS_INCOMPLETE, RUN_STATUS_COMPLETED, analyze_with_research_committee, compute_research_run_id
+from trading_research.research.orchestration import (
+    RUN_STATUS_ANALYSIS_INCOMPLETE,
+    RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER,
+    RUN_STATUS_COMPLETED,
+    analyze_with_research_committee,
+    compute_research_run_id,
+)
 from trading_research.research.prompt_registry import PromptRegistry
 
 from tests.support.research_fixtures import FakeResearchRepository
@@ -240,3 +249,141 @@ def test_preflight_missing_evidence_blocks_before_any_provider_call():
     )
     assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
     assert provider.calls == []
+
+
+# --- Manager-invocation fix: manager only called when configured (require_decision) ---
+
+
+def test_manager_configured_is_invoked_exactly_once():
+    """Unchanged production behavior: with 'manager' in roles, it is called exactly once
+    after every analyst role succeeds."""
+    provider = _happy_provider()
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo, configuration=_config(), clock=lambda: NOW,
+        run_mode="scripted",
+    )
+    assert result.status == RUN_STATUS_COMPLETED
+    assert result.decision is not None
+    assert [c.role for c in provider.calls].count("manager") == 1
+
+
+def test_manager_omitted_is_never_invoked():
+    """The core fix: 'manager' absent from roles + require_decision=False must never
+    result in a manager provider call, even though every analyst role succeeded."""
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+        ("technical", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+        # Deliberately no ("manager", 1) step scripted — a manager call would raise
+        # AssertionError from ScriptedResearchProvider, which pytest would report as an
+        # error, proving the manager was never invoked (not merely "invoked but happened
+        # to succeed anyway").
+    })
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("fundamental", "technical")), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False,
+    )
+    assert "manager" not in [c.role for c in provider.calls]
+    assert result.status == RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER
+    assert result.decision is None
+    assert [r.role for r in result.role_reports] == ["fundamental", "technical"]
+
+
+def test_bear_only_diagnostic_run_succeeds_without_extra_provider_call():
+    provider = ScriptedResearchProvider({
+        ("bear", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+    })
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("bear",)), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False,
+    )
+    assert [c.role for c in provider.calls] == ["bear"]  # exactly one call, bear only
+    assert result.status == RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER
+    assert [r.role for r in result.role_reports] == ["bear"]
+
+
+def test_analyst_only_failure_still_persists_structured_failures():
+    """Even in analyst-only/no-manager mode, a rejected claim or retry exhaustion must
+    still produce persisted structured failures — the manager-invocation fix must not
+    weaken failure observability."""
+    bad_payload = {
+        "stance": "BEARISH", "summary": "s", "catalysts": [], "risks": ["r"], "uncertainties": [],
+        "missing_data_reasons": [],
+        "claims": [{
+            "claim_id": "c1", "claim_type": "downside_estimate", "statement": "invented",
+            "evidence_ids": ["ev-does-not-exist"], "numeric_value": None, "unit": None, "importance": "high",
+        }],
+    }
+    provider = ScriptedResearchProvider({
+        ("bear", 1): ScriptedStep(kind="response", payload=bad_payload),
+        ("bear", 2): ScriptedStep(kind="response", payload=bad_payload),
+    })
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("bear",)), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False,
+    )
+    assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
+    assert result.decision is None
+    assert any(f.code == "UNKNOWN_EVIDENCE_ID" for f in repo.failures)
+    assert any(f.stage == "RETRY_EXHAUSTED" for f in repo.failures)
+    assert any(f.stage == "REQUIRED_ROLE_FAILED" for f in repo.failures)
+    # No manager-skip failure — there was never a manager configured to skip.
+    assert not any(f.stage == "MANAGER_SKIPPED" for f in repo.failures)
+    assert "manager" not in [c.role for c in provider.calls]
+
+
+def test_no_final_decision_fabricated_from_analyst_reports():
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+    })
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("fundamental",)), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False,
+    )
+    assert result.decision is None
+    assert result.status != RUN_STATUS_COMPLETED
+    assert repo.decisions == {}  # nothing was ever persisted as a decision
+
+
+def test_production_mode_requiring_decision_fails_closed_without_manager():
+    provider = ScriptedResearchProvider({})  # any call would be a test failure
+    repo = FakeResearchRepository()
+    with pytest.raises(ManagerNotConfiguredError):
+        analyze_with_research_committee(
+            _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+            prompt_registry=PromptRegistry(), research_repository=repo,
+            configuration=_config(roles=("fundamental", "bear")), clock=lambda: NOW,
+            run_mode="scripted",  # require_decision defaults to True
+        )
+    assert provider.calls == []  # fails before any provider call, not after wasted work
+    assert repo.attempts == []
+    assert repo.runs == {}  # not even a run_started row was persisted
+
+
+def test_full_committee_behavior_unchanged_when_manager_configured():
+    """Regression guard: a full fundamental+technical+manager run behaves identically to
+    before this fix — same status, same decision, same role order."""
+    provider = _happy_provider()
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo, configuration=_config(), clock=lambda: NOW,
+        run_mode="scripted",
+    )
+    assert [c.role for c in provider.calls] == ["fundamental", "technical", "manager"]
+    assert result.status == RUN_STATUS_COMPLETED
+    assert result.decision.rating == "OVERWEIGHT"
+    assert repo.runs[result.research_run_id]["status"] == RUN_STATUS_COMPLETED

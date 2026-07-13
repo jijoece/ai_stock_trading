@@ -140,5 +140,14 @@ class UnknownOverlayActionError(ResearchError):
     configured enum — fails closed rather than executing an unknown action."""
 
 
+class ManagerNotConfiguredError(ResearchError):
+    """`analyze_with_research_committee(require_decision=True)` (the default) was called
+    with a `configuration.roles` that does not include the manager role — a final
+    `ResearchDecision` can never be produced from that configuration. Raised immediately,
+    before any provider call, rather than silently treating analyst reports as a decision
+    or invoking the manager unconditionally (Milestone 6.1 follow-up: "Keep normal
+    production configurations fail-closed")."""
+
+
 class ReplayMismatchError(ResearchError):
     """A replay's reconstructed hash did not match the persisted hash."""

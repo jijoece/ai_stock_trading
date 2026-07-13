@@ -18,10 +18,16 @@ Never runs automatically just because credentials happen to be present. This tes
     what this test targets, not evidence acquisition);
   * invokes **only** the `bear` role, directly through the same
     `orchestration._run_role_with_retries` bounded-retry helper `analyze_with_research_committee`
-    itself uses for every analyst role — never through the full orchestrator function,
-    which (by unrelated, pre-existing design) invokes the manager unconditionally once
-    every analyst role succeeds. Calling the shared retry helper directly is what makes
-    "do not invoke the manager" a structural guarantee here, not a behavioral hope;
+    itself uses for every analyst role — never through the full orchestrator function.
+    This test predates a later fix: `analyze_with_research_committee` used to invoke the
+    manager unconditionally once every analyst role succeeded, regardless of whether a
+    manager role was configured; it now accepts `require_decision=False` for exactly this
+    analyst-only case and correctly never calls the manager (see
+    `orchestration.RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER` and
+    `tests/unit/test_research_orchestration.py`'s manager-invocation tests). Calling the
+    shared retry helper directly here still works and remains a structural (not merely
+    behavioral) guarantee that the manager is never invoked, so this already-validated
+    test is left as-is rather than switched to the now-also-correct full orchestrator path;
   * runs the exact same forced-tool-use structured output, local schema validation, and
     claim-to-evidence validation real analyst attempts go through in production;
   * persists every structured failure (if any) to a real, temporary SQLite database via

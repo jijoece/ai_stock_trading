@@ -1182,3 +1182,129 @@ limitations").
   files and nothing else. That commit was not created by this assistant (no `git commit`
   tool call was ever issued this session); it is recorded here for an accurate history,
   not claimed as this assistant's action.
+
+## Milestone 6.1 follow-up 3 — manager-invocation fix
+
+Started: 2026-07-13 (same-day follow-up, requested immediately after the real bear-role
+smoke test result above landed as commit `6ebae33`).
+
+### The pre-existing bug
+
+`analyze_with_research_committee` invoked the manager role unconditionally once every
+configured analyst role produced a valid report — it never checked whether `"manager"`
+was actually present in `configuration.roles` before calling
+`_run_role_with_retries(role=MANAGER_ROLE, ...)`. This was first discovered while
+designing the opt-in real bear-role smoke test (documented in the previous follow-up
+section's "Known limitations") and is fixed now, as its own narrowly-scoped change.
+
+### Fix
+
+`research/errors.py`: added `ManagerNotConfiguredError(ResearchError)` — raised when a
+caller wants a final decision but the manager role isn't configured to produce one.
+
+`research/orchestration.py::analyze_with_research_committee` gained a keyword-only
+`require_decision: bool = True` parameter:
+
+* **Manager configured** (`"manager" in configuration.roles`): `require_decision` has no
+  effect — behavior is byte-for-byte unchanged from before this fix. Every existing
+  production call site (`cli.py::run_research_cli`, `research/scheduled_cycle.py`) always
+  configures manager (`config/research.yaml`'s `roles:` list includes it), so this fix
+  changes nothing for any currently-running production path — confirmed by the full
+  suite passing unmodified (760 passed, same 7 skipped, before and after).
+* **Manager omitted + `require_decision=True`** (the default): raises
+  `ManagerNotConfiguredError` **immediately**, before `compute_research_run_id`, before
+  any preflight check, before any provider call, and before any `research_repository`
+  write (no `run_started` row, no attempt, nothing persisted for an invalid
+  configuration) — genuinely fail-closed, not just "eventually errors."
+* **Manager omitted + `require_decision=False`** (explicit opt-in for an
+  analyst-only/diagnostic run): every configured analyst role runs exactly as before
+  (bounded retry, full schema + claim-to-evidence validation, structured-failure
+  persistence, idempotent resume/reuse — all unchanged); the manager is never invoked
+  under any outcome; on success, returns the new terminal status
+  `RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER` with `decision=None` and
+  `role_reports` populated — never a fabricated `ResearchDecision`; on an analyst-role
+  failure, returns the existing `ANALYSIS_INCOMPLETE` status exactly as it always has
+  (reusing an existing, already-well-understood status per the request's own suggestion,
+  rather than inventing a second new failure-side status).
+* **Idempotent resume**: `RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER` was also added
+  to the existing-run-reuse check at the top of the function (alongside `COMPLETED` and
+  `ANALYSIS_INCOMPLETE`), so re-invoking an identical analyst-only run is a pure read, not
+  a re-run — consistent with every other terminal status.
+
+**A second, closely-related bug found and fixed in the same code path while writing
+tests**: the existing `if incomplete_reasons:` branch (an analyst role exhausted retries)
+unconditionally constructed and persisted a `MANAGER_SKIPPED`/`MANAGER_NOT_INVOKED`
+`ResearchValidationFailure` — including for a config that never had a manager role in the
+first place, where a "the manager was skipped" record is simply false (nothing was ever
+going to invoke it). Caught by
+`test_analyst_only_failure_still_persists_structured_failures` failing on first run — see
+"Test results" below. Fixed by guarding that failure's construction with
+`if manager_configured:`; the analyst-role failure(s)/`RETRY_EXHAUSTED`/
+`REQUIRED_ROLE_FAILED` records are still persisted exactly as before in every case.
+
+### Behavior preserved unchanged (verified, not just claimed)
+
+* Retry bound (`max_attempts_per_role`) — untouched.
+* Claim-to-evidence validation, schema validation, claim-failure classification —
+  untouched.
+* Prompt versions/hashes — untouched (this fix has no interaction with
+  `PromptRegistry`/`bear/v2.txt` at all).
+* Execution boundaries — untouched; `analyze_with_research_committee` still imports
+  nothing from `execution`/`paper`/`runtime`/`recommendations`/`overlay`.
+* Recommendation/overlay logic — untouched; this fix is entirely inside the research
+  orchestration layer, several calls upstream of where a baseline recommendation or
+  overlay would ever be touched.
+
+### Tests added (`tests/unit/test_research_orchestration.py`)
+
+* `test_manager_configured_is_invoked_exactly_once` — manager configured -> invoked
+  exactly once, unchanged behavior.
+* `test_manager_omitted_is_never_invoked` — manager absent + `require_decision=False` ->
+  no `("manager", ...)` step is ever needed in the `ScriptedResearchProvider` (a manager
+  call would raise `AssertionError` from the scripted provider itself, proving the
+  guarantee structurally, not just via a role-name assertion afterward); returns
+  `ANALYST_REPORTS_COMPLETE_NO_MANAGER`, `decision=None`.
+* `test_bear_only_diagnostic_run_succeeds_without_extra_provider_call` — single-role
+  (`roles=("bear",)`) diagnostic config succeeds with exactly one provider call total.
+* `test_analyst_only_failure_still_persists_structured_failures` — a rejected claim in
+  analyst-only mode still persists `UNKNOWN_EVIDENCE_ID`/`RETRY_EXHAUSTED`/
+  `REQUIRED_ROLE_FAILED` failures, and (after the second fix above) correctly persists
+  **no** `MANAGER_SKIPPED` failure, since no manager was ever configured.
+* `test_no_final_decision_fabricated_from_analyst_reports` — `result.decision is None`,
+  `repo.decisions == {}` (nothing was ever persisted as a decision) for an analyst-only
+  success.
+* `test_production_mode_requiring_decision_fails_closed_without_manager` — default
+  `require_decision=True` + no manager configured -> `ManagerNotConfiguredError` raised
+  before any provider call, before any repository write (`provider.calls == []`,
+  `repo.attempts == []`, `repo.runs == {}`).
+* `test_full_committee_behavior_unchanged_when_manager_configured` — explicit regression
+  guard: role call order, final status, decision rating, and persisted run status all
+  identical to pre-fix behavior.
+
+### Test results
+
+* `pytest tests/unit/test_research_orchestration.py -v`: first run —
+  **16 passed, 1 failed** (`test_analyst_only_failure_still_persists_structured_failures`
+  failed on `assert not any(f.stage == "MANAGER_SKIPPED" ...)`, correctly catching the
+  second bug described above). After the `if manager_configured:` guard fix: **17 passed**
+  (10 pre-existing + 7 new).
+* `pytest tests/ -q` (full main suite): **760 passed, 7 skipped** — 753 -> 760 (+7 new
+  tests), skip count unchanged at 7, zero regressions.
+* `cd paper_runtime && pytest tests/ -q`: **33 passed** — unchanged, final regression
+  verification per this follow-up's explicit instruction.
+
+### Documentation
+
+`tests/integration/test_research_claude_bear_smoke.py`'s docstring (written before this
+fix existed) claimed calling `_run_role_with_retries` directly was necessary because of
+"unrelated, pre-existing design" — updated to note the bug is now fixed and point to the
+new `require_decision=False` path, while deliberately leaving the test's own mechanism
+unchanged (it still calls `_run_role_with_retries` directly, which remains correct and
+is the version already validated against a real Claude response in the previous
+follow-up — not worth risking a behavior change to an already-proven real-API test for a
+documentation-only concern).
+
+### Known limitations (this follow-up)
+
+None new. This fix fully resolves item 1 in the previous follow-up's "Known limitations"
+list.

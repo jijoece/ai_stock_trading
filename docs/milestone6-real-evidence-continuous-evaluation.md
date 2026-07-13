@@ -688,6 +688,43 @@ order, or live order was constructed or submitted. This is a single successful r
 not a repeated statistical validation — the test remains opt-in, not part of the default
 suite, for the same cost/latency reasons as the Milestone 5 smoke test.
 
+## Follow-up: manager-invocation fix
+
+`analyze_with_research_committee` used to call the manager role unconditionally once
+every configured analyst role succeeded, without checking whether `"manager"` was
+actually present in `configuration.roles`. Fixed with a new keyword-only
+`require_decision: bool = True` parameter:
+
+* **Manager configured**: unchanged — `require_decision` has no effect. Every production
+  call site (`cli.py`, `research/scheduled_cycle.py`) always configures manager
+  (`config/research.yaml`), so no production behavior changed.
+* **Manager omitted, `require_decision=True` (default)**: raises
+  `research/errors.py::ManagerNotConfiguredError` immediately, before any provider call
+  or repository write — fail-closed.
+* **Manager omitted, `require_decision=False`**: analyst roles run normally (same bounded
+  retry, validation, and structured-failure persistence as always); the manager is never
+  invoked; success returns the new `RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER`
+  status with `decision=None` — never a fabricated `ResearchDecision`; a failure still
+  returns the existing `ANALYSIS_INCOMPLETE` status.
+
+A second, closely related bug was found while adding tests for this: the existing
+"required analyst role failed" path unconditionally persisted a `MANAGER_SKIPPED`
+structured failure even when no manager was ever configured (a factually false "the
+manager was skipped" record). Fixed by only persisting that record when a manager is
+actually configured — analyst-role failure records themselves are unaffected.
+
+Retry limits, claim validation, prompt versions, and execution boundaries are all
+unchanged by this fix. Tests added in
+`tests/unit/test_research_orchestration.py`: `test_manager_configured_is_invoked_exactly_once`,
+`test_manager_omitted_is_never_invoked`,
+`test_bear_only_diagnostic_run_succeeds_without_extra_provider_call`,
+`test_analyst_only_failure_still_persists_structured_failures`,
+`test_no_final_decision_fabricated_from_analyst_reports`,
+`test_production_mode_requiring_decision_fails_closed_without_manager`,
+`test_full_committee_behavior_unchanged_when_manager_configured`. Result: `pytest
+tests/ -q` -> `760 passed, 7 skipped` (753 -> 760, zero regressions); `paper_runtime` ->
+`33 passed`, unchanged.
+
 ### Remaining limitations
 
 1. `CROSS_SNAPSHOT_EVIDENCE`/`CROSS_SYMBOL_EVIDENCE`/`UNIT_MISMATCH`/
@@ -707,8 +744,6 @@ suite, for the same cost/latency reasons as the Milestone 5 smoke test.
 3. Corporate-status/going-concern SEC metadata and portfolio-context market-value pricing
    remain deferred to Milestone 7 (see the M6.1 scratchpad's "Issues deferred" for the
    specific justification for each).
-4. `analyze_with_research_committee` invokes the manager unconditionally once all
+4. ~~`analyze_with_research_committee` invokes the manager unconditionally once all
    configured analyst roles succeed, without checking whether `"manager"` is present in
-   `configuration.roles` — discovered while building the opt-in bear-role smoke test;
-   flagged as a candidate Milestone 7 hardening item, not fixed here (out of this
-   follow-up's requested scope).
+   `configuration.roles`~~ — **fixed**: see "Follow-up: manager-invocation fix" below.
