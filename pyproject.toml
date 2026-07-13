@@ -13,6 +13,7 @@ dependencies = [
     "jsonschema>=4.26.0",
     "PyYAML>=6.0.3",
     "python-dotenv>=1.2.2",
+    "httpx>=0.28.0",
 ]
 
 [project.optional-dependencies]
@@ -42,4 +43,8 @@ asyncio_mode = "auto"
 markers = [
     "paper_broker: opt-in real credentialed paper-broker smoke test (Milestone 4) — requires RUN_PAPER_BROKER_TESTS=true and real Alpaca paper credentials; skipped by default, never run automatically just because credentials happen to be present.",
     "claude_api: opt-in real Claude API structured-output smoke test (Milestone 5) — requires RUN_CLAUDE_RESEARCH_TESTS=true and a real ANTHROPIC_API_KEY plus research.model configured; skipped by default, never run automatically just because credentials happen to be present.",
+    "sec_api: opt-in real SEC EDGAR smoke test (Milestone 6) — requires RUN_SEC_API_TESTS=true; skipped by default. No credentials are required by SEC EDGAR itself, but this still never runs automatically.",
+    "market_data_api: opt-in real Alpaca market-data smoke test (Milestone 6) — requires RUN_MARKET_DATA_TESTS=true and real Alpaca credentials; skipped by default, never run automatically just because credentials happen to be present.",
+    "news_api: opt-in real news-provider smoke test (Milestone 6) — requires RUN_NEWS_API_TESTS=true and a real news-provider API key; skipped by default.",
+    "real_research_cycle: opt-in real scheduled-research-cycle smoke test (Milestone 6) — requires RUN_REAL_RESEARCH_CYCLE=true; skipped by default.",
 ]

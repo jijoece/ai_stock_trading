@@ -765,6 +765,420 @@ def research_usage_cli(db_path: Path) -> dict:
     }
 
 
+def _make_persist_hook(conn) -> "Callable[[dict], None] | None":
+    """Bridges `HttpJsonClient.on_response`'s plain-dict callback to
+    `evidence_providers/persistence.py::save_provider_request` (Milestone 6
+    Step 5). `None` when no database connection is available yet (e.g. the
+    registry is being built outside a `session()` block)."""
+    if conn is None:
+        return None
+    from datetime import datetime, timezone
+
+    from .evidence_providers.persistence import LICENSE_ACCOUNT_LINKED, LICENSE_PUBLIC_DOMAIN, ProviderRequestRecord, save_provider_request
+
+    def _hook(record: dict) -> None:
+        licensing = LICENSE_PUBLIC_DOMAIN if record["provider"] == "sec-edgar" else LICENSE_ACCOUNT_LINKED
+        now = datetime.now(timezone.utc)
+        save_provider_request(conn, ProviderRequestRecord(
+            provider=record["provider"], operation=record["operation"], symbol=record["symbol"] or "__NONE__",
+            requested_as_of=now, retrieved_at=now, provider_response_timestamp=None,
+            http_status=record["http_status"], content_hash=None, normalized_record_hash=None,
+            cache_status=record["cache_status"], rate_limited=record["rate_limited"], retry_count=record["retry_count"],
+            latency_ms=record["latency_ms"], success=record["success"], error_code=record["error_code"],
+            retryable=record["retryable"], licensing_classification=licensing, raw_payload=None,
+        ))
+
+    return _hook
+
+
+def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> tuple:
+    """Returns `(registry, health_provider_names)`. `provider_mode` is
+    "fixture" (offline, no network/credentials — always available) or "real"
+    (docs/milestone-6.md Step 21: real mode requires explicit selection).
+    `conn`, when supplied, wires real HTTP calls to persist request/response
+    metadata (Step 5) for `provider-health`/`evidence-provider-usage`.
+    """
+    from .evidence_providers.cache import ProviderCache
+    from .evidence_providers.config import load_evidence_provider_config
+    from .evidence_providers.evidence_adapters import (
+        RealFilingEvidenceProvider,
+        RealFundamentalsEvidenceProvider,
+        RealMarketEvidenceProvider,
+        RealNewsEvidenceProvider,
+        RealSentimentEvidenceProvider,
+    )
+    from .evidence_providers.fixture_clients import FixtureMarketDataClient, FixtureSecClient
+    from .evidence_providers.http_client import HttpJsonClient
+    from .evidence_providers.market_data_provider import AlpacaMarketDataClient
+    from .evidence_providers.news_provider import UnconfiguredNewsProvider
+    from .evidence_providers.rate_limits import MinIntervalRateLimiter
+    from .evidence_providers.sec_provider import SecEdgarClient
+    from .evidence_providers.sentiment_provider import RedditSentimentSource
+    from .research.scheduled_cycle import PROVIDER_MODE_FIXTURE, PROVIDER_MODE_REAL, EvidenceProviderRegistry
+
+    if provider_mode == PROVIDER_MODE_FIXTURE:
+        sec = FixtureSecClient()
+        market = FixtureMarketDataClient()
+        registry = EvidenceProviderRegistry(
+            fundamentals=RealFundamentalsEvidenceProvider(sec), market=RealMarketEvidenceProvider(market),
+            filings=RealFilingEvidenceProvider(sec), news=None, sentiment=None, portfolio_context=None,
+            market_data_client=market, sec_client=sec,
+        )
+        return registry, ()
+
+    if provider_mode != PROVIDER_MODE_REAL:
+        raise ValueError(f"unknown provider-mode {provider_mode!r} — must be 'fixture' or 'real'")
+
+    provider_config = load_evidence_provider_config()
+    used_providers: list[str] = []
+    persist_hook = _make_persist_hook(conn)
+
+    sec = None
+    if provider_config.sec.enabled:
+        sec_cache = ProviderCache(clock=time.monotonic)
+        sec_http = HttpJsonClient(
+            base_headers={"User-Agent": provider_config.sec.user_agent_contact},
+            rate_limiter=MinIntervalRateLimiter(provider_config.sec.min_request_interval_seconds),
+            max_attempts=provider_config.sec.max_attempts, timeout_seconds=provider_config.sec.request_timeout_seconds,
+            provider="sec-edgar", on_response=persist_hook,
+        )
+        sec = SecEdgarClient(http_client=sec_http, cache=sec_cache, user_agent=provider_config.sec.user_agent_contact)
+        used_providers.append("sec-edgar")
+
+    market = None
+    if provider_config.market_data.enabled and cfg.alpaca_market_data_api_key and cfg.alpaca_market_data_api_secret:
+        market_cache = ProviderCache(clock=time.monotonic)
+        market_http = HttpJsonClient(
+            base_headers={"APCA-API-KEY-ID": cfg.alpaca_market_data_api_key, "APCA-API-SECRET-KEY": cfg.alpaca_market_data_api_secret},
+            rate_limiter=MinIntervalRateLimiter(provider_config.market_data.min_request_interval_seconds),
+            max_attempts=provider_config.market_data.max_attempts, timeout_seconds=provider_config.market_data.request_timeout_seconds,
+            provider="alpaca-data", on_response=persist_hook,
+        )
+        market = AlpacaMarketDataClient(
+            api_key=cfg.alpaca_market_data_api_key, api_secret=cfg.alpaca_market_data_api_secret,
+            http_client=market_http, cache=market_cache,
+        )
+        used_providers.append("alpaca-data")
+    # market_data.enabled=true with absent credentials fails closed to
+    # market=None (excluded from the registry) rather than raising — the
+    # cycle proceeds with whatever other evidence is available and records
+    # the gap in missing_data_reasons, consistent with "absent credentials
+    # fail closed" (docs/milestone-6.md Step 20).
+
+    news = RealNewsEvidenceProvider(UnconfiguredNewsProvider()) if provider_config.news.enabled else None
+    sentiment = (
+        RealSentimentEvidenceProvider(RedditSentimentSource(credentials_configured=provider_config.sentiment.enabled))
+        if provider_config.sentiment.enabled else None
+    )
+
+    registry = EvidenceProviderRegistry(
+        fundamentals=RealFundamentalsEvidenceProvider(sec) if sec else None,
+        market=RealMarketEvidenceProvider(market) if market else None,
+        filings=RealFilingEvidenceProvider(sec) if sec else None,
+        news=news, sentiment=sentiment, portfolio_context=None,
+        market_data_client=market, sec_client=sec,
+    )
+    return registry, tuple(used_providers)
+
+
+def provider_health_cli(db_path: Path) -> dict:
+    """`provider-health` CLI command (Milestone 6)."""
+    from .evidence_providers.health import compute_all_provider_health
+    from .evidence_providers.persistence import list_provider_requests
+
+    with session(db_path) as conn:
+        rows = list_provider_requests(conn)
+    summaries = compute_all_provider_health(rows)
+    return {
+        "providers": [
+            {
+                "provider": s.provider, "status": s.status, "total_requests": s.total_requests,
+                "success_rate": s.success_rate, "cache_hit_rate": s.cache_hit_rate,
+                "average_latency_ms": s.average_latency_ms, "p95_latency_ms": s.p95_latency_ms,
+            }
+            for s in summaries
+        ],
+    }
+
+
+def fetch_evidence_cli(symbol: str, as_of_str: str, db_path: Path, provider_mode: str) -> dict:
+    """`fetch-evidence` CLI command (Milestone 6). Builds and persists a real
+    (or fixture) point-in-time evidence snapshot — never calls Claude."""
+    from .research.configuration import load_research_config
+    from .research.scheduled_cycle import build_real_evidence_snapshot
+    from .storage.research_repositories import save_evidence_snapshot
+
+    symbol = symbol.upper()
+    try:
+        as_of = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        return {"error": f"invalid --as-of: {exc}"}
+    if as_of.tzinfo is None:
+        return {"error": "--as-of must be timezone-aware (e.g. 2026-07-01T20:00:00Z)"}
+
+    cfg = load_config()
+    research_config = load_research_config()
+
+    with session(db_path) as conn:
+        registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=cfg, conn=conn)
+        snapshot = build_real_evidence_snapshot(
+            symbol, as_of, providers=registry, deterministic_factors={}, config_hash=research_config.config_hash,
+            git_sha=_git_sha(), clock=lambda: datetime.now(timezone.utc),
+            max_evidence_items=research_config.max_evidence_items,
+            max_items_per_source_category=research_config.max_items_per_source_category,
+        )
+        newly_persisted = save_evidence_snapshot(conn, snapshot)
+
+    return {
+        "provider_mode": provider_mode, "providers_used": list(used_providers), "snapshot_id": snapshot.snapshot_id,
+        "symbol": snapshot.symbol, "as_of": snapshot.as_of.isoformat(), "evidence_item_count": len(snapshot.evidence_items),
+        "source_record_count": len(snapshot.source_records), "missing_data_reasons": list(snapshot.missing_data_reasons),
+        "point_in_time_safe": snapshot.point_in_time_safe, "newly_persisted": newly_persisted,
+    }
+
+
+def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, symbols: list[str] | None) -> dict:
+    """`run-research-cycle` CLI command (Milestone 6). `--provider-mode
+    fixture` (offline) is available by default; `--provider-mode real`
+    requires explicit selection and only queries providers explicitly
+    enabled in `config/evidence_providers.yaml`."""
+    from decimal import Decimal
+
+    from .analysis.scorer import load_scoring_config
+    from .analysis.screener import load_screening_config
+    from .research.configuration import load_research_config
+    from .research.deterministic_provider import DeterministicResearchProvider
+    from .research.prompt_registry import PromptRegistry
+    from .research.scheduled_cycle import run_scheduled_research_cycle
+    from .research.scheduled_research_config import load_scheduled_research_config
+    from .storage.research_cycle_repositories import SQLiteResearchCycleRepository
+    from .storage.research_repositories import SQLiteResearchRepository
+
+    try:
+        as_of = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        return {"error": f"invalid --as-of: {exc}"}
+    if as_of.tzinfo is None:
+        return {"error": "--as-of must be timezone-aware (e.g. 2026-07-01T20:00:00Z)"}
+
+    sr_config = load_scheduled_research_config()
+    cycle_config = sr_config.to_cycle_configuration(provider_mode=provider_mode)
+    research_config = load_research_config()
+
+    candidate_symbols = tuple(s.upper() for s in symbols) if symbols else tuple(
+        s.upper() for s in (["AAPL", "MSFT", "SHEL"] if provider_mode == "fixture" else [])
+    )
+    if not candidate_symbols:
+        return {"error": "no candidate symbols supplied — pass --symbol at least once for provider-mode=real"}
+
+    with session(db_path) as conn:
+        from .universe.tickers import default_universe
+        from .models.trading_models import PortfolioState
+
+        registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=load_config(), conn=conn)
+        result = run_scheduled_research_cycle(
+            as_of=as_of, symbols=candidate_symbols, configuration=cycle_config, conn=conn,
+            cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
+            screening_config=load_screening_config(), scoring_config=load_scoring_config(),
+            evidence_providers=registry, research_provider=DeterministicResearchProvider(),
+            research_provider_name="deterministic", research_model_name="deterministic-v1",
+            research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
+            prompt_registry=PromptRegistry(), portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
+        )
+
+    return {
+        "cycle_id": result.cycle_id, "status": result.status, "provider_mode": provider_mode,
+        "providers_used": list(used_providers), "reused_existing_cycle": result.reused_existing_cycle,
+        "symbol_results": [
+            {
+                "symbol": r.symbol, "status": r.status, "evidence_outcome": r.evidence_outcome,
+                "baseline_recommendation_id": r.baseline_recommendation_id,
+                "enhanced_recommendation_id": r.enhanced_recommendation_id, "baseline_side": r.baseline_side,
+                "enhanced_side": r.enhanced_side, "failure_reason": r.failure_reason,
+            }
+            for r in result.symbol_results
+        ],
+    }
+
+
+def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
+    """`resume-research-cycle` CLI command (Milestone 6). Re-invokes the same
+    cycle_id's already-attempted symbols — already-COMPLETED symbols are a
+    pure read (idempotent), unresolved ones are retried."""
+    from decimal import Decimal
+
+    from .analysis.scorer import load_scoring_config
+    from .analysis.screener import load_screening_config
+    from .models.trading_models import PortfolioState
+    from .research.configuration import load_research_config
+    from .research.deterministic_provider import DeterministicResearchProvider
+    from .research.prompt_registry import PromptRegistry
+    from .research.scheduled_cycle import ScheduledResearchConfiguration, run_scheduled_research_cycle
+    from .storage.research_cycle_repositories import SQLiteResearchCycleRepository
+    from .storage.research_repositories import SQLiteResearchRepository
+    from .universe.tickers import default_universe
+
+    with session(db_path) as conn:
+        repo = SQLiteResearchCycleRepository(conn)
+        cycle_row = repo.get_cycle(cycle_id)
+        if cycle_row is None:
+            return {"error": f"no persisted cycle {cycle_id!r}"}
+        symbol_rows = repo.list_symbol_results(cycle_id)
+        symbols = tuple(r["symbol"] for r in symbol_rows)
+        as_of = datetime.fromisoformat(cycle_row["as_of"])
+        provider_mode = cycle_row["provider_mode"]
+
+        cycle_config = ScheduledResearchConfiguration(
+            universe_id=cycle_row["universe_id"], max_candidates_per_cycle=max(len(symbols), 1),
+            experiment_policy=cycle_row["experiment_policy"], submit_paper_orders=False,
+            require_complete_evidence=True, require_point_in_time_safe=True, continue_on_symbol_failure=True,
+            provider_mode=provider_mode, config_hash=cycle_row["configuration_hash"],
+        )
+        registry, _used = _build_evidence_provider_registry(provider_mode, cfg=load_config(), conn=conn)
+        research_config = load_research_config()
+
+        result = run_scheduled_research_cycle(
+            as_of=as_of, symbols=symbols, configuration=cycle_config, conn=conn, cycle_repository=repo,
+            universe=default_universe(), screening_config=load_screening_config(), scoring_config=load_scoring_config(),
+            evidence_providers=registry, research_provider=DeterministicResearchProvider(),
+            research_provider_name="deterministic", research_model_name="deterministic-v1",
+            research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
+            prompt_registry=PromptRegistry(), portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
+        )
+
+    return {
+        "cycle_id": result.cycle_id, "status": result.status, "reused_existing_cycle": result.reused_existing_cycle,
+        "symbol_results": [{"symbol": r.symbol, "status": r.status} for r in result.symbol_results],
+    }
+
+
+def evaluate_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
+    """`evaluate-research-cycle` CLI command (Milestone 6). Computes forward
+    evaluations for every baseline+enhanced recommendation the cycle
+    produced — reuses `evaluation/evaluation_service.py` unchanged."""
+    from decimal import Decimal
+
+    from .evaluation.evaluation_service import evaluate_recommendation_all_horizons
+    from .evaluation.price_provider import DeterministicPriceProvider
+    from .runtime.paper_runtime_config import load_paper_runtime_config
+    from .storage import evaluation_repositories as eval_repo
+    from .storage.research_cycle_repositories import SQLiteResearchCycleRepository
+    from .storage.trading_repositories import load_recommendation
+
+    runtime_config = load_paper_runtime_config()
+    now = datetime.now(timezone.utc)
+    price_provider = DeterministicPriceProvider()
+
+    with session(db_path) as conn:
+        repo = SQLiteResearchCycleRepository(conn)
+        symbol_rows = repo.list_symbol_results(cycle_id)
+        if not symbol_rows:
+            return {"error": f"no persisted symbol results for cycle {cycle_id!r}"}
+
+        results = {}
+        for row in symbol_rows:
+            for label, rec_id in (("baseline", row["baseline_recommendation_id"]), ("enhanced", row["enhanced_recommendation_id"])):
+                if not rec_id:
+                    continue
+                recommendation = load_recommendation(conn, rec_id)
+                if recommendation is None:
+                    continue
+                evaluations = evaluate_recommendation_all_horizons(
+                    recommendation_id=rec_id, symbol=recommendation["symbol"],
+                    recommendation_price=Decimal(str(recommendation["price_at_rec"])) if recommendation.get("price_at_rec") is not None else None,
+                    execution_price=None, filled_quantity=0, requested_quantity=0, execution_completed_at=None,
+                    price_provider=price_provider, now=now, horizons=runtime_config.evaluation_horizons_trading_days,
+                    benchmark_symbol=runtime_config.evaluation_benchmark, model_version=recommendation.get("model_version"),
+                    prompt_version=recommendation.get("prompt_version"), config_hash=recommendation.get("config_hash"),
+                )
+                for e in evaluations:
+                    eval_repo.save_evaluation(conn, e)
+                results[f"{row['symbol']}:{label}"] = [
+                    {"horizon_trading_days": e.horizon_trading_days, "status": e.status} for e in evaluations
+                ]
+
+    return {"cycle_id": cycle_id, "benchmark": runtime_config.evaluation_benchmark, "evaluations": results}
+
+
+def compare_research_cycles_cli(db_path: Path) -> dict:
+    """`compare-research-cycles` CLI command (Milestone 6)."""
+    with session(db_path) as conn:
+        rows = conn.execute("SELECT * FROM research_cycles ORDER BY started_at").fetchall()
+        cycles = []
+        for row in rows:
+            symbol_rows = conn.execute(
+                "SELECT status FROM research_cycle_symbol_results WHERE cycle_id = ?", (row["cycle_id"],)
+            ).fetchall()
+            completed = sum(1 for r in symbol_rows if r["status"] == "COMPLETED")
+            failed = sum(1 for r in symbol_rows if r["status"] == "FAILED")
+            cycles.append({
+                "cycle_id": row["cycle_id"], "universe_id": row["universe_id"], "as_of": row["as_of"],
+                "status": row["status"], "experiment_policy": row["experiment_policy"], "provider_mode": row["provider_mode"],
+                "symbol_count": len(symbol_rows), "completed": completed, "failed": failed,
+            })
+    return {"cycles": cycles}
+
+
+def research_promotion_status_cli(experiment_id: str, db_path: Path) -> dict:
+    """`research-promotion-status` CLI command (Milestone 6). Never produces
+    a live-trading status — `research/promotion.py`'s status enum has none."""
+    from .evaluation.research_comparison import compare_arms
+    from .research.promotion import PromotionGateInputs, PromotionMetricInput, evaluate_promotion
+    from .research.scheduled_research_config import load_scheduled_research_config
+    from .storage import evaluation_repositories as eval_repo
+    from .storage.research_repositories import list_attempt_usage_rows, list_experiment_assignments
+
+    sr_config = load_scheduled_research_config()
+    if not sr_config.promotion_enabled:
+        return {"status": "PROMOTION_DISABLED", "reason": "promotion.enabled=false in config/scheduled_research.yaml"}
+
+    with session(db_path) as conn:
+        assignments = list_experiment_assignments(conn, experiment_id)
+        if not assignments:
+            return {"error": f"no persisted experiment assignments for {experiment_id!r}"}
+        all_evaluations = eval_repo.list_all_evaluations(conn)
+        by_rec = {}
+        for e in all_evaluations:
+            by_rec.setdefault(e.recommendation_id, []).append(e)
+        comparison = compare_arms(assignments, by_rec)
+        usage_rows = list_attempt_usage_rows(conn)
+
+    provider_failure_rate = 1 - (sum(1 for r in usage_rows if r["success"]) / len(usage_rows)) if usage_rows else 0.0
+    retry_rate = (sum(1 for r in usage_rows if r["retry_count"] > 0) / len(usage_rows)) if usage_rows else 0.0
+
+    decision = evaluate_promotion(
+        PromotionGateInputs(
+            completed_evaluations=min(comparison.baseline.recommendation_count, comparison.enhanced.recommendation_count),
+            market_regimes_observed=1,  # single-run session — see docs/milestone6 known limitations
+            excess_return_enhanced=PromotionMetricInput(status=comparison.enhanced.benchmark_relative_cumulative_return.status, value=comparison.enhanced.benchmark_relative_cumulative_return.value),
+            excess_return_baseline=PromotionMetricInput(status=comparison.baseline.benchmark_relative_cumulative_return.status, value=comparison.baseline.benchmark_relative_cumulative_return.value),
+            max_drawdown_enhanced=PromotionMetricInput(status=comparison.enhanced.max_drawdown.status, value=comparison.enhanced.max_drawdown.value),
+            max_drawdown_baseline=PromotionMetricInput(status=comparison.baseline.max_drawdown.status, value=comparison.baseline.max_drawdown.value),
+            incomplete_analysis_rate=0.0, unsupported_claim_rate=0.0, provider_failure_rate=provider_failure_rate,
+            retry_rate=retry_rate, reproducibility_rate=None,
+        ),
+        sr_config.promotion,
+    )
+    return {"experiment_id": experiment_id, "status": decision.status, "policy_version": decision.policy_version, "reasons": list(decision.reasons)}
+
+
+def evidence_provider_usage_cli(db_path: Path) -> dict:
+    """`evidence-provider-usage` CLI command (Milestone 6)."""
+    from .evidence_providers.persistence import list_provider_requests
+
+    with session(db_path) as conn:
+        rows = list_provider_requests(conn)
+    by_provider: dict[str, dict] = {}
+    for row in rows:
+        agg = by_provider.setdefault(row["provider"], {"requests": 0, "successes": 0, "cache_hits": 0})
+        agg["requests"] += 1
+        agg["successes"] += int(bool(row["success"]))
+        agg["cache_hits"] += int(row["cache_status"] == "HIT")
+    return {"by_provider": by_provider}
+
+
 def paper_status(db_path: Path) -> dict:
     from .paper.ledger import PaperLedger
 
@@ -830,6 +1244,31 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("research-performance", help="Research-run outcome rates: completed/incomplete/failed (Milestone 5)")
 
     sub.add_parser("research-usage", help="Token/latency/cost aggregation by role over persisted research attempts (Milestone 5)")
+
+    sub.add_parser("provider-health", help="Real evidence-provider health status (Milestone 6)")
+
+    p_fetch_evidence = sub.add_parser("fetch-evidence", help="Build and persist a real (or fixture) point-in-time evidence snapshot (Milestone 6)")
+    p_fetch_evidence.add_argument("--symbol", required=True)
+    p_fetch_evidence.add_argument("--as-of", required=True, help="ISO-8601 timezone-aware timestamp, e.g. 2026-07-01T20:00:00Z")
+    p_fetch_evidence.add_argument("--provider-mode", choices=("fixture", "real"), default="fixture")
+
+    p_run_cycle = sub.add_parser("run-research-cycle", help="Run one scheduled research cycle over a bounded candidate set (Milestone 6)")
+    p_run_cycle.add_argument("--as-of", required=True, help="ISO-8601 timezone-aware timestamp, e.g. 2026-07-01T20:00:00Z")
+    p_run_cycle.add_argument("--provider-mode", choices=("fixture", "real"), default="fixture")
+    p_run_cycle.add_argument("--symbol", action="append", dest="symbols", help="Candidate symbol (repeatable); fixture mode defaults to AAPL/MSFT/SHEL")
+
+    p_resume_cycle = sub.add_parser("resume-research-cycle", help="Resume a previously started scheduled research cycle by cycle_id (Milestone 6)")
+    p_resume_cycle.add_argument("--cycle-id", required=True)
+
+    p_eval_cycle = sub.add_parser("evaluate-research-cycle", help="Compute forward-performance evaluations for every recommendation a cycle produced (Milestone 6)")
+    p_eval_cycle.add_argument("--cycle-id", required=True)
+
+    sub.add_parser("compare-research-cycles", help="List every persisted scheduled research cycle and its outcome counts (Milestone 6)")
+
+    p_promotion_status = sub.add_parser("research-promotion-status", help="Deterministic promotion-gate status for one experiment (Milestone 6) — never a live-trading status")
+    p_promotion_status.add_argument("--experiment-id", required=True)
+
+    sub.add_parser("evidence-provider-usage", help="Real evidence-provider request/cache-hit counts (Milestone 6)")
 
     args = parser.parse_args(argv)
 
@@ -921,6 +1360,54 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "research-usage":
         cfg = load_config()
         outcome = research_usage_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "provider-health":
+        cfg = load_config()
+        outcome = provider_health_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "fetch-evidence":
+        cfg = load_config()
+        outcome = fetch_evidence_cli(args.symbol, args.as_of, cfg.research_database_path, args.provider_mode)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "run-research-cycle":
+        cfg = load_config()
+        outcome = run_research_cycle_cli(args.as_of, cfg.research_database_path, args.provider_mode, args.symbols)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "resume-research-cycle":
+        cfg = load_config()
+        outcome = resume_research_cycle_cli(args.cycle_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "evaluate-research-cycle":
+        cfg = load_config()
+        outcome = evaluate_research_cycle_cli(args.cycle_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "compare-research-cycles":
+        cfg = load_config()
+        outcome = compare_research_cycles_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "research-promotion-status":
+        cfg = load_config()
+        outcome = research_promotion_status_cli(args.experiment_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "evidence-provider-usage":
+        cfg = load_config()
+        outcome = evidence_provider_usage_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 

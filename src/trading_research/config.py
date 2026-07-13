@@ -38,8 +38,15 @@ class Config:
 
     log_level: str
 
+    # Milestone 6 real market-data provider — deliberately distinct from
+    # ALPACA_API_KEY/ALPACA_API_SECRET (Milestone 4), which remain read
+    # exclusively by the isolated paper_runtime process. See .env.example.
+    alpaca_market_data_api_key: str | None = None
+    alpaca_market_data_api_secret: str | None = None
+
     secret_fields: tuple[str, ...] = field(
-        default=("anthropic_api_key", "reddit_mcp_auth_token"), repr=False
+        default=("anthropic_api_key", "reddit_mcp_auth_token", "alpaca_market_data_api_key", "alpaca_market_data_api_secret"),
+        repr=False,
     )
 
     def require_anthropic_key(self) -> str:
@@ -106,6 +113,8 @@ def load_config(env_file: str | Path | None = None, *, require_anthropic: bool =
             "ROBINHOOD_MCP_URL", "https://agent.robinhood.com/mcp/trading"
         ),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        alpaca_market_data_api_key=os.environ.get("ALPACA_MARKET_DATA_API_KEY") or None,
+        alpaca_market_data_api_secret=os.environ.get("ALPACA_MARKET_DATA_API_SECRET") or None,
     )
 
     if require_anthropic:

@@ -1,0 +1,30 @@
+# Real evidence-provider configuration (Milestone 6, docs/milestone-6.md
+# Step 20). Every provider defaults to DISABLED — presence of a credential
+# in the environment never flips `enabled` by itself (mirrors
+# config/research.yaml's existing "no fallback provider selected silently"
+# posture). An unrecognized provider name fails closed.
+version: 1
+
+providers:
+  sec:
+    enabled: true              # no API key required — public SEC EDGAR endpoints only
+    user_agent_contact: "agentic-trading-desk-milestone6 research@example.com"
+    request_timeout_seconds: 30
+    max_attempts: 2
+    min_request_interval_seconds: 0.15
+
+  market_data:
+    enabled: false
+    provider: alpaca            # only "alpaca" is implemented; anything else fails closed
+    request_timeout_seconds: 30
+    max_attempts: 2
+    min_request_interval_seconds: 0.35
+
+  news:
+    enabled: false
+    provider: null               # no real news provider is implemented in this milestone
+    request_timeout_seconds: 30
+    max_attempts: 2
+
+  sentiment:
+    enabled: false                # requires REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET

@@ -158,7 +158,27 @@ Milestone 5 implemented:
 * evaluation comparison;
 * opt-in Claude API smoke testing.
 
-The real Claude API smoke test reached Anthropic but was blocked by account billing or insufficient credit. It did not validate a successful real structured output.
+Milestone 5 completed a successful real Claude structured-output smoke test
+using claude-sonnet-5.
+
+The validated path included:
+
+- real Anthropic API authentication;
+- forced tool-use structured output;
+- Anthropic-compatible wire-schema transformation;
+- full local bounded-schema validation;
+- claim-to-evidence validation;
+- token usage capture;
+- latency capture;
+- bounded non-retryable 4xx handling.
+
+The final smoke test passed with approximately:
+
+- input tokens: 3,222;
+- output tokens: approximately 1,800;
+- latency: approximately 16.6 seconds.
+
+The exact values should be verified from the persisted test result or documentation.
 
 Milestone 4 is now fully validated for a credentialed paper-broker acknowledgement:
 
@@ -1849,7 +1869,7 @@ RECORDED-PROVIDER-FIXTURE
 REAL-SEC-DATA
 REAL-MARKET-DATA
 REAL-NEWS-DATA
-REAL-CLAUDE-STRUCTURED-OUTPUT
+REAL-CLAUDE-STRUCTURED-OUTPUT: previously confirmed in Milestone 5
 SHADOW-EXPERIMENT
 REAL-PAPER-EXECUTION
 ENVIRONMENTALLY-PENDING
