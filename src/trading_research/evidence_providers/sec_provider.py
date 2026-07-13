@@ -60,7 +60,7 @@ class SecEdgarClient:
         is not in SEC's public ticker index."""
         symbol = symbol.upper()
         if self._cik_index is None:
-            key = CacheKey.build(provider="sec", operation="ticker_index", symbol="__ALL__")
+            key = CacheKey.build(provider="sec-edgar", operation="ticker_index", symbol="__ALL__")
             cached = self._cache.get(key) if self._cache else None
             if cached is not None:
                 self._cik_index = cached
@@ -83,7 +83,7 @@ class SecEdgarClient:
         cik = cik or self.resolve_cik(symbol)
         if cik is None:
             return ()
-        key = CacheKey.build(provider="sec", operation="submissions", symbol=symbol, cik=cik)
+        key = CacheKey.build(provider="sec-edgar", operation="submissions", symbol=symbol, cik=cik)
         payload = self._cache.get(key) if self._cache else None
         if payload is None:
             payload, _meta = self._http.get_json(SUBMISSIONS_URL_TEMPLATE.format(cik10=cik), operation="submissions", symbol=symbol)
@@ -129,7 +129,7 @@ class SecEdgarClient:
         cik = cik or self.resolve_cik(symbol)
         if cik is None:
             return ()
-        key = CacheKey.build(provider="sec", operation="companyfacts", symbol=symbol, cik=cik)
+        key = CacheKey.build(provider="sec-edgar", operation="companyfacts", symbol=symbol, cik=cik)
         payload = self._cache.get(key) if self._cache else None
         if payload is None:
             payload, _meta = self._http.get_json(COMPANY_FACTS_URL_TEMPLATE.format(cik10=cik), operation="companyfacts", symbol=symbol)

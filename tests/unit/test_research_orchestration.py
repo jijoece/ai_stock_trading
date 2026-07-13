@@ -197,6 +197,38 @@ def test_prompt_version_change_creates_a_new_run_id(tmp_path: Path):
     assert run_id_original != run_id_edited
 
 
+def test_manager_decision_with_empty_bear_case_is_retried_not_crashed():
+    """Milestone 6.1 application-bug regression: an empty `bear_case` passes JSON Schema
+    (no `minLength`) but fails `ResearchDecision.__post_init__`'s own invariant, raising
+    `EvidenceValidationError`. Before the Step 14 fix this propagated uncaught out of
+    `_run_role_with_retries`, crashing the whole committee run instead of being retried."""
+    bad_manager_payload = dict(MANAGER_PAYLOAD, bear_case="")
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+        ("technical", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+        ("manager", 1): ScriptedStep(kind="response", payload=bad_manager_payload),
+        ("manager", 2): ScriptedStep(kind="response", payload=MANAGER_PAYLOAD),
+    })
+    repo = FakeResearchRepository()
+
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo, configuration=_config(), clock=lambda: NOW,
+        run_mode="scripted",
+    )
+
+    assert result.status == RUN_STATUS_COMPLETED
+    assert result.decision is not None
+    assert [c.role for c in provider.calls if c.role == "manager"] == ["manager", "manager"]
+    from trading_research.research.failure_taxonomy import CODE_MISSING_BEAR_CASE, STAGE_STRUCTURED_SCHEMA
+
+    bear_case_failures = [f for f in repo.failures if f.code == CODE_MISSING_BEAR_CASE]
+    assert len(bear_case_failures) == 1
+    assert bear_case_failures[0].stage == STAGE_STRUCTURED_SCHEMA
+    assert bear_case_failures[0].role == "manager"
+    assert bear_case_failures[0].attempt_number == 1
+
+
 def test_preflight_missing_evidence_blocks_before_any_provider_call():
     thin_snapshot = build_fixture_snapshot("XXXX", NOW, config_hash="c" * 64, git_sha="sha1", clock=lambda: NOW)
     provider = ScriptedResearchProvider({})  # no steps scripted at all — any call is a test failure

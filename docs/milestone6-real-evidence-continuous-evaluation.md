@@ -354,10 +354,12 @@ recorded in the Milestone 6 scratchpad's "Environmental validation" section.
 6. **Portfolio-context weighting uses cost basis, not live market value** — no live-marking
    price source is wired into `LedgerPortfolioContextProvider` (documented in its own
    returned `note` field, not silently approximated as exact).
-7. **`evidence_provider_requests` persistence covers only the raw-HTTP-client layer's own
-   calls**, not cache hits (a cache hit never reaches `HttpJsonClient.get_json`, so it is not
-   separately logged to this table) — cache hit/miss counts are still available via
-   `ProviderCache.stats()` in-process, just not persisted across runs.
+7. ~~`evidence_provider_requests` persistence covers only the raw-HTTP-client layer's own
+   calls, not cache hits~~ — **fixed in Milestone 6.1**: `ProviderCache.get()` now notifies
+   the same `on_response` callback `HttpJsonClient` uses on a genuine cache `HIT` (and on
+   `CACHE_CORRUPT`), so cache activity is now visible in `evidence_provider_requests` and in
+   `provider-health`'s `cache_hit_rate`. See `docs/milestone-6.1.md`'s documentation section
+   below.
 8. **Only one primary market-data provider (Alpaca) and one primary filing/fundamentals
    source (SEC EDGAR) are implemented**, per the milestone's explicit "avoid adding several
    overlapping providers without a justified need."
@@ -371,3 +373,256 @@ scheduler, or daemon exists in this repository.** `scheduled_research.enabled` i
 scheduler, a CI job) is permitted to treat a cycle run as sanctioned; it does not itself
 cause recurring execution. Every invocation in this milestone was a single, explicit CLI or
 test invocation.
+
+## Milestone 6.1 — Bear-role failure diagnostics
+
+**Status:** Code-complete. All 654 pre-existing tests still pass; 93 new tests added
+(747 passed, 6 skipped total). Real-Claude revalidation was environmentally blocked (no
+`ANTHROPIC_API_KEY` in this environment) — reported honestly, not fabricated. See
+`.claude/scratchpads/milestone6-progress.md`'s "Milestone 6.1" section for the complete,
+unedited working log.
+
+### The original incident
+
+The Milestone 6 manual real-Claude scheduled-cycle validation reported that the `bear`
+analyst role exhausted both of its allowed attempts (`research_run_id=
+run-e4544adb0ac3e1faf405846132bdcf3d`), the `manager` role was correctly never invoked
+afterward, and the run correctly ended `ANALYSIS_INCOMPLETE` — but the exact failure
+stage/code for each bear attempt was never recorded, only a free-text
+`ResearchAttemptRecord.failure_reason` string.
+
+### Historical persistence sufficiency
+
+**Insufficient — OBSERVABILITY GAP.** `data/research.sqlite3` (this repository's real,
+gitignored research database) contains zero rows in `research_committee_runs`; every other
+`.sqlite3` file discoverable in this environment was also checked and none contains the
+target `research_run_id`. This is consistent with the Milestone 6 document's own "Known
+limitations" #3 (the real-Claude path was validated *manually*, not via a committed,
+repeatable test) — the database that captured it did not survive. No root cause for this
+*specific* historical run is claimed; see "Root-cause classification" below for what was
+established instead.
+
+### Root-cause classification
+
+1. For `run-e4544adb0ac3e1faf405846132bdcf3d` itself: **OBSERVABILITY GAP** (see above) —
+   the fix is this entire session's structured-persistence layer, which prevents the gap
+   from recurring for any future run.
+2. For the most evidence-backed *representative* failure category (a bear-role claim
+   citing a fabricated numeric downside estimate not present in the evidence): **VALID
+   EXPECTED REJECTION**, with a contributing **PROMPT DEFECT**. `claim_validation.py`'s
+   numeric-tolerance rejection is correct, already-proven behavior (Milestone 5's own real
+   Claude validation demonstrated the identical rejection on live output); the bear prompt
+   never explicitly told the model not to invent a downside number, which is now fixed
+   (see below).
+3. Independently discovered while tracing the failure path (not from reproducing the
+   historical incident): two **APPLICATION BUG**s — (a) `AnthropicResearchProvider`
+   discarded `stop_reason`/token counts before raising a tool-use-extraction failure,
+   which would have made a genuine `OUTPUT-TOKEN LIMIT` failure undiagnosable; (b)
+   `orchestration.py` did not catch `EvidenceValidationError` around
+   `build_decision`/`build_role_report`, so a manager decision with an empty
+   `bear_case`/`bull_case` could crash the entire committee run instead of being retried.
+   Both are fixed — see "Fixes" below.
+
+No validator was weakened. `claim_validation.py`'s tolerance, evidence-citation rules, and
+rejection criteria are byte-for-byte unchanged from Milestone 5.
+
+### Failure taxonomy
+
+`research/failure_taxonomy.py` — 14 validated stages (`PROVIDER_REQUEST` ...
+`UNKNOWN`) and 31 validated codes (`PROVIDER_TIMEOUT` ... `UNCLASSIFIED_VALIDATION_FAILURE`),
+matching the milestone document's suggested lists exactly. An unrecognized stage/code
+raises `FailureValidationError` immediately — there is no silent fallback to a fabricated
+specific classification.
+
+### Failure model
+
+`ResearchValidationFailure` (frozen dataclass): `failure_id` (deterministic SHA-256 of the
+failure's own content — the same failure always produces the same ID, which is what makes
+persistence idempotent), `research_run_id`, `attempt_id`, `role`, `attempt_number`,
+`stage`, `code`, `message` (bounded, 2000 chars), `field_path` (bounded, 300 chars),
+`claim_id`, `evidence_ids` (bounded, 50 entries), `retryable`, `model_name`,
+`prompt_version`, `schema_version`, `occurred_at` (UTC-aware, enforced), and `metadata` — a
+strictly allowlisted mapping (`stop_reason`, `input_tokens`, `output_tokens`,
+`latency_ms`, `provider_status_code`, `expected_type`, `actual_type`,
+`allowed_evidence_count`, `numeric_tolerance`, `max_output_tokens`, `tool_name`,
+`tool_use_block_count`, `blocking_role_count`, `attempts_made`) with an additional
+secret-like-value scan on every string. An unknown metadata key, or a value matching a
+secret-like pattern, is rejected outright.
+
+### Schema and migration changes
+
+Additive only, applied idempotently from `storage/database.py::connect` (unchanged
+convention): `storage/research_schema.py` gained `research_attempt_failures` (one row per
+structured failure — `failure_id`, `attempt_id`, `research_run_id`, `role`,
+`attempt_number`, `stage`, `code`, `message`, `field_path`, `claim_id`,
+`evidence_ids_json`, `retryable`, `model_name`, `prompt_version`, `schema_version`,
+`metadata_json`, `occurred_at`), append-only (UPDATE/DELETE trigger-rejected, matching
+`research_attempts`'s own convention), plus five supporting indexes. A pre-existing,
+completely unused `research_failures` stub table (no code ever wrote or read it) was left
+untouched — not retrofitted, not deleted.
+
+### Repository APIs
+
+`storage/research_repositories.py`: `SQLiteResearchRepository.save_attempt_failure(s)`
+(idempotent on the deterministic `failure_id`), `.list_run_failures(research_run_id)`
+(used by replay); module-level `list_attempt_failures(conn, attempt_id)`,
+`list_role_failures(conn, run_id, role)`, `list_run_failures(conn, run_id, *, role=,
+attempt_number=, stage=, code=, retryable=)`, `summarize_run_failures(conn, run_id)`,
+`list_attempt_rows_for_metrics(conn)`, `list_all_attempt_failures(conn)`.
+
+### Provider and output-classification changes
+
+`research/errors.py::ResearchError` gained optional `stage`/`code`/`field_path`/
+`claim_id`/`evidence_ids`/`retryable`/`metadata` keyword arguments plus per-subclass
+defaults — purely additive, no existing `raise XError("...")` call site changed behavior.
+`research/anthropic_provider.py::generate_structured` now extracts
+`stop_reason`/`input_tokens`/`output_tokens` immediately after receiving a response,
+before any tool-use-extraction check runs, and distinguishes: no tool_use block at all
+(`OUTPUT_TRUNCATED` when `stop_reason == "max_tokens"`, else
+`EXPECTED_TOOL_USE_MISSING`), a tool_use block with the wrong name (`UNEXPECTED_TOOL_NAME`),
+more than one matching tool_use block (`MULTIPLE_TOOL_BLOCKS`), and a non-dict
+`tool_use.input` (`MALFORMED_TOOL_INPUT`) — previously these four cases collapsed into one
+generic `MalformedOutputError` with no usage/stop_reason captured.
+`output_validation.py::validate_against_schema` now attaches one structured entry per
+underlying `jsonschema` violation (and per forbidden-field hit) to
+`SchemaValidationError.schema_errors`, deterministically mapped via `classify_schema_error`
+(`required`→`SCHEMA_REQUIRED_FIELD_MISSING`, `type`→`SCHEMA_TYPE_MISMATCH`,
+`enum`→`SCHEMA_ENUM_INVALID`, `additionalProperties`→`SCHEMA_EXTRA_FIELD`,
+`maxItems`/`minItems`→`SCHEMA_LIST_LIMIT_EXCEEDED`, unrecognized →
+`UNCLASSIFIED_VALIDATION_FAILURE`).
+
+### Claim-validation persistence changes
+
+`claim_validation.py::classify_claim_rejection_reason` pattern-matches the module's own
+prose reason strings into codes (`UNKNOWN_EVIDENCE_ID`, `STALE_EVIDENCE_REFERENCE`,
+`POINT_IN_TIME_UNSAFE_EVIDENCE`, `UNSUPPORTED_NUMERIC_CLAIM`, `NUMERIC_VALUE_MISMATCH`,
+`UNSUPPORTED_MATERIAL_CLAIM`) — the validator's own logic is unchanged; this only makes
+its existing decisions queryable. `orchestration.py` now persists a
+`ResearchValidationFailure` for **every** rejected claim, including a claim whose
+importance was too low to invalidate the whole report — previously that case was silently
+dropped (never persisted anywhere, not even in the free-text `failure_reason`).
+
+### Retry-feedback changes
+
+`failure_taxonomy.py::build_retry_feedback` groups failures by code (with an occurrence
+count for duplicates), caps the number of distinct lines at 5, appends the exact allowed
+`evidence_id` set when relevant, and always ends with an explicit "return a complete
+replacement report" instruction — replacing the previous behavior of feeding the entire
+raw exception string or the entire joined claim-rejection string back into the next
+attempt's prompt unbounded.
+
+### Prompt changes
+
+`prompts/research/bear/v1.txt` rewritten to explicitly forbid invented numeric downside
+percentages/price targets/probability estimates, require visible fact/inference/uncertainty
+separation, require at least one `risks` entry, and require a complete replacement report
+after retry feedback. Edited in place (not a new `v2.txt`) — `PromptRegistry` hashes the
+prompt's *text*, so this edit alone changes `prompt_hash` and therefore
+`research_run_id` for any future run, per Milestone 5's existing versioning design.
+
+### Evidence-presentation changes
+
+None. No change to `evidence_validation.py`'s rendering, delimiting, or injection-risk
+annotation.
+
+### Validator changes
+
+None that weaken anything. `claim_validation.py`'s tolerance and rejection logic is
+unchanged. `decision_json_schema`/`role_report_json_schema` are unchanged (a
+`minLength: 1` addition for `bear_case`/`bull_case` was considered and rejected — it would
+have incorrectly forced a non-empty `bear_case` even on a legitimate `ANALYSIS_INCOMPLETE`
+decision, which the dataclass explicitly permits; the narrower, correct fix was catching
+`EvidenceValidationError` in the orchestrator instead — see "Provider and
+output-classification changes").
+
+### CLI diagnostics
+
+`python -m trading_research.cli research-failures --research-run-id <id> [--role] [--attempt] [--stage] [--code]`
+— sanitized structured JSON (never a raw prompt, raw response, chain-of-thought, or
+secret), counts by stage/code, non-zero exit code on an unknown run.
+`python -m trading_research.cli research-failure-metrics` — see "Failure metrics" below.
+
+### Replay changes
+
+`replay_research_run` now re-runs `validate_role_report`/`validate_decision` against every
+persisted role report/decision, normalizes the results into `(role, code, claim_id)`
+signatures, and compares them against the persisted `research_attempt_failures` rows for
+the same stage — reporting `matched`, `missing_persisted` (validator now flags something
+not persisted at run time), `unexpected_persisted` (a persisted failure the validator no
+longer reproduces — genuine validator-version drift), and `not_reconstructible` (a role
+whose every attempt was rejected has no persisted `RoleResearchReport` to re-validate at
+all — structurally different from "the validator changed its mind," and reported
+separately so the two are never conflated). Still has no `provider` parameter — replay
+remains structurally incapable of calling a provider or executing anything.
+
+### Failure metrics
+
+`research/failure_metrics.py::compute_research_failure_metrics` — failures by
+role/stage/code, attempts-per-completed-role, retry-success/exhaustion rate,
+required-role-failure rate, manager-skip rate, unknown-evidence-ID rate,
+unsupported-numeric-claim rate, schema-failure rate, output-truncation rate,
+provider-error rate, average failed-attempt input/output tokens and latency, tokens spent
+on exhausted retries — every metric reports `OK`/`INSUFFICIENT_DATA`/`UNDEFINED`
+explicitly, never a misleading zero. Wired to the new `research-failure-metrics` CLI
+command.
+
+### Fixes
+
+1. **Prompt defect** — see "Prompt changes" above.
+2. **Application bug (provider observability)** — `anthropic_provider.py` now captures
+   token/stop_reason/latency before any tool-use-extraction failure is raised; a
+   `max_tokens` stop reason with no tool_use block is now `OUTPUT_TRUNCATED`, not a
+   generic malformed-output error.
+3. **Application bug (uncaught exception)** — `orchestration.py` now catches
+   `EvidenceValidationError` alongside `SchemaValidationError`, so an empty
+   `bear_case`/`bull_case` is a retried, classified failure (`MISSING_BEAR_CASE` /
+   `SCHEMA_REQUIRED_FIELD_MISSING`) instead of an unhandled crash. Regression test:
+   `tests/unit/test_research_orchestration.py::
+   test_manager_decision_with_empty_bear_case_is_retried_not_crashed`.
+4. **Hardening (provider cache-hit persistence)** — `evidence_providers/cache.py::
+   ProviderCache.get()` now notifies the same `on_response` callback `HttpJsonClient`
+   uses on a cache `HIT`/`CACHE_CORRUPT` (deliberately not on `MISS`/
+   `STALE_CACHE_REJECTED`, since those always fall through to a real HTTP call that
+   already persists its own row — notifying there too would double-count real requests).
+   A genuine bug found in the process: `sec_provider.py`'s `CacheKey.build(provider="sec",
+   ...)` used a different provider-name string than its own `HttpJsonClient(provider=
+   "sec-edgar", ...)`, which would have grouped cache-hit rows under the wrong provider —
+   fixed to `"sec-edgar"` for both.
+5. **Hardening (single-provider concentration)** — `provider-health` now returns a
+   `concentration` object exposing `market_data_provider_count`/`filing_provider_count`/
+   `fundamentals_provider_count`/`news_provider_count`/`sentiment_provider_count`/
+   `redundancy_status` — a static, documented architectural fact (ADR 0004), not a metric
+   derived from request volume, and no new provider was added.
+
+### Correct rejections retained
+
+Every existing Milestone 1-6 test still passes unmodified. The claim-to-evidence
+validator's numeric tolerance, evidence-citation rules, point-in-time-safety checks, and
+schema strictness are byte-for-byte unchanged. `tests/unit/test_research_claim_validation.py`
+and `tests/unit/test_research_output_validation.py`'s pre-existing assertions were not
+weakened — only new classification-focused tests were added alongside them.
+
+### Real Claude revalidation outcome
+
+**Not run — environmentally blocked.** No `ANTHROPIC_API_KEY` is configured in this
+development environment (checked via `dotenv_values()` boolean presence only). All
+revalidation this session used `ScriptedResearchProvider` against the real, unmodified
+orchestration code path; the Anthropic-SDK-specific classification logic
+(`anthropic_provider.py`) is instead unit-tested against locally-constructed real
+`anthropic.*Error`/response-shaped objects
+(`tests/unit/test_research_anthropic_provider_classification.py`), exercising the same
+code paths a live call would trigger without requiring network access or credentials.
+
+### Remaining limitations
+
+1. `CROSS_SNAPSHOT_EVIDENCE`/`CROSS_SYMBOL_EVIDENCE`/`UNIT_MISMATCH`/
+   `UNSUPPORTED_MATERIAL_CLAIM` (claim-level) are defined in the taxonomy but not
+   currently reachable — the existing claim validator cannot yet distinguish "evidence_id
+   never existed" from "belongs to a different snapshot/symbol," and does not compare
+   units; extending it was out of this session's narrow, evidence-backed scope.
+2. Real-Claude revalidation of the bear-role prompt fix could not be performed in this
+   environment (no API key) — the fix is validated deterministically
+   (`test_bear_role_failure_reproduction.py`) but not yet against a live model response.
+3. Corporate-status/going-concern SEC metadata and portfolio-context market-value pricing
+   remain deferred to Milestone 7 (see the M6.1 scratchpad's "Issues deferred" for the
+   specific justification for each).

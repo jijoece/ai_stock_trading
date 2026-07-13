@@ -12,12 +12,56 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from .failure_taxonomy import (
+    CODE_NUMERIC_VALUE_MISMATCH,
+    CODE_POINT_IN_TIME_UNSAFE_EVIDENCE,
+    CODE_STALE_EVIDENCE_REFERENCE,
+    CODE_UNKNOWN_EVIDENCE_ID,
+    CODE_UNSUPPORTED_MATERIAL_CLAIM,
+    CODE_UNSUPPORTED_NUMERIC_CLAIM,
+)
 from .models import EvidenceSnapshot, ResearchClaim, ResearchDecision, RoleResearchReport
 
 # Rounding-only tolerance for numeric claims — never a loophole for a model
 # to introduce a materially different financial value (Step 9: "use
 # documented tolerances only for legitimate rounding").
 NUMERIC_TOLERANCE_RELATIVE = Decimal("0.02")
+
+
+def classify_claim_rejection_reason(reason: str) -> str:
+    """Maps a `validate_claim`/`validate_decision` prose reason to a
+    `failure_taxonomy` code (docs/milestone-6.1.md Step 9). Pattern-matched against the
+    *exact* strings this module produces above — kept in the same module deliberately, so
+    a wording change and its classifier stay co-located and get caught by the same test.
+
+    Note on `CROSS_SNAPSHOT_EVIDENCE`/`CROSS_SYMBOL_EVIDENCE`/`UNIT_MISMATCH`: these
+    taxonomy codes exist for a future validator that can distinguish "evidence_id never
+    existed anywhere" from "evidence_id belongs to a different snapshot/symbol", and can
+    compare units. The current validator (unchanged by this milestone — Step 14: "do not
+    broaden tolerances/validator behavior without evidence") only ever proves "not present
+    in *this* snapshot" — this function reports exactly what the validator actually
+    determined, never more. `UNSUPPORTED_NUMERIC_CLAIM` vs. `NUMERIC_VALUE_MISMATCH` *is*
+    distinguished, per Step 9's explicit mapping: no comparable value at all is
+    `UNSUPPORTED_NUMERIC_CLAIM`; a candidate value existed but disagreed beyond tolerance
+    is `NUMERIC_VALUE_MISMATCH`.
+    """
+    if "cites unknown evidence_id" in reason:
+        return CODE_UNKNOWN_EVIDENCE_ID
+    if "relies on stale evidence_id" in reason:
+        return CODE_STALE_EVIDENCE_REFERENCE
+    if "relies on point-in-time-unsafe evidence_id" in reason:
+        return CODE_POINT_IN_TIME_UNSAFE_EVIDENCE
+    if "has no comparable normalized_values" in reason:
+        return CODE_UNSUPPORTED_NUMERIC_CLAIM
+    if "does not match any cited evidence's normalized_values" in reason:
+        return CODE_NUMERIC_VALUE_MISMATCH
+    if "cites no evidence" in reason:
+        return CODE_UNSUPPORTED_MATERIAL_CLAIM
+    if "cites unknown/fabricated evidence_id" in reason:
+        return CODE_UNKNOWN_EVIDENCE_ID
+    if "missing_data_reasons" in reason:
+        return CODE_UNSUPPORTED_MATERIAL_CLAIM
+    return "UNCLASSIFIED_VALIDATION_FAILURE"
 
 
 @dataclass(frozen=True)

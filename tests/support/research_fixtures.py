@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from trading_research.research.failure_taxonomy import ResearchValidationFailure
 from trading_research.research.models import ResearchDecision, RoleResearchReport
 from trading_research.research.orchestration import ResearchAttemptRecord
 
@@ -16,6 +17,7 @@ from trading_research.research.orchestration import ResearchAttemptRecord
 class FakeResearchRepository:
     runs: dict = field(default_factory=dict)  # research_run_id -> dict(status=..., snapshot_id=..., ...)
     attempts: list = field(default_factory=list)
+    failures: list = field(default_factory=list)
     role_reports: dict = field(default_factory=dict)  # (research_run_id, role) -> RoleResearchReport
     decisions: dict = field(default_factory=dict)  # research_run_id -> ResearchDecision
 
@@ -37,6 +39,16 @@ class FakeResearchRepository:
 
     def save_attempt(self, attempt: ResearchAttemptRecord) -> None:
         self.attempts.append(attempt)
+
+    def save_attempt_failures(self, failures: "tuple[ResearchValidationFailure, ...]") -> None:
+        existing_ids = {f.failure_id for f in self.failures}
+        for failure in failures:
+            if failure.failure_id not in existing_ids:
+                self.failures.append(failure)
+                existing_ids.add(failure.failure_id)
+
+    def list_run_failures(self, research_run_id: str) -> "tuple[ResearchValidationFailure, ...]":
+        return tuple(f for f in self.failures if f.research_run_id == research_run_id)
 
     def save_role_report(self, report: RoleResearchReport, attempt_id: str, created_at: datetime) -> None:
         self.role_reports[(report.research_run_id, report.role)] = report

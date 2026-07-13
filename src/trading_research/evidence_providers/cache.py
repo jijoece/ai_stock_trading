@@ -44,13 +44,30 @@ class ProviderCache:
     """In-process deterministic cache. Not shared across processes — each
     scheduled-cycle run gets a fresh cache, which is sufficient to satisfy
     "no duplicate provider calls within one cycle" without adding a second
-    persistence layer redundant with `evidence_provider_responses`."""
+    persistence layer redundant with `evidence_provider_responses`.
+
+    Milestone 6.1 (docs/milestone-6.1.md Step 18, "Provider cache hits not
+    persisted"): `on_response`, when set, mirrors `http_client.HttpJsonClient`'s own
+    callback exactly — same dict shape, same call sites end up persisting it via the same
+    `_make_persist_hook` — so a cache hit is now visible in `evidence_provider_requests`
+    and in `provider-health`'s `cache_hit_rate` instead of only in this in-process
+    `stats()` snapshot, which never survives the process. Never duplicates the cached raw
+    payload — only request-level telemetry (`cache_status="HIT"`, zero latency, no retry)
+    is emitted, matching the existing no-raw-payload-duplication policy.
+
+    Deliberately does **not** notify on a plain MISS or a `STALE_CACHE_REJECTED` expiry:
+    every real call site (`sec_provider.py`, `market_data_provider.py`) falls through to a
+    genuine `HttpJsonClient.get_json` call immediately after either of those, and that
+    call already persists its own row — notifying here too would double-count every real
+    network request. `CACHE_CORRUPT` is safe to notify because it *raises*
+    `CacheCorruptionError` instead of falling through to a follow-up HTTP call."""
 
     clock: Callable[[], float]
     _store: dict[CacheKey, _Entry] = field(default_factory=dict)
     hits: int = field(default=0, init=False)
     misses: int = field(default=0, init=False)
     corruptions: int = field(default=0, init=False)
+    on_response: Callable[[dict], None] | None = None
 
     def get(self, key: CacheKey) -> Any | None:
         entry = self._store.get(key)
@@ -65,11 +82,22 @@ class ProviderCache:
                     self.misses += 1
                     return None
             self.hits += 1
+            self._notify(key, cache_status="HIT")
             return entry.value
         except Exception as exc:  # fail closed on any corrupted/unreadable entry
             self.corruptions += 1
             self._store.pop(key, None)
+            self._notify(key, cache_status="CACHE_CORRUPT", success=False, error_code="CacheCorruptionError")
             raise CacheCorruptionError(f"corrupted cache entry for {key}: {exc}") from exc
+
+    def _notify(self, key: CacheKey, *, cache_status: str, success: bool = True, error_code: str | None = None) -> None:
+        if self.on_response is None:
+            return
+        self.on_response({
+            "provider": key.provider, "operation": key.operation, "symbol": key.symbol,
+            "http_status": None, "cache_status": cache_status, "rate_limited": False, "retry_count": 0,
+            "latency_ms": 0, "success": success, "error_code": error_code, "retryable": None,
+        })
 
     def set(self, key: CacheKey, value: Any, *, ttl_seconds: float | None) -> None:
         self._store[key] = _Entry(value=value, stored_at=self.clock(), ttl_seconds=ttl_seconds)

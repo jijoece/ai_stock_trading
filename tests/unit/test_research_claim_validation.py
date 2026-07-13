@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from trading_research.research.claim_validation import validate_claim, validate_decision, validate_role_report
+from trading_research.research.claim_validation import classify_claim_rejection_reason, validate_claim, validate_decision, validate_role_report
 from trading_research.research.models import EvidenceItem, EvidenceSnapshot, ResearchClaim, ResearchDecision, RoleResearchReport, SourceRecord
 
 NOW = datetime(2026, 7, 1, tzinfo=timezone.utc)
@@ -167,6 +167,47 @@ def test_analysis_incomplete_with_missing_data_reasons_is_consistent():
     )
     result = validate_decision(decision, snap)
     assert result.is_valid
+
+
+def test_classify_unknown_evidence_id_reason():
+    snap = _snapshot()
+    result = validate_claim(_claim(evidence_ids=("ev-does-not-exist",)), snap)
+    assert classify_claim_rejection_reason(result.reasons[0]) == "UNKNOWN_EVIDENCE_ID"
+
+
+def test_classify_stale_evidence_reason():
+    snap = _snapshot(items=[_item(stale=True)])
+    result = validate_claim(_claim(), snap)
+    assert classify_claim_rejection_reason(result.reasons[0]) == "STALE_EVIDENCE_REFERENCE"
+
+
+def test_classify_point_in_time_unsafe_reason():
+    snap = _snapshot(sources=[_source(point_in_time_safe=False)])
+    result = validate_claim(_claim(), snap)
+    assert classify_claim_rejection_reason(result.reasons[0]) == "POINT_IN_TIME_UNSAFE_EVIDENCE"
+
+
+def test_classify_unsupported_numeric_claim_no_comparable_value():
+    # A non-numeric normalized_value (e.g. a category label) leaves zero Decimal-comparable
+    # candidates — "no comparable normalized_values", not "value differs beyond tolerance".
+    snap = _snapshot(items=[_item(normalized_values={"rating_label": "strong"})])
+    result = validate_claim(_claim(numeric_value=Decimal("5")), snap)
+    assert classify_claim_rejection_reason(result.reasons[0]) == "UNSUPPORTED_NUMERIC_CLAIM"
+
+
+def test_classify_numeric_value_mismatch_beyond_tolerance():
+    snap = _snapshot(items=[_item(normalized_values={"revenue_growth_yoy": 0.08})])
+    result = validate_claim(_claim(numeric_value=Decimal("99.9")), snap)
+    assert classify_claim_rejection_reason(result.reasons[0]) == "NUMERIC_VALUE_MISMATCH"
+
+
+def test_classify_no_evidence_cited_reason():
+    result = validate_claim(_claim(evidence_ids=()), _snapshot())
+    assert classify_claim_rejection_reason(result.reasons[0]) == "UNSUPPORTED_MATERIAL_CLAIM"
+
+
+def test_classify_unrecognized_reason_falls_back_unclassified():
+    assert classify_claim_rejection_reason("some future validator message never seen before") == "UNCLASSIFIED_VALIDATION_FAILURE"
 
 
 def test_validate_role_report_rejects_snapshot_mismatch():

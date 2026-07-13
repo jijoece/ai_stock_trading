@@ -78,3 +78,26 @@ def compute_provider_health(rows: list[dict], provider: str) -> ProviderHealthSu
 def compute_all_provider_health(rows: list[dict]) -> tuple[ProviderHealthSummary, ...]:
     providers = sorted({r["provider"] for r in rows})
     return tuple(compute_provider_health(rows, p) for p in providers)
+
+
+REDUNDANCY_SINGLE_PROVIDER_PER_CATEGORY = "SINGLE_PROVIDER_PER_CATEGORY"
+
+
+def compute_provider_concentration() -> dict:
+    """Milestone 6.1 (docs/milestone-6.1.md Step 18, "Single-provider concentration"): a
+    static architectural fact about *this milestone's fixed, documented provider set*
+    (ADR 0004), not a metric derived from request volume — adding redundant providers is
+    explicitly out of scope ("Do not add providers"). SEC EDGAR backs both
+    `filing_provider_count` and `fundamentals_provider_count` (one raw client, two
+    evidence categories — see ADR 0004 Decision 1); Alpaca backs
+    `market_data_provider_count`; news/sentiment remain `0` because
+    `RealNewsEvidenceProvider`/`RealSentimentEvidenceProvider` are ENVIRONMENTALLY_PENDING
+    (no API key / Reddit credentials in this environment), not silently omitted."""
+    return {
+        "market_data_provider_count": 1,
+        "filing_provider_count": 1,
+        "fundamentals_provider_count": 1,
+        "news_provider_count": 0,
+        "sentiment_provider_count": 0,
+        "redundancy_status": REDUNDANCY_SINGLE_PROVIDER_PER_CATEGORY,
+    }

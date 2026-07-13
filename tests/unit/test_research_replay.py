@@ -127,6 +127,54 @@ def test_missing_role_response_reported():
     assert any("no persisted decision found" in m for m in replay.mismatches)
 
 
+def test_replay_reconstructs_no_claim_failures_for_a_clean_run():
+    """Milestone 6.1 Step 16: a run with no rejected claims reconstructs an empty
+    failure-comparison set — matched/missing/unexpected/not_reconstructible all empty."""
+    snapshot, repo, result = _completed_run()
+    replay = replay_research_run(
+        result.research_run_id, research_repository=repo, snapshot=snapshot, provider_name="scripted",
+        model_name="test-model", prompt_registry=PromptRegistry(), configuration=_config(), run_mode="scripted",
+    )
+    assert replay.failure_comparison["matched"] == []
+    assert replay.failure_comparison["missing_persisted"] == []
+    assert replay.failure_comparison["unexpected_persisted"] == []
+    assert replay.persisted_failures == ()
+
+
+def test_replay_reports_not_reconstructible_for_a_role_with_no_persisted_report():
+    """A role whose every attempt was rejected has no `RoleResearchReport` persisted at
+    all — replay cannot re-validate it (there is nothing to re-run the validators
+    against), and this must be labeled `not_reconstructible`, never conflated with
+    "the validator no longer agrees" (`unexpected_persisted`)."""
+    from trading_research.research.failure_taxonomy import new_failure
+
+    snapshot, repo, result = _completed_run()
+    bogus_claim_failure = new_failure(
+        research_run_id=result.research_run_id, attempt_id=f"{result.research_run_id}-bear-1", role="bear",
+        attempt_number=1, stage="CLAIM_EVIDENCE_VALIDATION", code="UNKNOWN_EVIDENCE_ID",
+        message="claim cites unknown evidence_id 'ev-x'", claim_id="bear-claim-1", retryable=True,
+        model_name="test-model", prompt_version="v1", schema_version="role-report.v1", occurred_at=NOW,
+    )
+    repo.save_attempt_failures((bogus_claim_failure,))
+
+    replay = replay_research_run(
+        result.research_run_id, research_repository=repo, snapshot=snapshot, provider_name="scripted",
+        model_name="test-model", prompt_registry=PromptRegistry(), configuration=_config(), run_mode="scripted",
+    )
+    assert ("bear", "UNKNOWN_EVIDENCE_ID", "bear-claim-1") in replay.failure_comparison["not_reconstructible"]
+    assert replay.failure_comparison["unexpected_persisted"] == []
+
+
+def test_replay_never_calls_a_provider_even_with_persisted_failures():
+    """Structural guarantee unchanged by the Step 16 failure-comparison addition:
+    `replay_research_run` still has no `provider` parameter, so failure reconstruction can
+    only re-run local validators, never a real API call."""
+    import inspect
+
+    params = inspect.signature(replay_research_run).parameters
+    assert "provider" not in params
+
+
 def test_replay_signature_has_no_provider_parameter():
     """Structural guarantee: replay_research_run cannot call a provider
     because it has no provider argument at all."""

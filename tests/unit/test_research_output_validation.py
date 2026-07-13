@@ -138,6 +138,74 @@ def test_valid_decision_builds():
     assert decision.bull_case and decision.bear_case
 
 
+def test_schema_error_field_path_and_code_required_field_missing():
+    """Milestone 6.1 Step 8: `SchemaValidationError.schema_errors` carries one structured
+    entry per underlying jsonschema violation, with the exact field path and mapped code."""
+    bad = dict(VALID_REPORT)
+    del bad["stance"]
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    assert len(errors) == 1
+    assert errors[0]["code"] == "SCHEMA_REQUIRED_FIELD_MISSING"
+    assert errors[0]["field_path"] == "<root>"
+
+
+def test_schema_error_wrong_type_classified():
+    bad = dict(VALID_REPORT, summary=12345)
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    assert any(e["code"] == "SCHEMA_TYPE_MISMATCH" and e["field_path"] == "summary" for e in errors)
+
+
+def test_schema_error_invalid_enum_classified():
+    bad = dict(VALID_REPORT, stance="SUPER_BULLISH")
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    assert any(e["code"] == "SCHEMA_ENUM_INVALID" and e["field_path"] == "stance" for e in errors)
+
+
+def test_schema_error_extra_field_classified():
+    bad = dict(VALID_REPORT, unexpected_field="not allowed")
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    assert any(e["code"] == "SCHEMA_EXTRA_FIELD" for e in errors)
+
+
+def test_schema_error_list_bound_exceeded_classified():
+    many_claims = [dict(VALID_REPORT["claims"][0], claim_id=f"c{i}") for i in range(30)]
+    bad = dict(VALID_REPORT, claims=many_claims)
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(
+            bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1",
+            model_name="m", prompt_version="v1", schema=role_report_json_schema(max_claims=20),
+        )
+    errors = exc_info.value.schema_errors
+    assert any(e["code"] == "SCHEMA_LIST_LIMIT_EXCEEDED" and e["field_path"] == "claims" for e in errors)
+
+
+def test_multiple_schema_errors_all_retained():
+    bad = dict(VALID_REPORT, stance="SUPER_BULLISH", summary=12345)
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    codes = {e["code"] for e in errors}
+    assert "SCHEMA_ENUM_INVALID" in codes
+    assert "SCHEMA_TYPE_MISMATCH" in codes
+    assert len(errors) >= 2
+
+
+def test_forbidden_field_scan_populates_schema_errors():
+    bad = dict(VALID_REPORT, order_type="market")
+    with pytest.raises(SchemaValidationError) as exc_info:
+        build_role_report(bad, report_id="r1", research_run_id="run-1", role="fundamental", symbol="AAPL", snapshot_id="snap-1", model_name="m", prompt_version="v1")
+    errors = exc_info.value.schema_errors
+    assert any(e["code"] == "SCHEMA_EXTRA_FIELD" and e["field_path"] == "order_type" for e in errors)
+
+
 def test_no_share_quantity_or_dollar_allocation_field_allowed():
     bad = dict(VALID_DECISION, quantity=100)
     with pytest.raises(SchemaValidationError):

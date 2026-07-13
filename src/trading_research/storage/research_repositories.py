@@ -15,6 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..research.evidence import snapshot_from_row, snapshot_to_row
+from ..research.failure_taxonomy import ResearchValidationFailure
 from ..research.models import (
     EvidenceSnapshot,
     ExperimentAssignment,
@@ -186,6 +187,33 @@ class SQLiteResearchRepository:
         )
         self._conn.commit()
 
+    def save_attempt_failure(self, failure: ResearchValidationFailure) -> None:
+        """Idempotent on `failure_id` (deterministic — see
+        `research/failure_taxonomy.py::new_failure`): a retried write of the identical
+        failure content is a no-op, never a duplicate row (Step 6: "idempotent insertion")."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO research_attempt_failures "
+            "(failure_id, attempt_id, research_run_id, role, attempt_number, stage, code, message, "
+            "field_path, claim_id, evidence_ids_json, retryable, model_name, prompt_version, "
+            "schema_version, metadata_json, occurred_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                failure.failure_id, failure.attempt_id, failure.research_run_id, failure.role,
+                failure.attempt_number, failure.stage, failure.code, failure.message, failure.field_path,
+                failure.claim_id, json.dumps(list(failure.evidence_ids)), int(failure.retryable),
+                failure.model_name, failure.prompt_version, failure.schema_version,
+                json.dumps(dict(failure.metadata)), failure.occurred_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def save_attempt_failures(self, failures: "tuple[ResearchValidationFailure, ...]") -> None:
+        for failure in failures:
+            self.save_attempt_failure(failure)
+
+    def list_run_failures(self, research_run_id: str) -> "tuple[ResearchValidationFailure, ...]":
+        return list_run_failures(self._conn, research_run_id)
+
     def save_role_report(self, report: RoleResearchReport, attempt_id: str, created_at: datetime) -> None:
         self._conn.execute(
             "INSERT OR IGNORE INTO research_role_reports "
@@ -275,6 +303,23 @@ def list_experiment_assignments(conn: sqlite3.Connection, experiment_id: str) ->
     )
 
 
+def list_attempt_rows_for_metrics(conn: sqlite3.Connection) -> list[dict]:
+    """Feeds `research/failure_metrics.py::compute_research_failure_metrics` — unlike
+    `list_attempt_usage_rows`, this includes `research_run_id` so attempts can be grouped
+    per (run, role) to compute retry-success/retry-exhaustion rates."""
+    rows = conn.execute(
+        "SELECT research_run_id, role, success, input_tokens, output_tokens, latency_ms FROM research_attempts"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_all_attempt_failures(conn: sqlite3.Connection) -> tuple[ResearchValidationFailure, ...]:
+    """Every persisted failure across every run — feeds
+    `research/failure_metrics.py::compute_research_failure_metrics`."""
+    rows = conn.execute("SELECT * FROM research_attempt_failures ORDER BY occurred_at").fetchall()
+    return tuple(_failure_from_row(r) for r in rows)
+
+
 def list_attempt_usage_rows(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT role, provider, model_name, input_tokens, output_tokens, latency_ms, retry_count, success, "
@@ -286,3 +331,78 @@ def list_attempt_usage_rows(conn: sqlite3.Connection) -> list[dict]:
 def list_research_committee_runs(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT * FROM research_committee_runs ORDER BY created_at").fetchall()
     return [dict(r) for r in rows]
+
+
+def _failure_from_row(row: sqlite3.Row) -> ResearchValidationFailure:
+    return ResearchValidationFailure(
+        failure_id=row["failure_id"], research_run_id=row["research_run_id"], attempt_id=row["attempt_id"],
+        role=row["role"], attempt_number=row["attempt_number"], stage=row["stage"], code=row["code"],
+        message=row["message"], field_path=row["field_path"], claim_id=row["claim_id"],
+        evidence_ids=tuple(json.loads(row["evidence_ids_json"])), retryable=bool(row["retryable"]),
+        model_name=row["model_name"], prompt_version=row["prompt_version"], schema_version=row["schema_version"],
+        occurred_at=datetime.fromisoformat(row["occurred_at"]), metadata=json.loads(row["metadata_json"]),
+    )
+
+
+def list_attempt_failures(conn: sqlite3.Connection, attempt_id: str) -> tuple[ResearchValidationFailure, ...]:
+    rows = conn.execute(
+        "SELECT * FROM research_attempt_failures WHERE attempt_id = ? ORDER BY occurred_at", (attempt_id,)
+    ).fetchall()
+    return tuple(_failure_from_row(r) for r in rows)
+
+
+def list_role_failures(conn: sqlite3.Connection, research_run_id: str, role: str) -> tuple[ResearchValidationFailure, ...]:
+    rows = conn.execute(
+        "SELECT * FROM research_attempt_failures WHERE research_run_id = ? AND role = ? ORDER BY occurred_at",
+        (research_run_id, role),
+    ).fetchall()
+    return tuple(_failure_from_row(r) for r in rows)
+
+
+def list_run_failures(
+    conn: sqlite3.Connection,
+    research_run_id: str,
+    *,
+    role: str | None = None,
+    attempt_number: int | None = None,
+    stage: str | None = None,
+    code: str | None = None,
+    retryable: bool | None = None,
+) -> tuple[ResearchValidationFailure, ...]:
+    """Queryable by every dimension Step 6/15 require: run (mandatory), and optionally
+    role, attempt_number, stage, code, retryability."""
+    query = "SELECT * FROM research_attempt_failures WHERE research_run_id = ?"
+    params: list = [research_run_id]
+    if role is not None:
+        query += " AND role = ?"
+        params.append(role)
+    if attempt_number is not None:
+        query += " AND attempt_number = ?"
+        params.append(attempt_number)
+    if stage is not None:
+        query += " AND stage = ?"
+        params.append(stage)
+    if code is not None:
+        query += " AND code = ?"
+        params.append(code)
+    if retryable is not None:
+        query += " AND retryable = ?"
+        params.append(int(retryable))
+    query += " ORDER BY occurred_at"
+    rows = conn.execute(query, params).fetchall()
+    return tuple(_failure_from_row(r) for r in rows)
+
+
+def summarize_run_failures(conn: sqlite3.Connection, research_run_id: str) -> dict:
+    """Counts by stage and by code for one run — used by the `research-failures` CLI
+    command (Step 15) and by `research/failure_metrics.py` (Step 17)."""
+    failures = list_run_failures(conn, research_run_id)
+    by_stage: dict[str, int] = {}
+    by_code: dict[str, int] = {}
+    for f in failures:
+        by_stage[f.stage] = by_stage.get(f.stage, 0) + 1
+        by_code[f.code] = by_code.get(f.code, 0) + 1
+    return {
+        "research_run_id": research_run_id, "total_failures": len(failures),
+        "counts_by_stage": by_stage, "counts_by_code": by_code,
+    }

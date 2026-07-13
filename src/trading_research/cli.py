@@ -681,6 +681,8 @@ def replay_research_cli(research_run_id: str, db_path: Path) -> dict:
         "research_run_id": research_run_id, "matches": result.matches, "mismatches": list(result.mismatches),
         "decision_rating": result.reconstructed_decision.rating if result.reconstructed_decision else None,
         "overlay_action": result.reconstructed_overlay.action if result.reconstructed_overlay else None,
+        "persisted_failure_count": len(result.persisted_failures),
+        "failure_comparison": result.failure_comparison,
     }
 
 
@@ -765,6 +767,64 @@ def research_usage_cli(db_path: Path) -> dict:
     }
 
 
+def research_failures_cli(
+    research_run_id: str, db_path: Path, *,
+    role: str | None = None, attempt_number: int | None = None, stage: str | None = None, code: str | None = None,
+) -> dict:
+    """`research-failures` CLI command (Milestone 6.1 Step 15): sanitized, structured
+    failure diagnostics for one research run. Never prints a raw prompt, a complete raw
+    provider response, chain-of-thought, or a secret — every field returned here already
+    passed `research/failure_taxonomy.py::ResearchValidationFailure`'s own bounded,
+    allowlisted-metadata validation before it was ever persisted."""
+    from .storage.research_repositories import list_run_failures, summarize_run_failures
+
+    with session(db_path) as conn:
+        run_row = conn.execute(
+            "SELECT research_run_id FROM research_committee_runs WHERE research_run_id = ?", (research_run_id,)
+        ).fetchone()
+        if run_row is None:
+            return {"error": f"no persisted research run {research_run_id!r}"}
+
+        failures = list_run_failures(
+            conn, research_run_id, role=role, attempt_number=attempt_number, stage=stage, code=code,
+        )
+        summary = summarize_run_failures(conn, research_run_id)
+
+    return {
+        "research_run_id": research_run_id,
+        "total_failures": len(failures),
+        "counts_by_stage": summary["counts_by_stage"],
+        "counts_by_code": summary["counts_by_code"],
+        "failures": [
+            {
+                "attempt_id": f.attempt_id, "role": f.role, "attempt_number": f.attempt_number,
+                "stage": f.stage, "code": f.code, "field_path": f.field_path, "claim_id": f.claim_id,
+                "evidence_ids": list(f.evidence_ids), "sanitized_message": f.message, "retryable": f.retryable,
+                "stop_reason": f.metadata.get("stop_reason"), "input_tokens": f.metadata.get("input_tokens"),
+                "output_tokens": f.metadata.get("output_tokens"), "prompt_version": f.prompt_version,
+                "schema_version": f.schema_version, "occurred_at": f.occurred_at.isoformat(),
+            }
+            for f in failures
+        ],
+    }
+
+
+def research_failure_metrics_cli(db_path: Path) -> dict:
+    """`research-failure-metrics` CLI command (Milestone 6.1 Step 17): deterministic
+    failure-rate/token/latency metrics over every persisted attempt and structured
+    failure. Every metric reports an explicit status
+    (`OK`/`INSUFFICIENT_DATA`/`UNDEFINED`) rather than a misleading zero when there is no
+    relevant data."""
+    from .research.failure_metrics import compute_research_failure_metrics
+    from .storage.research_repositories import list_all_attempt_failures, list_attempt_rows_for_metrics
+
+    with session(db_path) as conn:
+        attempt_rows = list_attempt_rows_for_metrics(conn)
+        failures = list_all_attempt_failures(conn)
+
+    return compute_research_failure_metrics(attempt_rows=attempt_rows, failures=failures)
+
+
 def _make_persist_hook(conn) -> "Callable[[dict], None] | None":
     """Bridges `HttpJsonClient.on_response`'s plain-dict callback to
     `evidence_providers/persistence.py::save_provider_request` (Milestone 6
@@ -835,7 +895,7 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
 
     sec = None
     if provider_config.sec.enabled:
-        sec_cache = ProviderCache(clock=time.monotonic)
+        sec_cache = ProviderCache(clock=time.monotonic, on_response=persist_hook)
         sec_http = HttpJsonClient(
             base_headers={"User-Agent": provider_config.sec.user_agent_contact},
             rate_limiter=MinIntervalRateLimiter(provider_config.sec.min_request_interval_seconds),
@@ -847,7 +907,7 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
 
     market = None
     if provider_config.market_data.enabled and cfg.alpaca_market_data_api_key and cfg.alpaca_market_data_api_secret:
-        market_cache = ProviderCache(clock=time.monotonic)
+        market_cache = ProviderCache(clock=time.monotonic, on_response=persist_hook)
         market_http = HttpJsonClient(
             base_headers={"APCA-API-KEY-ID": cfg.alpaca_market_data_api_key, "APCA-API-SECRET-KEY": cfg.alpaca_market_data_api_secret},
             rate_limiter=MinIntervalRateLimiter(provider_config.market_data.min_request_interval_seconds),
@@ -882,8 +942,9 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
 
 
 def provider_health_cli(db_path: Path) -> dict:
-    """`provider-health` CLI command (Milestone 6)."""
-    from .evidence_providers.health import compute_all_provider_health
+    """`provider-health` CLI command (Milestone 6; concentration fields added Milestone
+    6.1 Step 18)."""
+    from .evidence_providers.health import compute_all_provider_health, compute_provider_concentration
     from .evidence_providers.persistence import list_provider_requests
 
     with session(db_path) as conn:
@@ -898,6 +959,7 @@ def provider_health_cli(db_path: Path) -> dict:
             }
             for s in summaries
         ],
+        "concentration": compute_provider_concentration(),
     }
 
 
@@ -1245,6 +1307,20 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("research-usage", help="Token/latency/cost aggregation by role over persisted research attempts (Milestone 5)")
 
+    p_research_failures = sub.add_parser(
+        "research-failures", help="Sanitized, structured failure diagnostics for one research run (Milestone 6.1)"
+    )
+    p_research_failures.add_argument("--research-run-id", required=True)
+    p_research_failures.add_argument("--role", default=None)
+    p_research_failures.add_argument("--attempt", type=int, default=None, dest="attempt_number")
+    p_research_failures.add_argument("--stage", default=None)
+    p_research_failures.add_argument("--code", default=None)
+
+    sub.add_parser(
+        "research-failure-metrics",
+        help="Deterministic failure-rate/token/latency metrics over persisted research attempts (Milestone 6.1)",
+    )
+
     sub.add_parser("provider-health", help="Real evidence-provider health status (Milestone 6)")
 
     p_fetch_evidence = sub.add_parser("fetch-evidence", help="Build and persist a real (or fixture) point-in-time evidence snapshot (Milestone 6)")
@@ -1360,6 +1436,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "research-usage":
         cfg = load_config()
         outcome = research_usage_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "research-failures":
+        cfg = load_config()
+        outcome = research_failures_cli(
+            args.research_run_id, cfg.research_database_path, role=args.role,
+            attempt_number=args.attempt_number, stage=args.stage, code=args.code,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "research-failure-metrics":
+        cfg = load_config()
+        outcome = research_failure_metrics_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 

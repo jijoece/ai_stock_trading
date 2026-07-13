@@ -133,6 +133,34 @@ CREATE TABLE IF NOT EXISTS research_failures (
     reason TEXT NOT NULL,
     occurred_at TEXT NOT NULL
 );
+
+-- Milestone 6.1 (docs/milestone-6.1.md Step 6): one row per structured failure, not one
+-- row per attempt — a single failed attempt can produce several independent claim
+-- rejections. Append-only, idempotent on the deterministic failure_id (see
+-- research/failure_taxonomy.py::new_failure). `attempt_id` is a real
+-- `research_attempts.attempt_id` for attempt-scoped failures (provider/schema/claim); for
+-- run-level meta-failures (retry exhaustion, manager skip) it is a synthetic identifier
+-- (`{research_run_id}-{role}-retry-exhausted`, `{research_run_id}-manager-skipped`) since
+-- no real attempt exists to reference — deliberately not a foreign key for that reason.
+CREATE TABLE IF NOT EXISTS research_attempt_failures (
+    failure_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL,
+    research_run_id TEXT NOT NULL REFERENCES research_committee_runs(research_run_id),
+    role TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    stage TEXT NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL,
+    field_path TEXT,
+    claim_id TEXT,
+    evidence_ids_json TEXT NOT NULL,
+    retryable INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
 """
 
 RESEARCH_INDEXES = """
@@ -143,6 +171,11 @@ CREATE INDEX IF NOT EXISTS idx_research_role_reports_run ON research_role_report
 CREATE INDEX IF NOT EXISTS idx_research_decisions_snapshot ON research_decisions(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_research_overlay_decision ON research_overlay_decisions(research_decision_id);
 CREATE INDEX IF NOT EXISTS idx_research_experiment_symbol ON research_experiment_assignments(experiment_id, symbol);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_failures_run ON research_attempt_failures(research_run_id);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_failures_attempt ON research_attempt_failures(attempt_id);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_failures_role ON research_attempt_failures(research_run_id, role);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_failures_stage ON research_attempt_failures(stage);
+CREATE INDEX IF NOT EXISTS idx_research_attempt_failures_code ON research_attempt_failures(code);
 """
 
 RESEARCH_TRIGGERS = """
@@ -177,6 +210,14 @@ BEGIN SELECT RAISE(ABORT, 'research attempts are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_research_attempts_no_delete
 BEFORE DELETE ON research_attempts
 BEGIN SELECT RAISE(ABORT, 'research attempts are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_research_attempt_failures_no_update
+BEFORE UPDATE ON research_attempt_failures
+BEGIN SELECT RAISE(ABORT, 'research attempt failures are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_research_attempt_failures_no_delete
+BEFORE DELETE ON research_attempt_failures
+BEGIN SELECT RAISE(ABORT, 'research attempt failures are append-only'); END;
 """
 
 

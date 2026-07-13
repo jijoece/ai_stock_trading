@@ -27,8 +27,29 @@ from .errors import (
     ProviderTransientError,
     ProviderUnavailableError,
 )
+from .failure_taxonomy import (
+    CODE_EXPECTED_TOOL_USE_MISSING,
+    CODE_MALFORMED_TOOL_INPUT,
+    CODE_MULTIPLE_TOOL_BLOCKS,
+    CODE_OUTPUT_TRUNCATED,
+    CODE_PROVIDER_CLIENT_ERROR,
+    CODE_PROVIDER_RATE_LIMITED,
+    CODE_PROVIDER_SERVER_ERROR,
+    CODE_PROVIDER_TIMEOUT,
+    CODE_PROVIDER_UNAVAILABLE,
+    CODE_UNEXPECTED_TOOL_NAME,
+    STAGE_PROVIDER_REQUEST,
+    STAGE_PROVIDER_RESPONSE,
+    STAGE_TOOL_USE_EXTRACTION,
+)
 from .models import ResearchModelRequest, ResearchModelResponse
 from .usage import PricingEntry, build_usage_record
+
+# Anthropic truncates a response mid-generation on this stop_reason — a truncated
+# tool_use.input is the single most likely real cause of "no valid tool_use block" for a
+# verbose analyst role (Step 7: "For output truncation, record ... whether retrying with
+# the same limit would be pointless").
+_TRUNCATION_STOP_REASON = "max_tokens"
 
 TOOL_NAME = "submit_structured_research_output"
 
@@ -110,40 +131,95 @@ class AnthropicResearchProvider:
                 tool_choice={"type": "tool", "name": TOOL_NAME},
             )
         except anthropic.APITimeoutError as exc:
-            raise ProviderTimeoutError(f"Anthropic request timed out: {exc}") from exc
+            latency_ms = int((time.monotonic() - start) * 1000)
+            raise ProviderTimeoutError(
+                f"Anthropic request timed out: {exc}", stage=STAGE_PROVIDER_REQUEST, code=CODE_PROVIDER_TIMEOUT,
+                retryable=True, metadata={"latency_ms": latency_ms},
+            ) from exc
         except anthropic.RateLimitError as exc:
-            raise ProviderRateLimitError(f"Anthropic rate limit: {exc}") from exc
+            latency_ms = int((time.monotonic() - start) * 1000)
+            raise ProviderRateLimitError(
+                f"Anthropic rate limit: {exc}", stage=STAGE_PROVIDER_RESPONSE, code=CODE_PROVIDER_RATE_LIMITED,
+                retryable=True, metadata={"latency_ms": latency_ms},
+            ) from exc
         except anthropic.APIConnectionError as exc:
-            raise ProviderTransientError(f"Anthropic connection error: {exc}") from exc
+            latency_ms = int((time.monotonic() - start) * 1000)
+            raise ProviderTransientError(
+                f"Anthropic connection error: {exc}", stage=STAGE_PROVIDER_REQUEST, code=CODE_PROVIDER_UNAVAILABLE,
+                retryable=True, metadata={"latency_ms": latency_ms},
+            ) from exc
         except anthropic.APIStatusError as exc:
+            latency_ms = int((time.monotonic() - start) * 1000)
             status = getattr(exc, "status_code", None)
+            status_metadata = {"latency_ms": latency_ms, "provider_status_code": status or 0}
             if status in _TRANSIENT_STATUS_CODES:
-                raise ProviderTransientError(f"Anthropic transient error (status {status}): {exc}") from exc
+                raise ProviderTransientError(
+                    f"Anthropic transient error (status {status}): {exc}", stage=STAGE_PROVIDER_RESPONSE,
+                    code=CODE_PROVIDER_SERVER_ERROR, retryable=True, metadata=status_metadata,
+                ) from exc
             # Any other client error (401/403/404/400 invalid-request/billing,
             # etc.) is not something a bounded retry can fix — treat it as
             # provider-unavailable rather than silently burning retry budget.
-            raise ProviderUnavailableError(f"Anthropic API unavailable (status {status}): {exc}") from exc
+            raise ProviderUnavailableError(
+                f"Anthropic API unavailable (status {status}): {exc}", stage=STAGE_PROVIDER_RESPONSE,
+                code=CODE_PROVIDER_CLIENT_ERROR, retryable=False, metadata=status_metadata,
+            ) from exc
 
         latency_ms = int((time.monotonic() - start) * 1000)
 
-        tool_use_block = next(
-            (block for block in response.content if getattr(block, "type", None) == "tool_use" and block.name == TOOL_NAME),
-            None,
-        )
-        if tool_use_block is None:
-            raise MalformedOutputError(
-                "Claude response contained no tool_use block for the forced structured-output tool"
-            )
-        parsed = tool_use_block.input
-        if not isinstance(parsed, dict):
-            raise MalformedOutputError("Claude tool_use input was not a JSON object")
-
+        # Extracted before tool-use validation (Milestone 6.1 fix — see
+        # docs/milestone-6.1.md Step 7 / the M6.1 scratchpad's "Historical persistence
+        # findings" #3): a malformed/truncated response used to raise MalformedOutputError
+        # before any usage/stop_reason was ever read, making a real truncation
+        # structurally undiagnosable after the fact. Every failure path below now carries
+        # this metadata.
         usage_obj = getattr(response, "usage", None)
         input_tokens = getattr(usage_obj, "input_tokens", None)
         output_tokens = getattr(usage_obj, "output_tokens", None)
         cache_read_tokens = getattr(usage_obj, "cache_read_input_tokens", None)
         cache_write_tokens = getattr(usage_obj, "cache_creation_input_tokens", None)
         provider_request_id = getattr(response, "id", None)
+        stop_reason = getattr(response, "stop_reason", None)
+
+        tool_use_blocks = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+        matching_blocks = [b for b in tool_use_blocks if b.name == TOOL_NAME]
+        extraction_metadata = {
+            "stop_reason": str(stop_reason) if stop_reason is not None else "unknown",
+            "input_tokens": input_tokens if input_tokens is not None else 0,
+            "output_tokens": output_tokens if output_tokens is not None else 0,
+            "max_output_tokens": request.max_output_tokens,
+            "tool_use_block_count": len(tool_use_blocks),
+        }
+
+        if not tool_use_blocks:
+            truncated = stop_reason == _TRUNCATION_STOP_REASON
+            raise MalformedOutputError(
+                "Claude response contained no tool_use block for the forced structured-output tool"
+                + (f" (stop_reason={stop_reason!r} — output was truncated before any tool call)" if truncated else ""),
+                stage=STAGE_TOOL_USE_EXTRACTION,
+                code=CODE_OUTPUT_TRUNCATED if truncated else CODE_EXPECTED_TOOL_USE_MISSING,
+                retryable=True, metadata=extraction_metadata,
+            )
+        if not matching_blocks:
+            raise MalformedOutputError(
+                f"Claude response's tool_use block(s) did not use the forced tool name {TOOL_NAME!r}",
+                stage=STAGE_TOOL_USE_EXTRACTION, code=CODE_UNEXPECTED_TOOL_NAME, retryable=True,
+                metadata={**extraction_metadata, "tool_name": tool_use_blocks[0].name},
+            )
+        if len(matching_blocks) > 1:
+            raise MalformedOutputError(
+                "Claude response contained more than one tool_use block for the forced structured-output tool",
+                stage=STAGE_TOOL_USE_EXTRACTION, code=CODE_MULTIPLE_TOOL_BLOCKS, retryable=True,
+                metadata=extraction_metadata,
+            )
+        tool_use_block = matching_blocks[0]
+        parsed = tool_use_block.input
+        if not isinstance(parsed, dict):
+            raise MalformedOutputError(
+                "Claude tool_use input was not a JSON object",
+                stage=STAGE_TOOL_USE_EXTRACTION, code=CODE_MALFORMED_TOOL_INPUT, retryable=True,
+                metadata={**extraction_metadata, "actual_type": type(parsed).__name__},
+            )
 
         usage = build_usage_record(
             provider="anthropic", model_name=request.model_name, role=request.role,

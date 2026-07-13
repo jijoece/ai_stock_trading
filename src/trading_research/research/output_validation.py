@@ -17,6 +17,14 @@ from typing import Any, Mapping
 from jsonschema import Draft7Validator
 
 from .errors import MalformedOutputError, SchemaValidationError
+from .failure_taxonomy import (
+    CODE_SCHEMA_ENUM_INVALID,
+    CODE_SCHEMA_EXTRA_FIELD,
+    CODE_SCHEMA_LIST_LIMIT_EXCEEDED,
+    CODE_SCHEMA_REQUIRED_FIELD_MISSING,
+    CODE_SCHEMA_TYPE_MISMATCH,
+    CODE_UNCLASSIFIED_VALIDATION_FAILURE,
+)
 from .models import (
     CLAIM_IMPORTANCE_LEVELS,
     RATINGS,
@@ -162,16 +170,51 @@ def _scan_forbidden_fields(data: Mapping[str, Any], *, path: str = "") -> list[s
     return hits
 
 
+_SCHEMA_VALIDATOR_CODE_MAP = {
+    "required": CODE_SCHEMA_REQUIRED_FIELD_MISSING,
+    "type": CODE_SCHEMA_TYPE_MISMATCH,
+    "enum": CODE_SCHEMA_ENUM_INVALID,
+    "additionalProperties": CODE_SCHEMA_EXTRA_FIELD,
+    "maxItems": CODE_SCHEMA_LIST_LIMIT_EXCEEDED,
+    "minItems": CODE_SCHEMA_LIST_LIMIT_EXCEEDED,
+}
+
+
+def classify_schema_error(error) -> str:
+    """Deterministic mapping from a `jsonschema` validator name to a `failure_taxonomy`
+    code (docs/milestone-6.1.md Step 8). An unrecognized validator name maps explicitly
+    to `UNCLASSIFIED_VALIDATION_FAILURE` — never silently reused as a specific code it
+    does not actually mean."""
+    return _SCHEMA_VALIDATOR_CODE_MAP.get(error.validator, CODE_UNCLASSIFIED_VALIDATION_FAILURE)
+
+
 def validate_against_schema(data: dict, schema: dict) -> None:
     hits = _scan_forbidden_fields(data)
     if hits:
-        raise SchemaValidationError(f"structured output contains forbidden executable-order field(s): {sorted(hits)}")
+        raise SchemaValidationError(
+            f"structured output contains forbidden executable-order field(s): {sorted(hits)}",
+            schema_errors=tuple(
+                {"stage": "STRUCTURED_SCHEMA", "code": CODE_SCHEMA_EXTRA_FIELD, "field_path": hit,
+                 "message": f"forbidden executable-order field: {hit}"}
+                for hit in sorted(hits)
+            ),
+        )
     validator = Draft7Validator(schema)
     errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
     if errors:
+        schema_errors = tuple(
+            {
+                "stage": "STRUCTURED_SCHEMA",
+                "code": classify_schema_error(e),
+                "field_path": ".".join(str(p) for p in e.path) or "<root>",
+                "message": e.message,
+            }
+            for e in errors
+        )
         raise SchemaValidationError(
             "structured output failed schema validation: "
-            + "; ".join(f"{'.'.join(str(p) for p in e.path) or '<root>'}: {e.message}" for e in errors)
+            + "; ".join(f"{se['field_path']}: {se['message']}" for se in schema_errors),
+            schema_errors=schema_errors,
         )
 
 
