@@ -34,6 +34,31 @@ TOOL_NAME = "submit_structured_research_output"
 
 _TRANSIENT_STATUS_CODES = {500, 502, 503, 504, 529}
 
+# Anthropic strict-tool JSON Schema only supports a subset of Draft-07 —
+# numeric bounds, array-length bounds, and string-length bounds are all
+# rejected with a 400 (confirmed against the real API during Milestone 5
+# validation: "For 'array' type, property 'maxItems' is not supported").
+# These bounds remain fully enforced locally: `output_validation.py`
+# validates the returned tool_use.input against the *original*, unstripped
+# schema, so nothing sent back by Claude escapes them — this only relaxes
+# what we ask the API's strict-mode schema compiler to accept up front.
+_UNSUPPORTED_STRICT_KEYWORDS = frozenset({
+    "minItems", "maxItems", "minLength", "maxLength", "minimum", "maximum",
+    "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "pattern",
+})
+
+
+def _strict_compatible_schema(schema):
+    if isinstance(schema, dict):
+        return {
+            key: _strict_compatible_schema(value)
+            for key, value in schema.items()
+            if key not in _UNSUPPORTED_STRICT_KEYWORDS
+        }
+    if isinstance(schema, list):
+        return [_strict_compatible_schema(item) for item in schema]
+    return schema
+
 
 @dataclass(frozen=True)
 class AnthropicProviderConfig:
@@ -54,18 +79,31 @@ class AnthropicResearchProvider:
         self._client = anthropic.Anthropic(api_key=config.api_key, timeout=config.request_timeout_seconds)
 
     def generate_structured(self, request: ResearchModelRequest) -> ResearchModelResponse:
+        # strict=True (top-level on the tool, not on tool_choice) makes the
+        # API guarantee tool_use.input validates exactly against
+        # input_schema — including every entry in "required" — rather than
+        # letting the model omit a required array field it judged empty.
+        # Confirmed necessary against the real API during Milestone 5
+        # validation: without it, Claude omitted uncertainties/
+        # missing_data_reasons when it had nothing to put in them.
         tool = {
             "name": TOOL_NAME,
             "description": "Submit your complete structured research output exactly once.",
-            "input_schema": dict(request.json_schema),
+            "input_schema": _strict_compatible_schema(dict(request.json_schema)),
+            "strict": True,
         }
 
         start = time.monotonic()
         try:
+            # No `temperature` here: current-generation models (e.g.
+            # claude-sonnet-5, Opus 4.7/4.8, Fable 5) reject non-default
+            # sampling parameters outright (400 invalid_request_error) —
+            # confirmed against the real API during Milestone 5 validation.
+            # request.temperature is recorded for audit but intentionally
+            # not sent on the wire.
             response = self._client.messages.create(
                 model=request.model_name,
                 max_tokens=request.max_output_tokens,
-                temperature=request.temperature,
                 system=request.system_prompt,
                 messages=[{"role": "user", "content": request.user_prompt}],
                 tools=[tool],

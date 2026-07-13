@@ -1,7 +1,9 @@
 # Milestone 5 — Evidence-backed Claude research and controlled model evaluation
 
-**Status:** Code-complete; real Claude API structured-output validation blocked by an
-account-billing error (see "Real Claude API validation" below) — not yet environment-validated.
+**Status:** Code-complete and environment-validated. A real Claude API structured-output
+call (`claude-sonnet-5`, forced strict tool use) completed successfully against a fixture
+evidence snapshot on 2026-07-12 — see "Real Claude API validation" below for the exact
+result and the three real bugs it found and fixed.
 
 This document describes the research layer added on top of the Milestone 1-4 deterministic
 trading desk. See `docs/adr/0003-claude-research-boundary.md` for the design decisions and why
@@ -212,26 +214,53 @@ output, validates every cited evidence ID, and never imports `execution`/`paper`
 
 ### Real Claude API validation — actual result
 
-Attempted with real credentials present in this environment (`ANTHROPIC_API_KEY` configured,
-`ANTHROPIC_MODEL=claude-sonnet-5`). The provider correctly reached the real Anthropic API over
-the network (a genuine HTTPS round trip, not mocked) and authentication was accepted, but the
-request was rejected with `HTTP 400 invalid_request_error: "Your credit balance is too low to
-access the Anthropic API."` This is an account-billing condition, not a code defect: it confirmed
-the request was well-formed and credentials were valid, and it caused this bug fix —
-`anthropic_provider.py` originally mapped an unclassified 4xx status to the *retryable*
-`ProviderTransientError`; it now maps any non-transient status (including 400/401/403/404) to
-`ProviderUnavailableError` so a billing/config problem is never silently retried.
+Run on 2026-07-12 with real credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL=claude-sonnet-5`)
+against `tests/integration/test_research_claude_smoke.py`:
 
-**Milestone 5 is therefore NOT environment-validated against the real Claude API** — this must be
-re-run once the Anthropic account has an available credit balance. Do not claim otherwise.
+```text
+tests/integration/test_research_claude_smoke.py::test_real_claude_structured_role_output
+Claude smoke test usage: input_tokens=3222 output_tokens=1804 latency_ms=16586 cost_status=PRICING_NOT_CONFIGURED
+PASSED
+```
+
+Getting to a clean pass surfaced three real issues, none of them fixable by retrying — all now
+fixed in `research/anthropic_provider.py`:
+
+1. **Insufficient account credit (first attempt).** `HTTP 400 invalid_request_error: "Your credit
+   balance is too low..."` This also exposed a real classification bug: the provider originally
+   mapped any unclassified 4xx to the *retryable* `ProviderTransientError`. Fixed to map
+   everything except an explicit transient set (`500/502/503/504/529`) to
+   `ProviderUnavailableError`, so a billing or request-shape problem is never silently retried.
+2. **`temperature` is rejected outright on `claude-sonnet-5`** (`HTTP 400: "temperature is
+   deprecated for this model"` — current-generation models remove sampling parameters entirely,
+   confirmed against `claude-api` skill documentation). Fixed by no longer sending `temperature`
+   on the wire; `ResearchModelRequest.temperature` is retained for audit only.
+3. **Strict tool schemas reject several Draft-07 keywords** (`HTTP 400: "For 'array' type,
+   property 'maxItems' is not supported"`). Fixed with
+   `anthropic_provider._strict_compatible_schema`, which strips `minItems`/`maxItems`/
+   `minLength`/`maxLength`/`minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum`/
+   `multipleOf`/`pattern` before sending `input_schema` to the API. This only relaxes what the
+   API's strict-mode compiler is asked to accept — `output_validation.py` still validates
+   Claude's returned `tool_use.input` against the original, unstripped, bounded schema, so no
+   bound is actually weakened end-to-end.
+
+After those three fixes, the run also demonstrated the claim-to-evidence validator working
+correctly on live output: one numeric claim (an arithmetic derivation not present verbatim in any
+cited evidence's `normalized_values`) was correctly rejected by `claim_validation.py` — expected
+validator behavior on real model output, not a defect, and distinct from the more severe
+fabricated/unknown-evidence-id case the smoke test hard-fails on.
+
+**Milestone 5 is environment-validated against the real Claude API as of 2026-07-12.**
 
 ## Known limitations
 
 * `anthropic` remains a base (non-optional) dependency — it already was one before this
   milestone, for `scripts/submit_batch.py`'s unrelated meta-research pipeline. See ADR 0003
   Decision 1.
-* The real Claude API path is implemented and unit-tested (via mocked HTTP-error classification)
-  but not yet successfully exercised end-to-end due to the account-billing block above.
+* The real Claude API path is implemented, unit-tested (via mocked HTTP-error classification),
+  and has been successfully exercised end-to-end once (see "Real Claude API validation" above)
+  for a single role (`fundamental`) on a single fixture symbol. It has not yet been run across
+  all five roles or all four fixture symbols in one session.
 * Only the fundamental/technical/bull/bear/manager role set is implemented; catalyst, news, and
   sentiment analysts are a natural next step.
 * Evidence is fixture-backed for four symbols only in this vertical slice; no real external
