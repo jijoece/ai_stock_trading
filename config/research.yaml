@@ -1,0 +1,44 @@
+# Claude research-layer configuration (Milestone 5, docs/milestone-5.md Step 18).
+#
+# Research defaults to DISABLED. Presence of ANTHROPIC_API_KEY in the
+# environment never flips `enabled` or selects a provider by itself — that
+# would violate "no fallback model provider may be selected silently"
+# (docs/milestone-5.md Step 3/18). Flipping `enabled: true` and setting
+# `provider: anthropic` plus an explicit `model` are both required before any
+# real Claude call can happen; `research/configuration.py::require_ready`
+# additionally fails closed if provider=anthropic and model is still unset.
+version: 1
+
+research:
+  enabled: false
+  provider: deterministic       # deterministic | scripted | anthropic — unknown values fail closed
+  model: null                   # must be set explicitly to use provider: anthropic
+  max_attempts_per_role: 2
+  request_timeout_seconds: 60
+  max_input_characters: 100000
+  max_evidence_items: 100
+  max_items_per_source_category: 25
+  max_claims_per_role: 20
+  max_output_tokens: 4000
+  require_point_in_time_safe: true
+  require_evidence_for_material_claims: true
+  fail_on_stale_required_evidence: true
+  allow_parallel_roles: false
+
+# First vertical slice role set (docs/milestone-5.md Step 7). Additional
+# roles (catalyst, news, sentiment) can be appended once this slice is
+# proven — every role name must be one research/configuration.py::KNOWN_ROLES
+# recognizes, or config loading fails closed.
+roles:
+  - fundamental
+  - technical
+  - bull
+  - bear
+  - manager
+
+overlay:
+  policy_version: research-overlay.v1
+  allow_score_increase: false
+  allow_position_size_increase: false
+  incomplete_action: ANALYSIS_INCOMPLETE
+  critical_risk_action: FORCE_NO_ACTION

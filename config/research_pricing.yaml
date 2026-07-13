@@ -1,0 +1,21 @@
+# Optional, effective-dated Anthropic pricing configuration
+# (Milestone 5, docs/milestone-5.md Step 3/17).
+#
+# Deliberately empty by default: this repository does not hardcode model
+# pricing as timeless truth. When no entry matches (provider, model,
+# effective_date <= usage date), `research/usage.py::build_usage_record`
+# sets cost_status=PRICING_NOT_CONFIGURED and leaves estimated_cost unset —
+# token usage is still persisted, just not priced.
+#
+# To enable cost estimation, add dated entries such as:
+#
+# pricing:
+#   - provider: anthropic
+#     model: claude-sonnet-5
+#     effective_date: "2026-01-01"
+#     currency: USD
+#     input_price_per_million: "3.00"
+#     output_price_per_million: "15.00"
+#     pricing_version: anthropic-2026-01-01
+version: 1
+pricing: []

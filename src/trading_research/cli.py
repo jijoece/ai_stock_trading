@@ -562,6 +562,209 @@ def execute_paper(recommendation_id: str, db_path: Path, *, adapter: str = "dete
         }
 
 
+def build_evidence_cli(symbol: str, as_of_str: str, db_path: Path) -> dict:
+    """`build-evidence` CLI command (Milestone 5). Fixture-backed only in
+    this vertical slice — see `research/fixtures.py`. Never calls Claude."""
+    from datetime import datetime, timezone
+
+    from .research.configuration import load_research_config
+    from .research.fixtures import build_fixture_snapshot, fixture_symbols, is_fixture_symbol
+    from .storage.research_repositories import save_evidence_snapshot
+
+    symbol = symbol.upper()
+    try:
+        as_of = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        return {"error": f"invalid --as-of: {exc}"}
+    if as_of.tzinfo is None:
+        return {"error": "--as-of must be timezone-aware (e.g. 2026-07-01T20:00:00Z)"}
+    if not is_fixture_symbol(symbol):
+        return {"error": f"{symbol} is not a fixture-backed symbol in this vertical slice", "fixture_symbols": list(fixture_symbols())}
+
+    research_config = load_research_config()
+    snapshot = build_fixture_snapshot(
+        symbol, as_of, config_hash=research_config.config_hash, git_sha=_git_sha(),
+        clock=lambda: datetime.now(timezone.utc),
+    )
+    with session(db_path) as conn:
+        newly_persisted = save_evidence_snapshot(conn, snapshot)
+    return {
+        "snapshot_id": snapshot.snapshot_id, "symbol": snapshot.symbol, "as_of": snapshot.as_of.isoformat(),
+        "evidence_item_count": len(snapshot.evidence_items), "source_record_count": len(snapshot.source_records),
+        "missing_data_reasons": list(snapshot.missing_data_reasons), "point_in_time_safe": snapshot.point_in_time_safe,
+        "newly_persisted": newly_persisted,
+    }
+
+
+def run_research_cli(snapshot_id: str, provider_name: str, db_path: Path) -> dict:
+    """`run-research` CLI command (Milestone 5). `--provider deterministic`
+    (default) never leaves this machine; `--provider anthropic` requires an
+    explicit flag plus a configured ANTHROPIC_API_KEY and research.model —
+    never selected silently."""
+    from datetime import datetime, timezone
+
+    from .research.configuration import load_research_config
+    from .research.deterministic_provider import DeterministicResearchProvider
+    from .research.orchestration import analyze_with_research_committee
+    from .research.prompt_registry import PromptRegistry
+    from .storage.research_repositories import SQLiteResearchRepository, load_evidence_snapshot
+
+    research_config = load_research_config()
+
+    with session(db_path) as conn:
+        snapshot = load_evidence_snapshot(conn, snapshot_id)
+        if snapshot is None:
+            return {"error": f"no persisted evidence snapshot {snapshot_id!r} — run build-evidence first"}
+
+        if provider_name == "deterministic":
+            provider = DeterministicResearchProvider()
+            model_name = "deterministic-v1"
+        elif provider_name == "anthropic":
+            from .research.anthropic_provider import AnthropicProviderConfig, AnthropicResearchProvider
+            from .research.usage import load_pricing_config
+
+            cfg = load_config(require_anthropic=True)
+            research_config.require_ready()
+            model_name = research_config.model
+            provider = AnthropicResearchProvider(AnthropicProviderConfig(
+                api_key=cfg.anthropic_api_key, request_timeout_seconds=research_config.request_timeout_seconds,
+                pricing_entries=load_pricing_config(),
+            ))
+        else:
+            return {"error": f"unknown provider {provider_name!r} — must be 'deterministic' or 'anthropic'"}
+
+        repo = SQLiteResearchRepository(conn)
+        result = analyze_with_research_committee(
+            snapshot, provider=provider, provider_name=provider_name, model_name=model_name,
+            prompt_registry=PromptRegistry(), research_repository=repo, configuration=research_config,
+            clock=lambda: datetime.now(timezone.utc), run_mode=provider_name,
+        )
+
+    return {
+        "provider": provider_name, "model": model_name, "snapshot_id": snapshot_id,
+        "research_run_id": result.research_run_id, "status": result.status,
+        "reused_existing_run": result.reused_existing_run,
+        "role_reports": [r.role for r in result.role_reports],
+        "decision_rating": result.decision.rating if result.decision else None,
+        "incomplete_reasons": list(result.incomplete_reasons),
+    }
+
+
+def replay_research_cli(research_run_id: str, db_path: Path) -> dict:
+    """`replay-research` CLI command (Milestone 5). Never calls a provider —
+    reconstructs the persisted decision from the persisted evidence snapshot
+    and re-runs the deterministic validators/overlay only."""
+    from .research.configuration import load_research_config
+    from .research.prompt_registry import PromptRegistry
+    from .research.replay import replay_research_run
+    from .storage.research_repositories import SQLiteResearchRepository, load_evidence_snapshot
+
+    research_config = load_research_config()
+    with session(db_path) as conn:
+        run_row = conn.execute(
+            "SELECT * FROM research_committee_runs WHERE research_run_id = ?", (research_run_id,)
+        ).fetchone()
+        if run_row is None:
+            return {"error": f"no persisted research run {research_run_id!r}"}
+        snapshot = load_evidence_snapshot(conn, run_row["snapshot_id"])
+        if snapshot is None:
+            return {"error": f"snapshot {run_row['snapshot_id']!r} is no longer persisted"}
+
+        repo = SQLiteResearchRepository(conn)
+        result = replay_research_run(
+            research_run_id, research_repository=repo, snapshot=snapshot, provider_name=run_row["provider"],
+            model_name=run_row["model_name"], prompt_registry=PromptRegistry(), configuration=research_config,
+            run_mode=run_row["run_mode"],
+        )
+
+    return {
+        "research_run_id": research_run_id, "matches": result.matches, "mismatches": list(result.mismatches),
+        "decision_rating": result.reconstructed_decision.rating if result.reconstructed_decision else None,
+        "overlay_action": result.reconstructed_overlay.action if result.reconstructed_overlay else None,
+    }
+
+
+def compare_research_arms_cli(experiment_id: str, db_path: Path) -> dict:
+    """`compare-research-arms` CLI command (Milestone 5)."""
+    from .storage.research_repositories import list_experiment_assignments
+
+    with session(db_path) as conn:
+        assignments = list_experiment_assignments(conn, experiment_id)
+    return {
+        "experiment_id": experiment_id,
+        "assignments": [
+            {
+                "symbol": a.symbol, "arm": a.arm, "as_of": a.as_of.isoformat(),
+                "baseline_recommendation_id": a.baseline_recommendation_id,
+                "enhanced_recommendation_id": a.enhanced_recommendation_id,
+            }
+            for a in assignments
+        ],
+    }
+
+
+def research_performance_cli(db_path: Path) -> dict:
+    """`research-performance` CLI command (Milestone 5): research-run-level
+    outcome rates. Trading-performance comparison lives in
+    `evaluation/research_comparison.py` (evaluate-research-arms)."""
+    from .storage.research_repositories import list_research_committee_runs
+
+    with session(db_path) as conn:
+        runs = list_research_committee_runs(conn)
+    total = len(runs)
+    completed = sum(1 for r in runs if r["status"] == "COMPLETED")
+    incomplete = sum(1 for r in runs if r["status"] == "ANALYSIS_INCOMPLETE")
+    failed = sum(1 for r in runs if r["status"] == "FAILED")
+    return {
+        "total_runs": total, "completed": completed, "analysis_incomplete": incomplete, "failed": failed,
+        "completion_rate": (completed / total) if total else None,
+        "incomplete_rate": (incomplete / total) if total else None,
+    }
+
+
+def research_usage_cli(db_path: Path) -> dict:
+    """`research-usage` CLI command (Milestone 5): token/latency/cost
+    aggregation grouped by role, over every persisted attempt."""
+    from decimal import Decimal
+
+    from .storage.research_repositories import list_attempt_usage_rows
+
+    with session(db_path) as conn:
+        rows = list_attempt_usage_rows(conn)
+
+    by_role: dict[str, dict] = {}
+    total_cost = Decimal("0")
+    cost_available = False
+    for row in rows:
+        agg = by_role.setdefault(row["role"], {
+            "attempts": 0, "successes": 0, "total_input_tokens": 0, "total_output_tokens": 0,
+            "_latency_sum": 0, "_latency_count": 0,
+        })
+        agg["attempts"] += 1
+        agg["successes"] += int(bool(row["success"]))
+        agg["total_input_tokens"] += row["input_tokens"] or 0
+        agg["total_output_tokens"] += row["output_tokens"] or 0
+        if row["latency_ms"] is not None:
+            agg["_latency_sum"] += row["latency_ms"]
+            agg["_latency_count"] += 1
+        if row["cost_status"] == "CALCULATED" and row["estimated_cost"] is not None:
+            total_cost += Decimal(row["estimated_cost"])
+            cost_available = True
+
+    summary = {}
+    for role, agg in by_role.items():
+        summary[role] = {
+            "attempts": agg["attempts"], "successes": agg["successes"],
+            "total_input_tokens": agg["total_input_tokens"], "total_output_tokens": agg["total_output_tokens"],
+            "average_latency_ms": (agg["_latency_sum"] / agg["_latency_count"]) if agg["_latency_count"] else None,
+        }
+    return {
+        "by_role": summary,
+        "total_estimated_cost": str(total_cost) if cost_available else None,
+        "cost_status": "CALCULATED" if cost_available else "PRICING_NOT_CONFIGURED_OR_NO_USAGE",
+    }
+
+
 def paper_status(db_path: Path) -> dict:
     from .paper.ledger import PaperLedger
 
@@ -609,6 +812,24 @@ def main(argv: list[str] | None = None) -> int:
     p_evaluate.add_argument("--recommendation-id", action="append", dest="recommendation_ids", required=True)
 
     sub.add_parser("paper-performance", help="Aggregate portfolio/strategy metrics over evaluations (Milestone 4)")
+
+    p_build_evidence = sub.add_parser("build-evidence", help="Build and persist a point-in-time evidence snapshot (Milestone 5)")
+    p_build_evidence.add_argument("--symbol", required=True)
+    p_build_evidence.add_argument("--as-of", required=True, help="ISO-8601 timezone-aware timestamp, e.g. 2026-07-01T20:00:00Z")
+
+    p_run_research = sub.add_parser("run-research", help="Invoke the research committee for a persisted evidence snapshot (Milestone 5)")
+    p_run_research.add_argument("--snapshot-id", required=True)
+    p_run_research.add_argument("--provider", choices=("deterministic", "anthropic"), default="deterministic")
+
+    p_replay_research = sub.add_parser("replay-research", help="Deterministically replay a persisted research run — never calls a provider (Milestone 5)")
+    p_replay_research.add_argument("--research-run-id", required=True)
+
+    p_compare_arms = sub.add_parser("compare-research-arms", help="Show baseline vs Claude-enhanced experiment assignments (Milestone 5)")
+    p_compare_arms.add_argument("--experiment-id", required=True)
+
+    sub.add_parser("research-performance", help="Research-run outcome rates: completed/incomplete/failed (Milestone 5)")
+
+    sub.add_parser("research-usage", help="Token/latency/cost aggregation by role over persisted research attempts (Milestone 5)")
 
     args = parser.parse_args(argv)
 
@@ -660,6 +881,46 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "paper-performance":
         cfg = load_config()
         outcome = paper_performance_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "build-evidence":
+        cfg = load_config()
+        outcome = build_evidence_cli(args.symbol, args.as_of, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "run-research":
+        cfg = load_config()
+        outcome = run_research_cli(args.snapshot_id, args.provider, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        if "error" in outcome:
+            return 2
+        return 0 if outcome["status"] == "COMPLETED" else 2
+
+    if args.command == "replay-research":
+        cfg = load_config()
+        outcome = replay_research_cli(args.research_run_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        if "error" in outcome:
+            return 2
+        return 0 if outcome["matches"] else 2
+
+    if args.command == "compare-research-arms":
+        cfg = load_config()
+        outcome = compare_research_arms_cli(args.experiment_id, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "research-performance":
+        cfg = load_config()
+        outcome = research_performance_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "research-usage":
+        cfg = load_config()
+        outcome = research_usage_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 
