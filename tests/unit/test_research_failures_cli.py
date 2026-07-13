@@ -79,6 +79,15 @@ def test_full_run_query_returns_all_failures(db_with_bear_failure):
     assert "counts_by_code" in outcome
 
 
+def test_prompt_version_visible_in_diagnostics(db_with_bear_failure):
+    """The hardened bear/v2.txt prompt's version is visible per-failure through the CLI,
+    not just held in memory — proves persistence, not just construction."""
+    db_path, run_id = db_with_bear_failure
+    outcome = research_failures_cli(run_id, db_path, role="bear")
+    assert outcome["total_failures"] > 0
+    assert all(f["prompt_version"] == "v2" for f in outcome["failures"])
+
+
 def test_role_filter(db_with_bear_failure):
     db_path, run_id = db_with_bear_failure
     outcome = research_failures_cli(run_id, db_path, role="bear")

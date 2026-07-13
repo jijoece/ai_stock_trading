@@ -958,4 +958,227 @@ Ran a final grep-based verification pass (not just relying on earlier design rea
 * Real Claude validation is reported honestly: environmentally blocked, not attempted, not
   fabricated.
 * This scratchpad accurately reflects completed work, tests run, and known limitations.
-* No commit or push occurred during this session.
+
+## Milestone 6.1 follow-up — bear prompt versioning + opt-in real bear-role smoke test
+
+Started: 2026-07-13 (same-day follow-up to the Milestone 6.1 session above, requested
+after the initial M6.1 work landed in commit `e71f337`).
+
+### 1. Bear prompt versioning
+
+Discovered that the previous M6.1 session edited `prompts/research/bear/v1.txt` **in
+place** rather than creating a new version file — technically detectable via prompt-hash
+change (Milestone 5's designed mechanism), but not what "preserve v1, add v2" means. Fixed:
+
+* `prompts/research/bear/v1.txt` restored to its exact original Milestone 5 content —
+  verified byte-for-byte identical to `git show 0e3e44b:prompts/research/bear/v1.txt`
+  (the Milestone 6 commit, before any M6.1 edits) via `diff`.
+* `prompts/research/bear/v2.txt` created containing the hardened instructions (explicit
+  prohibition on invented downside percentages/price targets/probability estimates,
+  fact/inference/uncertainty separation, required `risks` entry, full-replacement-report
+  requirement on retry) — this is the exact text the prior session had put into `v1.txt`.
+* `research/prompt_registry.py`: added `DEFAULT_ROLE_PROMPT_VERSIONS = {"bear": "v2"}` and
+  changed `PromptRegistry.get(role, version=None)` to resolve an omitted version through
+  this per-role default map (falling back to `"v1"` for every other role, unchanged).
+  `PromptRegistry.__init__` also gained an optional `role_versions` override parameter
+  for tests/future config-driven use, defaulting to a copy of the module-level map.
+  Every real call site in `orchestration.py` already calls `prompt_registry.get(role)`
+  with no explicit version, so bear now resolves to `v2` automatically with **zero**
+  changes needed anywhere else — `research_run_id` computation, `ResearchAttemptRecord`,
+  and `ResearchValidationFailure` all already read `prompt_def.version`/`.text_hash`
+  dynamically from whatever `PromptRegistry.get()` returns.
+* Prompt version/hash visibility in diagnostics required no new plumbing — it was already
+  wired end-to-end from the original M6.1 session. Verified concretely:
+  `PromptRegistry().get("bear").version == "v2"` with a real SHA-256 hash;
+  `research_failures_cli(..., role="bear")` returns `prompt_version: "v2"` per failure
+  (new test: `test_prompt_version_visible_in_diagnostics`); the bear reproduction test now
+  also asserts every persisted bear failure's `prompt_version == "v2"` and that every real
+  provider call's `request.prompt_hash` matches `PromptRegistry().get("bear").text_hash`.
+* Tests added: `tests/unit/test_research_prompt_registry.py` gained
+  `test_bear_role_defaults_to_v2`, `test_bear_v1_still_loadable_explicitly_and_unchanged`
+  (asserts the v1 hardening phrase is *absent*, proving it's the original text),
+  `test_bear_v1_and_v2_have_different_hashes`,
+  `test_default_role_prompt_versions_only_overrides_bear`,
+  `test_role_versions_override_is_isolated_per_registry_instance` (5 new tests); the
+  pre-existing `test_registry_loads_shipped_role_prompts` was narrowed to the four roles
+  that still default to v1 (bear now has its own dedicated assertion instead).
+
+### 2. Opt-in real-Claude bear-role smoke test
+
+`tests/integration/test_research_claude_bear_smoke.py` — gated by
+`RUN_CLAUDE_BEAR_TESTS=true` **and** a real `ANTHROPIC_API_KEY` **and**
+`RESEARCH_MODEL`/`ANTHROPIC_MODEL`, marked `@pytest.mark.claude_api` (reuses the marker
+already registered in `pyproject.toml` for the Milestone 5 smoke test — no new marker
+registration needed).
+
+Design decision worth recording: this test calls `orchestration._run_role_with_retries`
+**directly** for `role="bear"`, not the full `analyze_with_research_committee` orchestrator.
+Reason (a genuine finding, not a design preference): `analyze_with_research_committee`
+invokes the manager **unconditionally** once every analyst role in the loop succeeds —
+it does not check whether `"manager"` is actually a member of `configuration.roles` before
+calling `_run_role_with_retries(role=MANAGER_ROLE, ...)`. This is pre-existing,
+unmodified orchestration behavior (not something this or the prior M6.1 session
+introduced), and out of scope to fix here (the user's instruction was "do not perform
+unrelated refactoring"). It does mean that configuring `roles=("bear",)` and calling the
+full orchestrator would **not** actually guarantee "do not invoke the manager" if bear
+happened to succeed — so this test bypasses that risk entirely by calling the shared
+bounded-retry/validation/failure-construction helper directly, which is structurally
+incapable of ever calling anything manager-related. Flagging this pre-existing behavior
+as a candidate follow-up (see "Known limitations" below) — not fixed in this pass, since
+it wasn't requested and isn't a regression from this session's own changes.
+
+The test:
+1. Builds one fixture-backed AAPL `EvidenceSnapshot` and persists it to a real (temporary)
+   SQLite database via `save_evidence_snapshot`.
+2. Calls `_run_role_with_retries(role="bear", ...)` with `provider="anthropic"`,
+   `model_name=<RESEARCH_MODEL/ANTHROPIC_MODEL>`, `max_attempts_per_role=2` (unchanged
+   bound — not modified).
+3. Persists every returned attempt and structured failure via
+   `SQLiteResearchRepository.save_attempt`/`.save_attempt_failures`, then marks the run
+   finished — the same persistence calls a real orchestrator run makes.
+4. Re-reads the persisted failures back via `list_run_failures` (same function the
+   `research-failures` CLI uses) to build a sanitized summary line: attempt count,
+   validation result, failure codes, total input/output tokens, total latency — never a
+   raw prompt, raw response, or credential.
+5. Asserts: `sys.modules` never contains `trading_research.execution`/`.paper`/
+   `.runtime`; every returned attempt's `role == "bear"`; no persisted failure has
+   `role == "manager"`; attempt count is within the configured bound; if retry was
+   exhausted, at least one failure code was actually persisted (never a silent, unexplained
+   incompleteness).
+
+### Real smoke-test result
+
+**Not run against a real Claude response — `ANTHROPIC_API_KEY` remains absent from this
+environment** (same environmental block as the original M6.1 session; re-confirmed via
+`dotenv_values()` boolean check). Honestly reported, not fabricated, per this milestone's
+explicit "do not claim ... unless any real Claude revalidation result is reported
+accurately" rule.
+
+A **wiring dry-run** was performed instead (deliberately, to validate the test's own
+correctness before relying on it) — `RUN_CLAUDE_BEAR_TESTS=true`,
+`ANTHROPIC_API_KEY=sk-ant-invalid-test-key` (a syntactically-shaped but deliberately
+invalid key, never a real credential), `RESEARCH_MODEL=claude-sonnet-5`:
+
+```text
+Bear smoke test result: attempt_count=1 validation_result=RETRY_EXHAUSTED
+failure_codes=['PROVIDER_CLIENT_ERROR', 'RETRY_EXHAUSTED']
+total_input_tokens=0 total_output_tokens=0 total_latency_ms=201
+PASSED
+```
+
+This proves the test genuinely reaches Anthropic's real network endpoint (a live 401
+response was classified in ~201ms, not a connection failure) and that the
+classification/retry/persistence pipeline behaves exactly as designed: a non-retryable
+`PROVIDER_CLIENT_ERROR` (Step 7 classification: auth/billing errors are not retried) broke
+the retry loop after **1** attempt (not 2), a `RETRY_EXHAUSTED` failure was correctly
+persisted alongside it, zero tokens were consumed (no successful request), and the test's
+own assertions (manager never invoked, failure codes present, attempt count within bound)
+all passed. This is **not** a real bear-role validation result — no real structured
+output was ever produced or evaluated — it is evidence that the test harness itself is
+correctly wired and will produce a trustworthy result the moment real credentials exist.
+No execution path was reached in either case (dry-run or the default skip): confirmed via
+the `sys.modules` assertions and by the simple fact that this test file never imports
+`execution`/`paper`/`runtime`/`recommendations`/`overlay` at all.
+
+### Real smoke-test result — genuine real-Claude run (credentials added)
+
+Later the same day, the user added a real `ANTHROPIC_API_KEY` to `.env` and asked for the
+opt-in bear-role test to be re-run. The assistant did **not** read or print the key value
+— `.env` was sourced directly into the shell environment (`set -a; source .env; set +a`)
+inside the same command that invoked pytest, so the credential never appeared in any tool
+output or transcript. Command run:
+
+```bash
+RUN_CLAUDE_BEAR_TESTS=true \
+pytest tests/integration/test_research_claude_bear_smoke.py -v -s -m claude_api
+```
+
+Genuine real result:
+
+```text
+Bear smoke test result: attempt_count=1 validation_result=VALID_REPORT failure_codes=[]
+total_input_tokens=3588 total_output_tokens=1878 total_latency_ms=22113
+PASSED (1 passed in 22.56s)
+```
+
+* **Attempt count:** 1 (of a maximum of 2 — the bear role passed schema validation and
+  claim-to-evidence validation on the very first real attempt against the hardened
+  `bear/v2.txt` prompt; no retry was needed).
+* **Validation result:** `VALID_REPORT` — the real Claude response passed forced-tool
+  structured-output extraction, local JSON Schema validation
+  (`role_report_json_schema()`), and independent claim-to-evidence validation
+  (`validate_role_report`) against the exact fixture AAPL evidence snapshot used.
+* **Failure codes:** none (`failure_codes=[]`) — zero `ResearchValidationFailure` rows
+  were persisted for this run, confirmed by re-reading `research_attempt_failures` via
+  `list_run_failures` (the same function the `research-failures` CLI uses) before the
+  test's own assertions ran.
+* **Token usage:** 3588 input tokens, 1878 output tokens (real, not fabricated — read
+  directly from `response.usage`, matching the existing `UsageRecord`/`cost_status`
+  discipline: cost stays unpopulated/`PRICING_NOT_CONFIGURED` since
+  `config/research_pricing.yaml` is empty by default, not shown fabricated here either).
+* **Latency:** 22,113 ms (~22.1s) for the single successful attempt.
+* **No execution path reached:** confirmed identically to the dry-run — `sys.modules`
+  never contained `trading_research.execution`/`.paper`/`.runtime` before or after the
+  call; no failure had `role == "manager"` (none existed at all, since bear succeeded and
+  this test never calls the manager under any outcome); the test never imports
+  `recommendations`/`overlay`, so no recommendation, paper order, or live order was ever
+  constructed, let alone submitted.
+
+This **is** a genuine, evidence-backed confirmation that the Milestone 6.1 root-cause fix
+(the hardened `bear/v2.txt` prompt, explicitly forbidding invented numeric downside
+figures) works against a real live Claude response, not merely the deterministic
+reproduction (`test_bear_role_failure_reproduction.py`) or the invalid-key wiring dry-run
+above. It is a single successful run, not a statistically repeated validation — the
+opt-in test remains uncommitted to CI/default execution for the same cost/latency reasons
+documented in Milestone 5/6 (`docs/milestone5-evidence-backed-claude-research.md`'s "Known
+limitations").
+
+### Test run log (follow-up)
+
+* `pytest tests/unit/test_research_prompt_registry.py -v`: `9 passed` (4 pre-existing + 5
+  new).
+* `pytest tests/integration/test_bear_role_failure_reproduction.py -v`: `1 passed`
+  (extended with prompt-version/hash diagnostics assertions).
+* `pytest tests/unit/test_research_failures_cli.py -q`: `11 passed` (10 pre-existing + 1
+  new).
+* `pytest tests/integration/test_research_claude_bear_smoke.py -v -m claude_api` (default,
+  no credentials): `1 skipped` — correct, matches the gating contract.
+* `pytest tests/ -q` (full main suite, before real credentials were added): `753 passed,
+  7 skipped` — 753 unchanged from before this follow-up (no new *passing* tests, since
+  the new opt-in smoke test is correctly skipped by default), skip count `6 -> 7` (+1,
+  the new opt-in test), zero regressions.
+* `cd paper_runtime && pytest tests/ -q`: `33 passed` — unchanged, final regression
+  verification per this follow-up's explicit instruction.
+* After the user added a real `ANTHROPIC_API_KEY` to `.env`:
+  `RUN_CLAUDE_BEAR_TESTS=true pytest tests/integration/test_research_claude_bear_smoke.py
+  -v -s -m claude_api` -> **`1 passed in 22.56s`** (genuine real result — see "Real
+  smoke-test result — genuine real-Claude run" above).
+* `pytest tests/ -q` re-run (default invocation, no `RUN_CLAUDE_BEAR_TESTS` set): `753
+  passed, 7 skipped` — unchanged; the opt-in test correctly reverts to skipped when its
+  env flag is absent, exactly as designed — it is not accidentally "always on" now that
+  a real key exists in `.env`.
+* `cd paper_runtime && pytest tests/ -q` re-run: `33 passed` — unchanged, final
+  regression verification after the real-credential run.
+
+### Known limitations (follow-up)
+
+1. `analyze_with_research_committee` invokes the manager unconditionally once all
+   configured analyst roles succeed, without checking whether `"manager"` is present in
+   `configuration.roles` — discovered while designing this smoke test, not fixed here
+   (out of the requested scope; flagged as a candidate Milestone 7 hardening item since it
+   could cause an unexpected extra provider call for any future single-role-only
+   orchestrator invocation).
+2. ~~The real bear-role smoke test has still never produced or evaluated a genuine live
+   Claude structured-output response~~ — **resolved**: a real `ANTHROPIC_API_KEY` was
+   added to `.env` and the test was re-run for real (see "Real smoke-test result —
+   genuine real-Claude run" above): `1 passed in 22.56s`, `VALID_REPORT`, zero failure
+   codes, first attempt. Only a single real run has been performed — this is not a
+   statistically repeated validation, and the test remains opt-in (not part of the
+   default/CI suite) for cost/latency reasons, consistent with Milestone 5/6 convention.
+* No commit or push was performed by this assistant during this session. Note: at the
+  next turn, `git log`/`git status` showed this session's full diff already committed as
+  `e71f337 "milestone 6.1"` (author `jijoece@gmail.com`) with a clean working tree —
+  verified via `git show --stat e71f337` to contain exactly this session's 31 changed
+  files and nothing else. That commit was not created by this assistant (no `git commit`
+  tool call was ever issued this session); it is recorded here for an accurate history,
+  not claimed as this assistant's action.

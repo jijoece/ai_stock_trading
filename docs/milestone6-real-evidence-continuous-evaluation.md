@@ -513,12 +513,16 @@ attempt's prompt unbounded.
 
 ### Prompt changes
 
-`prompts/research/bear/v1.txt` rewritten to explicitly forbid invented numeric downside
-percentages/price targets/probability estimates, require visible fact/inference/uncertainty
-separation, require at least one `risks` entry, and require a complete replacement report
-after retry feedback. Edited in place (not a new `v2.txt`) — `PromptRegistry` hashes the
-prompt's *text*, so this edit alone changes `prompt_hash` and therefore
-`research_run_id` for any future run, per Milestone 5's existing versioning design.
+`prompts/research/bear/v2.txt` (added in a same-day follow-up — see "Follow-up: proper
+prompt versioning" below) explicitly forbids invented numeric downside
+percentages/price targets/probability estimates, requires visible fact/inference/uncertainty
+separation, requires at least one `risks` entry, and requires a complete replacement report
+after retry feedback. `prompts/research/bear/v1.txt` is preserved as the original,
+unmodified Milestone 5 text. `research/prompt_registry.py::DEFAULT_ROLE_PROMPT_VERSIONS`
+makes `v2` the default a caller gets when it omits an explicit version — every real call
+site already does — so `prompt_hash`/`research_run_id` naturally differ from any run
+that used `v1`, per Milestone 5's existing versioning design; no orchestration code
+needed to change.
 
 ### Evidence-presentation changes
 
@@ -611,7 +615,78 @@ orchestration code path; the Anthropic-SDK-specific classification logic
 (`anthropic_provider.py`) is instead unit-tested against locally-constructed real
 `anthropic.*Error`/response-shaped objects
 (`tests/unit/test_research_anthropic_provider_classification.py`), exercising the same
-code paths a live call would trigger without requiring network access or credentials.
+code paths a live call would trigger without requiring network access or credentials. See
+"Follow-up: opt-in real bear-role smoke test" below for the dedicated bear-only opt-in
+test added after this session, and its own (still environmentally blocked) result.
+
+## Follow-up: proper prompt versioning
+
+Same-day follow-up after the above landed: the bear prompt hardening had been made by
+editing `v1.txt` in place rather than adding a real `v2`. Fixed:
+
+* `prompts/research/bear/v1.txt` restored to its exact original Milestone 5 content
+  (verified byte-for-byte against the pre-M6.1 commit).
+* `prompts/research/bear/v2.txt` added with the hardened instructions.
+* `research/prompt_registry.py::DEFAULT_ROLE_PROMPT_VERSIONS = {"bear": "v2"}` — every
+  existing call site (`prompt_registry.get(role)`, no explicit version) now resolves bear
+  to `v2` automatically; `v1` remains fully loadable via an explicit
+  `registry.get("bear", version="v1")`.
+* Prompt version and hash were already threaded through to `research_attempts`,
+  `research_attempt_failures`, and the `research-failures` CLI output by the original
+  M6.1 work — no new plumbing was needed, only new tests proving it (see
+  `tests/unit/test_research_prompt_registry.py` and the extended
+  `test_bear_role_failure_reproduction.py`/`test_research_failures_cli.py`).
+
+## Follow-up: opt-in real bear-role smoke test
+
+`tests/integration/test_research_claude_bear_smoke.py` (gated by
+`RUN_CLAUDE_BEAR_TESTS=true` + real `ANTHROPIC_API_KEY` + `RESEARCH_MODEL`/
+`ANTHROPIC_MODEL`, marked `claude_api`):
+
+```bash
+RUN_CLAUDE_BEAR_TESTS=true \
+pytest tests/integration/test_research_claude_bear_smoke.py \
+-v -m claude_api
+```
+
+Calls `orchestration._run_role_with_retries` directly for `role="bear"` rather than the
+full orchestrator — a genuine finding surfaced while designing this test:
+`analyze_with_research_committee` invokes the manager **unconditionally** once every
+configured analyst role succeeds, regardless of whether `"manager"` is actually present
+in `configuration.roles`. This pre-existing behavior is not fixed here (unrelated to this
+follow-up's scope); calling the shared retry helper directly instead makes "the manager is
+never invoked" a structural guarantee for this test rather than a behavioral hope.
+
+**Wiring dry-run** (`ANTHROPIC_API_KEY=sk-ant-invalid-test-key`, a deliberately invalid
+key, never a real credential), performed while `ANTHROPIC_API_KEY` was still absent from
+this environment, confirmed the test reaches Anthropic's real network endpoint and
+correctly classifies/persists the response:
+
+```text
+attempt_count=1 validation_result=RETRY_EXHAUSTED
+failure_codes=['PROVIDER_CLIENT_ERROR', 'RETRY_EXHAUSTED']
+total_input_tokens=0 total_output_tokens=0 total_latency_ms=201
+```
+
+**Genuine real-Claude result** — after the user added a real `ANTHROPIC_API_KEY` to
+`.env` (never read or printed by the assistant; loaded directly into the shell
+environment for the test invocation), the same command was re-run for real:
+
+```text
+attempt_count=1 validation_result=VALID_REPORT failure_codes=[]
+total_input_tokens=3588 total_output_tokens=1878 total_latency_ms=22113
+PASSED (1 passed in 22.56s)
+```
+
+The bear role, using the hardened `bear/v2.txt` prompt, passed forced-tool structured
+output, local JSON Schema validation, and independent claim-to-evidence validation
+against the fixture AAPL snapshot on its **first** real attempt — no retry needed, zero
+`ResearchValidationFailure` rows persisted. No execution path was reached in either the
+dry-run or the real run, confirmed via `sys.modules` checks (the test file never imports
+`execution`/`paper`/`runtime`/`recommendations`/`overlay`); no recommendation, paper
+order, or live order was constructed or submitted. This is a single successful real run,
+not a repeated statistical validation — the test remains opt-in, not part of the default
+suite, for the same cost/latency reasons as the Milestone 5 smoke test.
 
 ### Remaining limitations
 
@@ -620,9 +695,20 @@ code paths a live call would trigger without requiring network access or credent
    currently reachable — the existing claim validator cannot yet distinguish "evidence_id
    never existed" from "belongs to a different snapshot/symbol," and does not compare
    units; extending it was out of this session's narrow, evidence-backed scope.
-2. Real-Claude revalidation of the bear-role prompt fix could not be performed in this
-   environment (no API key) — the fix is validated deterministically
-   (`test_bear_role_failure_reproduction.py`) but not yet against a live model response.
+2. ~~Real-Claude revalidation of the bear-role prompt fix could not be performed in this
+   environment~~ — **resolved**: a real `ANTHROPIC_API_KEY` was added to `.env` and the
+   opt-in bear-role smoke test was run for real (see "Follow-up: opt-in real bear-role
+   smoke test"): `1 passed in 22.56s`, `VALID_REPORT`, zero failure codes, first attempt.
+   This is a single successful real run, not a statistically repeated validation across
+   multiple evidence conditions or multiple attempts — the deterministic reproduction
+   (`test_bear_role_failure_reproduction.py`) remains the repeatable, cost-free
+   regression guard; the real-Claude run is a point-in-time confirmation the fix works
+   against a live model.
 3. Corporate-status/going-concern SEC metadata and portfolio-context market-value pricing
    remain deferred to Milestone 7 (see the M6.1 scratchpad's "Issues deferred" for the
    specific justification for each).
+4. `analyze_with_research_committee` invokes the manager unconditionally once all
+   configured analyst roles succeed, without checking whether `"manager"` is present in
+   `configuration.roles` — discovered while building the opt-in bear-role smoke test;
+   flagged as a candidate Milestone 7 hardening item, not fixed here (out of this
+   follow-up's requested scope).

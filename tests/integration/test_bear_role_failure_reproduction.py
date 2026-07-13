@@ -122,6 +122,15 @@ def test_bear_role_invented_downside_exhausts_retries_and_skips_manager():
     assert all(f.stage == STAGE_CLAIM_EVIDENCE_VALIDATION for f in numeric_failures)
     assert all(f.claim_id == "bear-claim-1" for f in numeric_failures)
     assert {f.attempt_number for f in numeric_failures} == {1, 2}
+    # Prompt version/hash are visible in diagnostics (not just in-memory) — the hardened
+    # bear/v2.txt prompt is the default `PromptRegistry().get("bear")` resolves to, and
+    # every persisted failure for the bear role carries that version.
+    assert all(f.prompt_version == "v2" for f in numeric_failures)
+    from trading_research.research.prompt_registry import PromptRegistry as _PR
+    assert all(f.schema_version == "role-report.v1" for f in numeric_failures)
+    bear_prompt_hash = _PR().get("bear").text_hash
+    bear_calls_prompt_hashes = {c.prompt_hash for c in bear_calls}
+    assert bear_calls_prompt_hashes == {bear_prompt_hash}
 
     retry_exhausted = [f for f in repo.failures if f.stage == STAGE_RETRY_EXHAUSTED]
     assert len(retry_exhausted) == 1
