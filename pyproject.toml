@@ -47,4 +47,8 @@ markers = [
     "market_data_api: opt-in real Alpaca market-data smoke test (Milestone 6) — requires RUN_MARKET_DATA_TESTS=true and real Alpaca credentials; skipped by default, never run automatically just because credentials happen to be present.",
     "news_api: opt-in real news-provider smoke test (Milestone 6) — requires RUN_NEWS_API_TESTS=true and a real news-provider API key; skipped by default.",
     "real_research_cycle: opt-in real scheduled-research-cycle smoke test (Milestone 6) — requires RUN_REAL_RESEARCH_CYCLE=true; skipped by default.",
+    "corporate_status_real: opt-in real SEC-derived corporate-status smoke test (Milestone 7) — requires RUN_CORPORATE_STATUS_TESTS=true; skipped by default. No credentials required by SEC EDGAR itself, but this still never runs automatically.",
+    "reddit_sentiment_real: opt-in real Reddit sentiment smoke test (Milestone 7) — requires RUN_REDDIT_SENTIMENT_TESTS=true and real Reddit credentials; skipped by default.",
+    "real_shadow_cycle: opt-in real shadow-cycle smoke test (Milestone 7) — requires RUN_REAL_SHADOW_CYCLE=true; skipped by default.",
+    "real_claude_shadow_cycle: opt-in real Claude shadow-cycle smoke test (Milestone 7) — requires RUN_REAL_CLAUDE_SHADOW_CYCLE=true and a real ANTHROPIC_API_KEY; skipped by default. This is a real, small-cost Claude API call.",
 ]

@@ -22,7 +22,10 @@ providers:
 
   news:
     enabled: false
-    provider: null               # no real news provider is implemented in this milestone
+    provider: null               # set to "alpaca_news" to select the Alpaca News API adapter
+                                  # (Milestone 7 Step 9); requires ALPACA_MARKET_DATA_API_KEY/SECRET.
+                                  # Shipped default stays disabled/null — enabling this is an explicit
+                                  # operator decision, never inferred from credential presence.
     request_timeout_seconds: 30
     max_attempts: 2
 

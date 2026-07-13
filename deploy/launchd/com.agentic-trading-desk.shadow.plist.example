@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DEPLOYABLE SCHEDULER ARTIFACT (docs/milestone-7.md Step 20) — NOT an
+  ACTUAL RECURRING DEPLOYMENT. The `.example` suffix means launchd never
+  loads this file as-is; an operator must explicitly copy it (dropping the
+  suffix), fill in the placeholder paths and StartCalendarInterval below,
+  and run `launchctl load` themselves (see deploy/launchd/README.md for the
+  exact procedure and how to validate first without activating).
+
+  This template invokes ONLY `run_shadow_cycle.sh` (which in turn invokes
+  only `python -m trading_research.cli run-due-shadow-cycle`) — no other
+  command, no credentials embedded here or in the wrapper script.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-trading-desk.shadow</string>
+
+    <!-- Fill in the absolute path to your copy of run_shadow_cycle.sh
+         (dropped .example suffix, REPO_DIR/LOG_DIR filled in) before use. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/path/to/agentic-trading-desk/deploy/launchd/run_shadow_cycle.sh</string>
+    </array>
+
+    <!--
+      DISABLED BY DEFAULT: StartCalendarInterval is commented out below.
+      launchd does not run a job with no start trigger and no
+      RunAtLoad — this key block is illustrative only; an operator who
+      wants a real schedule must uncomment it AND fill in the actual
+      hour/minute they intend (which should match, but is not required by
+      launchd to match, config/shadow_operations.yaml's
+      schedule.intended_local_time — the scheduler's own catch-up logic in
+      shadow/schedule.py tolerates launchd firing a few minutes early/late
+      or being skipped entirely, since resolve_due_status is itself
+      re-evaluated fresh on every invocation).
+
+      <key>StartCalendarInterval</key>
+      <dict>
+          <key>Hour</key>
+          <integer>6</integer>
+          <key>Minute</key>
+          <integer>45</integer>
+      </dict>
+    -->
+
+    <!-- RunAtLoad is intentionally false/absent: loading this job must
+         never itself trigger an immediate run. Combined with no
+         StartCalendarInterval above, loading this exact template is
+         inert — it registers a job with launchd that never fires until an
+         operator adds a real trigger. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd's own stdout/stderr capture, separate from the wrapper
+         script's own timestamped per-invocation log files under LOG_DIR.
+         Fill in an absolute path before use. -->
+    <key>StandardOutPath</key>
+    <string>/path/to/agentic-trading-desk/logs/shadow/launchd-stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/agentic-trading-desk/logs/shadow/launchd-stderr.log</string>
+
+    <!-- No environment variables are set here — this repository's
+         capability decisions (shadow_operations.enabled, allow_enhanced_submission,
+         etc.) are read only from config/shadow_operations.yaml, never from
+         the environment (see that file's own header comment) — so there is
+         nothing sensitive or capability-affecting to set in EnvironmentVariables,
+         and none is set. -->
+
+    <!-- Not relying on launchd's own retry/backoff semantics: KeepAlive is
+         intentionally omitted. A missed or failed run is instead recovered
+         by this repository's own catch-up logic (shadow/schedule.py's
+         MISSED_WITHIN_CATCHUP/MISSED_TOO_OLD statuses) the next time this
+         job fires, not by launchd immediately relaunching a failed
+         process. -->
+</dict>
+</plist>

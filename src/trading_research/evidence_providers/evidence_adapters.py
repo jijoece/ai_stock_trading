@@ -175,6 +175,11 @@ class RealMarketEvidenceProvider:
 
 
 class RealNewsEvidenceProvider:
+    """Wraps any raw client satisfying `models.NewsProvider`'s
+    `list_news(symbol, *, published_after, available_by) -> tuple[NewsArticle, ...]`
+    shape — `UnconfiguredNewsProvider` (always fails closed) or
+    `alpaca_news_provider.AlpacaNewsClient` (docs/milestone-7.md Step 9)."""
+
     def __init__(self, client: UnconfiguredNewsProvider | object):
         self._client = client
 

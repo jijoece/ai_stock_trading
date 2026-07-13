@@ -1,0 +1,49 @@
+# Shadow-operations configuration (Milestone 7, docs/milestone-7.md Step 12).
+# Disabled by default in every dimension: `shadow_operations.enabled: false`
+# and `schedule.enabled: false`. `allow_baseline_paper_submission` and
+# `allow_enhanced_submission` both default false; `allow_enhanced_submission`
+# is structurally impossible to set true — `shadow/config.py`'s
+# `ShadowOperationsConfig.__post_init__` raises if it is ever `true`,
+# mirroring `research/promotion.py::PromotionGateConfig.allow_live_promotion`.
+# No environment variable can flip any of these — `.env` only ever supplies
+# credentials, never a capability decision (mirrors evidence_providers.yaml).
+version: 1
+
+shadow_operations:
+  enabled: false
+  mode: SHADOW_ENHANCED
+  allow_baseline_paper_submission: false
+  allow_enhanced_submission: false
+  require_market_open_day: true
+  run_window_timezone: America/Los_Angeles
+  run_window_start: "06:30"
+  run_window_end: "08:30"
+  max_catch_up_cycles: 1
+  lease_ttl_seconds: 3600
+  stale_run_timeout_seconds: 7200
+  continue_on_symbol_failure: true
+
+schedule:
+  enabled: false
+  cadence: DAILY_MARKET_DAY
+  intended_local_time: "06:45"
+
+budgets:
+  require_pricing_for_real_claude: true
+  max_symbols_per_cycle: 10
+  max_roles_per_symbol: 5
+  max_attempts_per_role: 2
+  max_input_tokens_per_cycle: 100000
+  max_output_tokens_per_cycle: 50000
+  max_latency_seconds_per_cycle: 900
+  max_estimated_cost_per_cycle_usd: 5.00
+  max_actual_cost_per_day_usd: 10.00
+  max_actual_cost_per_month_usd: 100.00
+  emergency_margin_fraction: 0.10
+
+safety:
+  pause_on_provider_failure_rate: 0.50
+  pause_on_retry_exhaustion_rate: 0.50
+  pause_on_unsupported_claim_rate: 0.25
+  pause_on_reconciliation_mismatch: true
+  pause_on_budget_breach: true

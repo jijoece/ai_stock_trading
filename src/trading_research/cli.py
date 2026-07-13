@@ -858,6 +858,8 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
     `conn`, when supplied, wires real HTTP calls to persist request/response
     metadata (Step 5) for `provider-health`/`evidence-provider-usage`.
     """
+    from .evidence_providers.alpaca_news_provider import PROVIDER_NAME as NEWS_PROVIDER_NAME
+    from .evidence_providers.alpaca_news_provider import AlpacaNewsClient
     from .evidence_providers.cache import ProviderCache
     from .evidence_providers.config import load_evidence_provider_config
     from .evidence_providers.evidence_adapters import (
@@ -925,11 +927,32 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
     # the gap in missing_data_reasons, consistent with "absent credentials
     # fail closed" (docs/milestone-6.md Step 20).
 
-    news = RealNewsEvidenceProvider(UnconfiguredNewsProvider()) if provider_config.news.enabled else None
-    sentiment = (
-        RealSentimentEvidenceProvider(RedditSentimentSource(credentials_configured=provider_config.sentiment.enabled))
-        if provider_config.sentiment.enabled else None
-    )
+    news = None
+    if provider_config.news.enabled and provider_config.news.provider == "alpaca_news":
+        if cfg.alpaca_market_data_api_key and cfg.alpaca_market_data_api_secret:
+            news_cache = ProviderCache(clock=time.monotonic, on_response=persist_hook)
+            news_http = HttpJsonClient(
+                base_headers={"APCA-API-KEY-ID": cfg.alpaca_market_data_api_key, "APCA-API-SECRET-KEY": cfg.alpaca_market_data_api_secret},
+                rate_limiter=MinIntervalRateLimiter(0.35),
+                max_attempts=provider_config.news.max_attempts, timeout_seconds=provider_config.news.request_timeout_seconds,
+                provider=NEWS_PROVIDER_NAME, on_response=persist_hook,
+            )
+            news = RealNewsEvidenceProvider(AlpacaNewsClient(
+                api_key=cfg.alpaca_market_data_api_key, api_secret=cfg.alpaca_market_data_api_secret,
+                http_client=news_http, cache=news_cache,
+            ))
+            used_providers.append(NEWS_PROVIDER_NAME)
+        # news.enabled=true with provider=alpaca_news but absent credentials fails
+        # closed to news=None (excluded from the registry), matching market_data's
+        # existing "absent credentials fail closed" posture (docs/milestone-6.md Step 20).
+    elif provider_config.news.enabled:
+        news = RealNewsEvidenceProvider(UnconfiguredNewsProvider())
+
+    sentiment = None
+    if provider_config.sentiment.enabled:
+        from .evidence_providers.reddit_fetch import build_reddit_sentiment_source
+
+        sentiment = RealSentimentEvidenceProvider(build_reddit_sentiment_source(cfg))
 
     registry = EvidenceProviderRegistry(
         fundamentals=RealFundamentalsEvidenceProvider(sec) if sec else None,
@@ -1241,6 +1264,423 @@ def evidence_provider_usage_cli(db_path: Path) -> dict:
     return {"by_provider": by_provider}
 
 
+def _shadow_scheduler_run_view(row: dict) -> dict:
+    """Sanitized, documented-field view of one `shadow_scheduler_runs` row —
+    everything already persisted there is derived data (no raw provider
+    payload, no raw prompt, no raw Claude response, no credentials), so this
+    is a pure column passthrough with no additional redaction needed."""
+    return dict(row)
+
+
+def run_due_shadow_cycle_cli(db_path: Path) -> dict:
+    """`run-due-shadow-cycle` CLI command (docs/milestone-7.md Step 18/25).
+    Thin wiring only — delegates entirely to
+    `shadow/scheduler.py::run_due_shadow_cycle`. Every successful-no-op
+    status (disabled, not-due, holiday, already-completed, lease-held,
+    paused, killed) is NOT an error; only an actual internal exception is.
+    """
+    from decimal import Decimal
+    from datetime import timezone as _tz
+
+    from .analysis.scorer import load_scoring_config
+    from .analysis.screener import load_screening_config
+    from .evidence_providers.evidence_adapters import (
+        RealFilingEvidenceProvider,
+        RealFundamentalsEvidenceProvider,
+        RealMarketEvidenceProvider,
+    )
+    from .evidence_providers.fixture_clients import FixtureMarketDataClient, FixtureSecClient
+    from .models.trading_models import PortfolioState
+    from .research.configuration import load_research_config
+    from .research.deterministic_provider import DeterministicResearchProvider
+    from .research.prompt_registry import PromptRegistry
+    from .research.scheduled_cycle import EvidenceProviderRegistry, run_scheduled_research_cycle
+    from .research.scheduled_research_config import load_scheduled_research_config
+    from .research.usage import load_pricing_config
+    from .shadow.config import load_shadow_operations_config
+    from .shadow.scheduler import DEPLOYMENT_SOURCE_MANUAL, run_due_shadow_cycle
+    from .storage.research_cycle_repositories import SQLiteResearchCycleRepository
+    from .storage.research_repositories import SQLiteResearchRepository
+    from .universe.tickers import default_universe
+
+    shadow_config = load_shadow_operations_config()
+    sr_config = load_scheduled_research_config()
+    # This CLI entry point only ever drives the offline/fixture provider mode
+    # — a real-Claude scheduled run would require additional operator
+    # opt-in beyond this task's scope (matching the milestone doc's "manual
+    # smoke tests may remain separately gated" and this task's own
+    # instruction that the shipped default config is `enabled: false`).
+    cycle_config = sr_config.to_cycle_configuration(provider_mode="fixture")
+    research_config = load_research_config()
+    pricing_entries = load_pricing_config()
+
+    def _cycle_kwargs_builder(symbols, as_of):
+        sec = FixtureSecClient()
+        market = FixtureMarketDataClient()
+        registry = EvidenceProviderRegistry(
+            fundamentals=RealFundamentalsEvidenceProvider(sec), market=RealMarketEvidenceProvider(market),
+            filings=RealFilingEvidenceProvider(sec), news=None, sentiment=None, portfolio_context=None,
+            market_data_client=market, sec_client=sec,
+        )
+        return dict(
+            cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
+            screening_config=load_screening_config(), scoring_config=load_scoring_config(),
+            evidence_providers=registry, research_provider=DeterministicResearchProvider(),
+            research_provider_name="deterministic", research_model_name="deterministic-v1",
+            research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
+            prompt_registry=PromptRegistry(),
+            portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            paper_submitter=None, git_sha=_git_sha(),
+        )
+
+    now = datetime.now(_tz.utc)
+    try:
+        with session(db_path) as conn:
+            result = run_due_shadow_cycle(
+                now=now, conn=conn, shadow_config=shadow_config, cycle_configuration=cycle_config,
+                candidate_symbols=lambda: ("AAPL", "MSFT", "SHEL"), run_cycle=run_scheduled_research_cycle,
+                cycle_kwargs_builder=_cycle_kwargs_builder, pricing_entries=pricing_entries,
+                clock=lambda: datetime.now(_tz.utc), deployment_source=DEPLOYMENT_SOURCE_MANUAL,
+            )
+    except Exception as exc:  # only a genuine internal error is non-zero-exit-worthy
+        return {"error": str(exc), "status": "INTERNAL_ERROR"}
+
+    return {
+        "status": result.status, "is_successful_no_op": result.is_successful_no_op, "is_blocked": result.is_blocked,
+        "is_error": result.is_error, "scheduler_run_id": result.scheduler_run_id,
+        "intended_schedule_id": result.intended_schedule_id,
+        "intended_schedule_time": result.intended_schedule_time.isoformat() if result.intended_schedule_time else None,
+        "cycle_id": result.cycle_id, "symbols_attempted": result.symbols_attempted,
+        "symbols_completed": result.symbols_completed, "symbols_skipped": result.symbols_skipped,
+        "budget_reservation_id": result.budget_reservation_id, "budget_reserved_usd": result.budget_reserved_usd,
+        "budget_consumed_usd": result.budget_consumed_usd, "failure_reason": result.failure_reason,
+        "reason": result.reason,
+    }
+
+
+def shadow_status_cli(db_path: Path) -> dict:
+    """`shadow-status` CLI command (docs/milestone-7.md Step 25): current
+    pause/kill state plus the last few scheduler-run and run-summary rows."""
+    from .shadow import pause as pause_mod
+    from .storage.shadow_alerts_repositories import list_run_summaries
+    from .storage.shadow_operations_repositories import list_scheduler_runs
+
+    with session(db_path) as conn:
+        state = pause_mod.current_state(conn)
+        runs = list_scheduler_runs(conn)[:5]
+        summaries = list_run_summaries(conn)[:5]
+
+    return {
+        "pause_state": state.state, "pause_reason": state.reason, "pause_source": state.source,
+        "pause_operator": state.operator, "pause_since": state.created_at.isoformat(),
+        "recent_scheduler_runs": [_shadow_scheduler_run_view(r) for r in runs],
+        "recent_run_summaries": [dict(s) for s in summaries],
+    }
+
+
+def shadow_readiness_cli(db_path: Path) -> dict:
+    """`shadow-readiness` CLI command (docs/milestone-7.md Step 23/25)."""
+    from datetime import timezone as _tz
+
+    from .shadow.config import load_shadow_operations_config
+    from .shadow.readiness import build_readiness_report
+
+    shadow_config = load_shadow_operations_config()
+    now = datetime.now(_tz.utc)
+    with session(db_path) as conn:
+        report = build_readiness_report(conn, now, shadow_config)
+
+    return {
+        "as_of": report.as_of.isoformat(), "policy_version": report.policy_version,
+        "overall_status": report.overall_status,
+        "categories": [
+            {"category": c.category, "status": c.status, "reasons": list(c.reasons), "metrics": c.metrics}
+            for c in report.categories
+        ],
+        "completed_cycle_count": report.completed_cycle_count,
+        "real_provider_cycle_count": report.real_provider_cycle_count,
+        "evidence_completeness_rate": report.evidence_completeness_rate,
+        "role_completion_rate": report.role_completion_rate,
+        "retry_exhaustion_rate": report.retry_exhaustion_rate,
+        "unsupported_claim_rate": report.unsupported_claim_rate,
+        "provider_failure_rate": report.provider_failure_rate,
+        "cost_per_completed_cycle_usd": str(report.cost_per_completed_cycle_usd) if report.cost_per_completed_cycle_usd is not None else None,
+        "average_cycle_duration_seconds": report.average_cycle_duration_seconds,
+        "scheduler_miss_count": report.scheduler_miss_count, "lease_conflict_count": report.lease_conflict_count,
+        "reconciliation_mismatch_count": report.reconciliation_mismatch_count,
+        "alert_delivery_failure_count": report.alert_delivery_failure_count, "reasons": list(report.reasons),
+    }
+
+
+def shadow_run_history_cli(db_path: Path, *, status: str | None = None, limit: int = 20) -> dict:
+    """`shadow-run-history` CLI command (docs/milestone-7.md Step 25): query
+    `shadow_scheduler_runs`/`shadow_run_summaries`, filterable by `status`,
+    else recent N (`limit`)."""
+    from .storage.shadow_alerts_repositories import list_run_summaries
+    from .storage.shadow_operations_repositories import list_scheduler_runs
+
+    with session(db_path) as conn:
+        runs = list_scheduler_runs(conn, status=status)[:limit]
+        summaries = list_run_summaries(conn)[:limit]
+
+    return {
+        "filter_status": status, "limit": limit,
+        "scheduler_runs": [_shadow_scheduler_run_view(r) for r in runs],
+        "run_summaries": [dict(s) for s in summaries],
+    }
+
+
+def shadow_budget_status_cli(db_path: Path) -> dict:
+    """`shadow-budget-status` CLI command (docs/milestone-7.md Step 25):
+    daily/monthly usage vs configured caps from `shadow/budget.py`."""
+    from datetime import timezone as _tz
+    from decimal import Decimal
+
+    from .shadow import budget as budget_mod
+    from .shadow.config import load_shadow_operations_config
+    from .storage.shadow_operations_repositories import list_budget_reservations, list_budget_usage
+
+    shadow_config = load_shadow_operations_config()
+    now = datetime.now(_tz.utc)
+    today_prefix = now.date().isoformat()
+    month_prefix = now.strftime("%Y-%m")
+
+    with session(db_path) as conn:
+        today_usage = list_budget_usage(conn, usage_date_prefix=today_prefix)
+        month_usage = list_budget_usage(conn, usage_date_prefix=month_prefix)
+        live_reservations = list_budget_reservations(conn, status=budget_mod.RESERVATION_STATUS_RESERVED)
+
+    spent_today = sum((Decimal(r["actual_cost_usd"]) for r in today_usage), Decimal("0"))
+    spent_month = sum((Decimal(r["actual_cost_usd"]) for r in month_usage), Decimal("0"))
+    live_reserved = sum((Decimal(r["reserved_estimated_cost_usd"]) for r in live_reservations), Decimal("0"))
+
+    return {
+        "as_of": now.isoformat(),
+        "daily_cap_usd": str(shadow_config.budgets.max_actual_cost_per_day_usd),
+        "monthly_cap_usd": str(shadow_config.budgets.max_actual_cost_per_month_usd),
+        "spent_today_usd": str(spent_today), "spent_month_usd": str(spent_month),
+        "live_reserved_usd": str(live_reserved), "live_reservation_count": len(live_reservations),
+        "remaining_today_usd": str(Decimal(shadow_config.budgets.max_actual_cost_per_day_usd) - spent_today - live_reserved),
+        "remaining_month_usd": str(Decimal(shadow_config.budgets.max_actual_cost_per_month_usd) - spent_month - live_reserved),
+    }
+
+
+def shadow_alerts_cli(db_path: Path, *, severity: str | None = None, limit: int = 20) -> dict:
+    """`shadow-alerts` CLI command (docs/milestone-7.md Step 25): recent
+    `shadow_alerts` plus delivery status, filterable by `severity`."""
+    from .storage.shadow_alerts_repositories import list_alert_deliveries, list_alerts
+
+    with session(db_path) as conn:
+        alerts = list_alerts(conn, severity=severity)[:limit]
+        result = []
+        for a in alerts:
+            deliveries = list_alert_deliveries(conn, a["alert_id"])
+            result.append({**dict(a), "deliveries": [dict(d) for d in deliveries]})
+
+    return {"filter_severity": severity, "limit": limit, "alerts": result}
+
+
+def shadow_pause_cli(db_path: Path, reason: str) -> dict:
+    """`shadow-pause --reason "..."` CLI command (docs/milestone-7.md Step
+    25). Delegates to `shadow/pause.py::request_pause` with
+    `source="OPERATOR"` — the operator action is persisted by `pause.py`
+    itself, this is thin wiring only."""
+    from datetime import timezone as _tz
+
+    from .shadow import pause as pause_mod
+
+    if not reason or not reason.strip():
+        return {"error": "--reason is required and must be non-empty"}
+
+    try:
+        with session(db_path) as conn:
+            state = pause_mod.request_pause(
+                conn, reason, pause_mod.SOURCE_OPERATOR, clock=lambda: datetime.now(_tz.utc),
+            )
+    except pause_mod.PauseStateError as exc:
+        return {"error": str(exc)}
+
+    return {"state": state.state, "previous_state": state.previous_state, "reason": state.reason, "source": state.source}
+
+
+def shadow_resume_cli(db_path: Path, reason: str, operator: str) -> dict:
+    """`shadow-resume --reason "..."` CLI command (docs/milestone-7.md Step
+    25). Delegates to `shadow/pause.py::resume` — cannot override `KILLED`;
+    `pause.py` itself raises `PauseStateError` in that case and this
+    function does not add a bypass."""
+    from datetime import timezone as _tz
+
+    from .shadow import pause as pause_mod
+
+    if not reason or not reason.strip():
+        return {"error": "--reason is required and must be non-empty"}
+    if not operator or not operator.strip():
+        return {"error": "--operator is required and must be non-empty"}
+
+    try:
+        with session(db_path) as conn:
+            state = pause_mod.resume(conn, reason, operator, clock=lambda: datetime.now(_tz.utc))
+    except pause_mod.PauseStateError as exc:
+        return {"error": str(exc)}
+
+    return {"state": state.state, "previous_state": state.previous_state, "reason": state.reason, "source": state.source}
+
+
+def shadow_kill_cli(db_path: Path, reason: str, operator: str) -> dict:
+    """`shadow-kill --reason "..."` CLI command (docs/milestone-7.md Step 25)."""
+    from datetime import timezone as _tz
+
+    from .shadow import pause as pause_mod
+
+    if not reason or not reason.strip():
+        return {"error": "--reason is required and must be non-empty"}
+    if not operator or not operator.strip():
+        return {"error": "--operator is required and must be non-empty"}
+
+    try:
+        with session(db_path) as conn:
+            state = pause_mod.kill(conn, reason, operator, clock=lambda: datetime.now(_tz.utc))
+    except pause_mod.PauseStateError as exc:
+        return {"error": str(exc)}
+
+    return {"state": state.state, "previous_state": state.previous_state, "reason": state.reason, "source": state.source}
+
+
+def shadow_force_clear_kill_cli(db_path: Path, reason: str, operator: str) -> dict:
+    """`shadow-force-clear-kill --reason "..."` CLI command — the SEPARATE,
+    clearly-scarier command required to leave `KILLED` (docs/milestone-7.md
+    Step 25: "resume cannot override KILLED without a separate explicit
+    process"). Delegates to `shadow/pause.py::force_clear_kill`, which
+    itself always records the operator action."""
+    from datetime import timezone as _tz
+
+    from .shadow import pause as pause_mod
+
+    if not reason or not reason.strip():
+        return {"error": "--reason is required and must be non-empty"}
+    if not operator or not operator.strip():
+        return {"error": "--operator is required and must be non-empty"}
+
+    try:
+        with session(db_path) as conn:
+            state = pause_mod.force_clear_kill(conn, reason, operator, clock=lambda: datetime.now(_tz.utc))
+    except pause_mod.PauseStateError as exc:
+        return {"error": str(exc)}
+
+    return {"state": state.state, "previous_state": state.previous_state, "reason": state.reason, "source": state.source}
+
+
+def shadow_lease_status_cli(db_path: Path) -> dict:
+    """`shadow-lease-status` CLI command (docs/milestone-7.md Step 25):
+    current lease state(s) from `shadow_run_leases`."""
+    from .storage.shadow_operations_repositories import list_leases
+
+    with session(db_path) as conn:
+        leases = list_leases(conn)
+
+    return {"leases": [dict(l) for l in leases]}
+
+
+def corporate_status_cli(symbol: str, as_of_str: str, db_path: Path) -> dict:
+    """`corporate-status --symbol SYM --as-of ISO8601` CLI command
+    (docs/milestone-7.md Step 25). Uses the real `SecEdgarClient` — no
+    credentials are required for SEC EDGAR (only a `User-Agent` contact
+    string, matching every other real-SEC code path in this repository)."""
+    from .evidence_providers.cache import ProviderCache
+    from .evidence_providers.config import load_evidence_provider_config
+    from .evidence_providers.corporate_status_adapters import derive_corporate_status
+    from .evidence_providers.http_client import HttpJsonClient
+    from .evidence_providers.rate_limits import MinIntervalRateLimiter
+    from .evidence_providers.sec_provider import SecEdgarClient
+
+    try:
+        as_of = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+    except ValueError as exc:
+        return {"error": f"invalid --as-of: {exc}"}
+    if as_of.tzinfo is None:
+        return {"error": "--as-of must be timezone-aware (e.g. 2026-07-10T20:00:00Z)"}
+
+    provider_config = load_evidence_provider_config()
+    with session(db_path) as conn:
+        persist_hook = _make_persist_hook(conn)
+        sec_cache = ProviderCache(clock=time.monotonic, on_response=persist_hook)
+        sec_http = HttpJsonClient(
+            base_headers={"User-Agent": provider_config.sec.user_agent_contact},
+            rate_limiter=MinIntervalRateLimiter(provider_config.sec.min_request_interval_seconds),
+            max_attempts=provider_config.sec.max_attempts, timeout_seconds=provider_config.sec.request_timeout_seconds,
+            provider="sec-edgar", on_response=persist_hook,
+        )
+        sec = SecEdgarClient(http_client=sec_http, cache=sec_cache, user_agent=provider_config.sec.user_agent_contact)
+        evidence = derive_corporate_status(symbol.upper(), sec_client=sec, as_of=as_of)
+
+    def _signal(s) -> dict:
+        return {"signal_type": s.signal_type, "status": s.status, "basis": s.basis, "evidence_ref_count": len(s.evidence_refs)}
+
+    return {
+        "symbol": evidence.symbol, "as_of": evidence.as_of.isoformat(), "reporting_status": evidence.reporting_status,
+        "reporting_status_reason": evidence.reporting_status_reason,
+        "earliest_reliable_filing_date": evidence.earliest_reliable_filing_date.isoformat() if evidence.earliest_reliable_filing_date else None,
+        "operating_history_years": str(evidence.operating_history_years) if evidence.operating_history_years is not None else None,
+        "has_latest_annual_filing": evidence.latest_annual_filing is not None,
+        "has_latest_quarterly_filing": evidence.latest_quarterly_filing is not None,
+        "late_filing_notice_count": len(evidence.late_filing_notices),
+        "bankruptcy_signals": [_signal(s) for s in evidence.bankruptcy_signals],
+        "delisting_signals": [_signal(s) for s in evidence.delisting_signals],
+        "registration_status_signals": [_signal(s) for s in evidence.registration_status_signals],
+        "shell_company_signals": [_signal(s) for s in evidence.shell_company_signals],
+        "going_concern_signals": [_signal(s) for s in evidence.going_concern_signals],
+        "completeness_status": evidence.completeness_status,
+        "has_any_critical_uncertainty": evidence.has_any_critical_uncertainty(),
+        "source_count": len(evidence.sources),
+    }
+
+
+def retention_plan_cli() -> dict:
+    """`retention-plan` CLI command (docs/milestone-7.md Step 26). Prints the
+    classification only — does not even open the research database, since
+    the plan itself (tier assignment, rationale) does not depend on current
+    row counts. Read-only, no action taken."""
+    from .shadow.retention import RETENTION_PLAN
+
+    return {
+        "policy_version": "retention/v1",
+        "rules": [
+            {
+                "table_name": r.table_name, "tier": r.tier, "retention_days": r.retention_days,
+                "created_at_column": r.created_at_column, "rationale": r.rationale,
+            }
+            for r in RETENTION_PLAN
+        ],
+    }
+
+
+def retention_apply_cli(db_path: Path, *, dry_run: bool) -> dict:
+    """`retention-apply --dry-run` CLI command (docs/milestone-7.md Step 26).
+    Without `--dry-run`, `shadow/retention.py::apply_retention` raises
+    `NotImplementedError` — this function does not catch it, so it
+    propagates to the caller (`main()` maps it to a non-zero exit with a
+    structured error message, never a silent success)."""
+    from datetime import timezone as _tz
+
+    from .shadow.retention import apply_retention
+
+    now = datetime.now(_tz.utc)
+    with session(db_path) as conn:
+        report = apply_retention(conn, now, dry_run=dry_run)
+
+    return {
+        "policy_version": report.policy_version, "as_of": report.as_of.isoformat(), "dry_run": dry_run,
+        "diffs": [
+            {
+                "table_name": d.table_name, "tier": d.tier, "table_exists": d.table_exists,
+                "current_row_count": d.current_row_count, "eligible_row_count": d.eligible_row_count,
+                "action_if_applied": d.action_if_applied,
+            }
+            for d in report.diffs
+        ],
+    }
+
+
 def paper_status(db_path: Path) -> dict:
     from .paper.ledger import PaperLedger
 
@@ -1345,6 +1785,50 @@ def main(argv: list[str] | None = None) -> int:
     p_promotion_status.add_argument("--experiment-id", required=True)
 
     sub.add_parser("evidence-provider-usage", help="Real evidence-provider request/cache-hit counts (Milestone 6)")
+
+    sub.add_parser("run-due-shadow-cycle", help="Single-invocation scheduler entry point for shadow operations (Milestone 7)")
+
+    sub.add_parser("shadow-status", help="Current pause/kill state and recent shadow scheduler runs (Milestone 7)")
+
+    sub.add_parser("shadow-readiness", help="Shadow-operations readiness report (Milestone 7)")
+
+    p_shadow_run_history = sub.add_parser("shadow-run-history", help="Recent shadow scheduler runs/summaries (Milestone 7)")
+    p_shadow_run_history.add_argument("--status", default=None)
+    p_shadow_run_history.add_argument("--limit", type=int, default=20)
+
+    sub.add_parser("shadow-budget-status", help="Daily/monthly shadow-operations budget usage vs caps (Milestone 7)")
+
+    p_shadow_alerts = sub.add_parser("shadow-alerts", help="Recent shadow operational alerts and delivery status (Milestone 7)")
+    p_shadow_alerts.add_argument("--severity", default=None, choices=["INFO", "WARNING", "ERROR", "CRITICAL"])
+    p_shadow_alerts.add_argument("--limit", type=int, default=20)
+
+    p_shadow_pause = sub.add_parser("shadow-pause", help="Request an operator pause of shadow operations (Milestone 7)")
+    p_shadow_pause.add_argument("--reason", required=True)
+
+    p_shadow_resume = sub.add_parser("shadow-resume", help="Resume shadow operations from a PAUSED_* state — cannot override KILLED (Milestone 7)")
+    p_shadow_resume.add_argument("--reason", required=True)
+    p_shadow_resume.add_argument("--operator", required=True)
+
+    p_shadow_kill = sub.add_parser("shadow-kill", help="Activate the shadow-operations kill switch (Milestone 7)")
+    p_shadow_kill.add_argument("--reason", required=True)
+    p_shadow_kill.add_argument("--operator", required=True)
+
+    p_shadow_force_clear_kill = sub.add_parser(
+        "shadow-force-clear-kill", help="Explicit, separate command to clear KILLED — not reachable via shadow-resume (Milestone 7)"
+    )
+    p_shadow_force_clear_kill.add_argument("--reason", required=True)
+    p_shadow_force_clear_kill.add_argument("--operator", required=True)
+
+    sub.add_parser("shadow-lease-status", help="Current shadow_run_leases state (Milestone 7)")
+
+    p_corporate_status = sub.add_parser("corporate-status", help="Real SEC-derived corporate-status evidence for one symbol (Milestone 7)")
+    p_corporate_status.add_argument("--symbol", required=True)
+    p_corporate_status.add_argument("--as-of", required=True)
+
+    p_retention_plan = sub.add_parser("retention-plan", help="Print the data-retention plan — read-only, no action taken (Milestone 7)")
+
+    p_retention_apply = sub.add_parser("retention-apply", help="Retention apply — --dry-run prints a diff; without it, raises NotImplementedError (Milestone 7)")
+    p_retention_apply.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args(argv)
 
@@ -1499,6 +1983,93 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "evidence-provider-usage":
         cfg = load_config()
         outcome = evidence_provider_usage_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "run-due-shadow-cycle":
+        cfg = load_config()
+        outcome = run_due_shadow_cycle_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "shadow-status":
+        cfg = load_config()
+        outcome = shadow_status_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-readiness":
+        cfg = load_config()
+        outcome = shadow_readiness_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-run-history":
+        cfg = load_config()
+        outcome = shadow_run_history_cli(cfg.research_database_path, status=args.status, limit=args.limit)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-budget-status":
+        cfg = load_config()
+        outcome = shadow_budget_status_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-alerts":
+        cfg = load_config()
+        outcome = shadow_alerts_cli(cfg.research_database_path, severity=args.severity, limit=args.limit)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-pause":
+        cfg = load_config()
+        outcome = shadow_pause_cli(cfg.research_database_path, args.reason)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "shadow-resume":
+        cfg = load_config()
+        outcome = shadow_resume_cli(cfg.research_database_path, args.reason, args.operator)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "shadow-kill":
+        cfg = load_config()
+        outcome = shadow_kill_cli(cfg.research_database_path, args.reason, args.operator)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "shadow-force-clear-kill":
+        cfg = load_config()
+        outcome = shadow_force_clear_kill_cli(cfg.research_database_path, args.reason, args.operator)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "shadow-lease-status":
+        cfg = load_config()
+        outcome = shadow_lease_status_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "corporate-status":
+        cfg = load_config()
+        outcome = corporate_status_cli(args.symbol, args.as_of, cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "retention-plan":
+        outcome = retention_plan_cli()
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "retention-apply":
+        cfg = load_config()
+        try:
+            outcome = retention_apply_cli(cfg.research_database_path, dry_run=args.dry_run)
+        except NotImplementedError as exc:
+            print(json.dumps({"error": str(exc)}, indent=2))
+            return 2
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 

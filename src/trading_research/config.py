@@ -33,6 +33,8 @@ class Config:
     reddit_mcp_command: str
     reddit_mcp_url: str | None
     reddit_mcp_auth_token: str | None
+    reddit_client_id: str | None
+    reddit_client_secret: str | None
 
     robinhood_mcp_url: str
 
@@ -45,7 +47,10 @@ class Config:
     alpaca_market_data_api_secret: str | None = None
 
     secret_fields: tuple[str, ...] = field(
-        default=("anthropic_api_key", "reddit_mcp_auth_token", "alpaca_market_data_api_key", "alpaca_market_data_api_secret"),
+        default=(
+            "anthropic_api_key", "reddit_mcp_auth_token", "alpaca_market_data_api_key",
+            "alpaca_market_data_api_secret", "reddit_client_id", "reddit_client_secret",
+        ),
         repr=False,
     )
 
@@ -109,6 +114,8 @@ def load_config(env_file: str | Path | None = None, *, require_anthropic: bool =
         reddit_mcp_command=os.environ.get("REDDIT_MCP_COMMAND", "npx -y reddit-mcp-server"),
         reddit_mcp_url=os.environ.get("REDDIT_MCP_URL") or None,
         reddit_mcp_auth_token=os.environ.get("REDDIT_MCP_AUTH_TOKEN") or None,
+        reddit_client_id=os.environ.get("REDDIT_CLIENT_ID") or None,
+        reddit_client_secret=os.environ.get("REDDIT_CLIENT_SECRET") or None,
         robinhood_mcp_url=os.environ.get(
             "ROBINHOOD_MCP_URL", "https://agent.robinhood.com/mcp/trading"
         ),

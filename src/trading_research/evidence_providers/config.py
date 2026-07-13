@@ -18,6 +18,7 @@ from ..hashing import hash_config
 DEFAULT_EVIDENCE_PROVIDERS_CONFIG_PATH = REPO_ROOT / "config" / "evidence_providers.yaml"
 
 KNOWN_MARKET_DATA_PROVIDERS = ("alpaca",)
+KNOWN_NEWS_PROVIDERS = ("alpaca_news",)
 
 
 class EvidenceProviderConfigError(RuntimeError):
@@ -95,6 +96,13 @@ def load_evidence_provider_config(path: str | Path | None = None) -> EvidencePro
         )
     if bool(md_raw.get("enabled")) and md_raw.get("provider") is None:
         raise EvidenceProviderConfigError("providers.market_data.enabled=true requires an explicit provider name")
+
+    if news_raw.get("provider") is not None and news_raw["provider"] not in KNOWN_NEWS_PROVIDERS:
+        raise EvidenceProviderConfigError(
+            f"providers.news.provider {news_raw['provider']!r} is not one of {KNOWN_NEWS_PROVIDERS} — fails closed"
+        )
+    if bool(news_raw.get("enabled")) and news_raw.get("provider") is None:
+        raise EvidenceProviderConfigError("providers.news.enabled=true requires an explicit provider name")
 
     return EvidenceProviderConfiguration(
         version=raw.get("version", 1),
