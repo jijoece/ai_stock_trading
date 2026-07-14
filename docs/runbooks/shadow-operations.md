@@ -20,6 +20,13 @@ for `provider: anthropic`, a matching `config/research_pricing.yaml` entry and
 `ANTHROPIC_API_KEY` — missing any of these fails closed before any lease/DB work, reported
 as `MISSING_CREDENTIALS`/`PRICING_NOT_CONFIGURED` in the CLI's JSON output.
 
+**Milestone 8 update:** shadow operations still only ever submits baseline-arm paper orders
+through the legacy global `paper/ledger.py` path (unchanged) — isolated baseline/enhanced
+paper books are a separate, additive subsystem (`config/paper_books.yaml`,
+`docs/runbooks/paper-book-operations.md`) not yet wired into the shadow scheduler. Wiring
+`paper_books/` into `run_due_shadow_cycle` is recommended future work (see
+`docs/milestone8-isolated-paper-portfolios.md` Section 21).
+
 **Milestone 7.2 update:** every `run-due-shadow-cycle` invocation that reaches health
 evaluation now persists one field-level diagnostic row per health dimension. Explain any
 run's verdict directly:

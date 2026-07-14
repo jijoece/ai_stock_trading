@@ -65,6 +65,12 @@ class OrderIntentPayload:
     expires_at: str
     idempotency_key: str
     asset_type: str = "equity"
+    # Milestone 8 (docs/milestone-8.md Step 15): additive, optional book
+    # identity. `None` preserves every pre-Milestone-8 caller's exact
+    # behavior. A book-aware caller (`paper_books/execution.py`) always
+    # supplies this; it is never required for the legacy Milestone 3/4
+    # single-book submission path.
+    book_id: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "OrderIntentPayload":
@@ -80,7 +86,7 @@ class OrderIntentPayload:
             side=data["side"], quantity=data["quantity"], order_type=data["order_type"],
             limit_price=data.get("limit_price"), reference_price=data["reference_price"],
             expires_at=data["expires_at"], idempotency_key=data["idempotency_key"],
-            asset_type=data.get("asset_type", "equity"),
+            asset_type=data.get("asset_type", "equity"), book_id=data.get("book_id"),
         )
 
     def validate(self, *, now: datetime) -> None:

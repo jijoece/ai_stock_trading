@@ -10,6 +10,7 @@ from .evaluation_schema import apply_evaluation_schema
 from .evidence_provider_schema import apply_evidence_provider_schema
 from .execution_schema import apply_execution_schema
 from .migrations import apply_schema
+from .paper_books_schema import apply_paper_books_schema
 from .research_cycle_schema import apply_research_cycle_schema
 from .research_schema import apply_research_schema
 from .shadow_alerts_schema import apply_shadow_alerts_schema
@@ -32,6 +33,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     apply_corporate_status_schema(conn)
     apply_shadow_operations_schema(conn)
     apply_shadow_alerts_schema(conn)
+    apply_paper_books_schema(conn)
     return conn
 
 

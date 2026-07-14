@@ -1837,6 +1837,11 @@ def paper_status(db_path: Path) -> dict:
         }
 
 
+def _parse_iso_datetime(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trading-research", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1977,6 +1982,48 @@ def main(argv: list[str] | None = None) -> int:
 
     p_retention_apply = sub.add_parser("retention-apply", help="Retention apply — --dry-run prints a diff; without it, raises NotImplementedError (Milestone 7)")
     p_retention_apply.add_argument("--dry-run", action="store_true")
+
+    sub.add_parser("paper-book-list", help="List configured/opened isolated paper books (Milestone 8)")
+
+    p_pb_show = sub.add_parser("paper-book-show", help="Show one isolated paper book's cash/positions (Milestone 8)")
+    p_pb_show.add_argument("--book-id", required=True)
+
+    p_pb_snapshot = sub.add_parser("paper-book-snapshot", help="Build a point-in-time mark-to-market snapshot for one book (Milestone 8)")
+    p_pb_snapshot.add_argument("--book-id", required=True)
+    p_pb_snapshot.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+
+    p_pb_run_cycle = sub.add_parser(
+        "paper-book-run-cycle", help="Fixture-mode: size, risk-check, and locally simulate-fill one symbol across isolated books (Milestone 8)"
+    )
+    p_pb_run_cycle.add_argument("--cycle-id", required=True)
+    p_pb_run_cycle.add_argument(
+        "--experiment-policy", required=True,
+        choices=("OBSERVE_ONLY", "BASELINE_ONLY", "ENHANCED_ONLY", "BOTH_SEPARATE_PAPER_BOOKS", "SHADOW_ENHANCED"),
+    )
+    p_pb_run_cycle.add_argument("--provider-mode", choices=("fixture",), default="fixture")
+    p_pb_run_cycle.add_argument("--symbol", required=True)
+    p_pb_run_cycle.add_argument("--quantity-hint", required=True, help="Decimal string")
+    p_pb_run_cycle.add_argument("--reference-price", required=True, help="Decimal string")
+    p_pb_run_cycle.add_argument("--bid", required=True, help="Decimal string market-simulation input")
+    p_pb_run_cycle.add_argument("--ask", required=True, help="Decimal string market-simulation input")
+    p_pb_run_cycle.add_argument("--recommendation-id-baseline")
+    p_pb_run_cycle.add_argument("--recommendation-id-enhanced")
+
+    p_pb_reconcile = sub.add_parser("paper-book-reconcile", help="Reconcile one isolated paper book against its own fills/cash/positions (Milestone 8)")
+    p_pb_reconcile.add_argument("--book-id", required=True)
+    p_pb_reconcile.add_argument("--as-of", help="ISO8601 timestamp (default: now)")
+
+    p_pb_compare = sub.add_parser("paper-experiment-compare", help="Compare baseline vs enhanced isolated paper books over a window (Milestone 8)")
+    p_pb_compare.add_argument("--experiment-id", required=True)
+    p_pb_compare.add_argument("--window-start", required=True, help="ISO8601 timestamp")
+    p_pb_compare.add_argument("--window-end", required=True, help="ISO8601 timestamp")
+    p_pb_compare.add_argument("--min-comparable-cycles", type=int, default=1)
+
+    p_pb_promotion = sub.add_parser("paper-promotion-status", help="Evidence-only promotion status from the latest comparison (Milestone 8) — never a live-trading status")
+    p_pb_promotion.add_argument("--experiment-id", required=True)
+    p_pb_promotion.add_argument("--min-comparable-cycles", type=int, default=1)
+    p_pb_promotion.add_argument("--min-trading-days", type=int, default=1)
+    p_pb_promotion.add_argument("--min-closed-trades", type=int, default=1)
 
     args = parser.parse_args(argv)
 
@@ -2228,6 +2275,76 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(json.dumps(outcome, indent=2, default=str))
         return 0
+
+    if args.command == "paper-book-list":
+        from .paper_books.cli_support import paper_book_list_cli
+
+        cfg = load_config()
+        outcome = paper_book_list_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-show":
+        from .paper_books.cli_support import paper_book_show_cli
+
+        cfg = load_config()
+        outcome = paper_book_show_cli(cfg.research_database_path, args.book_id)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-snapshot":
+        from .paper_books.cli_support import paper_book_snapshot_cli
+
+        cfg = load_config()
+        outcome = paper_book_snapshot_cli(cfg.research_database_path, args.book_id, _parse_iso_datetime(args.as_of))
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-run-cycle":
+        from .paper_books.cli_support import paper_book_run_cycle_cli
+
+        cfg = load_config()
+        outcome = paper_book_run_cycle_cli(
+            cfg.research_database_path, cycle_id=args.cycle_id, experiment_policy=args.experiment_policy,
+            symbol=args.symbol, quantity_hint=args.quantity_hint, reference_price=args.reference_price,
+            bid=args.bid, ask=args.ask, recommendation_id_baseline=args.recommendation_id_baseline,
+            recommendation_id_enhanced=args.recommendation_id_enhanced,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-reconcile":
+        from .paper_books.cli_support import paper_book_reconcile_cli
+
+        cfg = load_config()
+        as_of = _parse_iso_datetime(args.as_of) if args.as_of else None
+        outcome = paper_book_reconcile_cli(cfg.research_database_path, args.book_id, as_of)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-experiment-compare":
+        from .paper_books.cli_support import paper_experiment_compare_cli
+
+        cfg = load_config()
+        outcome = paper_experiment_compare_cli(
+            cfg.research_database_path, experiment_id=args.experiment_id,
+            window_start=_parse_iso_datetime(args.window_start), window_end=_parse_iso_datetime(args.window_end),
+            min_comparable_cycles=args.min_comparable_cycles,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-promotion-status":
+        from .paper_books.cli_support import paper_promotion_status_cli
+
+        cfg = load_config()
+        outcome = paper_promotion_status_cli(
+            cfg.research_database_path, experiment_id=args.experiment_id,
+            min_comparable_cycles=args.min_comparable_cycles, min_trading_days=args.min_trading_days,
+            min_closed_trades=args.min_closed_trades,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
 
     return 1
 
