@@ -23,3 +23,15 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = [
+    "**/__pycache__",
+    "**/*.egg-info",
+    ".pytest_cache",
+]
+venvPath = ".."
+venv = ".venv"
+pythonVersion = "3.10"
+typeCheckingMode = "basic"

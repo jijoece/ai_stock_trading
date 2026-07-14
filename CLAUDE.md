@@ -10,3 +10,12 @@ This project uses the trading skill in SKILL.md for all analysis and decision su
   - scripts/indicators.py
   - scripts/score.py
   - scripts/macro_pillar.py
+
+## Python code intelligence
+
+Prefer the Pyright LSP for Python navigation and diagnostics:
+
+- Use definitions, references, symbols, implementations, hover types, and call hierarchy before broad grep or full-file reads.
+- Read only the relevant symbol body when sufficient.
+- Treat Pyright diagnostics as guidance; verify behavior with the project's tests.
+- Do not perform broad type-error cleanup unless the task explicitly requests it.

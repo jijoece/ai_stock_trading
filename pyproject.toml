@@ -52,3 +52,17 @@ markers = [
     "real_shadow_cycle: opt-in real shadow-cycle smoke test (Milestone 7) — requires RUN_REAL_SHADOW_CYCLE=true; skipped by default.",
     "real_claude_shadow_cycle: opt-in real Claude shadow-cycle smoke test (Milestone 7) — requires RUN_REAL_CLAUDE_SHADOW_CYCLE=true and a real ANTHROPIC_API_KEY; skipped by default. This is a real, small-cost Claude API call.",
 ]
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = [
+    "**/__pycache__",
+    "**/*.egg-info",
+    ".venv",
+    ".pytest_cache",
+    "paper_runtime",
+]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
