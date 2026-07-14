@@ -245,6 +245,7 @@ def test_budget_rejected_releases_lease_and_records_run(conn):
         now=DUE_NOW, conn=conn, shadow_config=shadow_config, cycle_configuration=cycle_configuration,
         candidate_symbols=lambda: ("AAPL",), run_cycle=_stub_run_cycle_success,
         cycle_kwargs_builder=lambda syms, as_of: {}, pricing_entries=(), clock=_clock_at(DUE_NOW),
+        research_provider_name="anthropic", research_model_name="claude-test-model",
     )
     assert result.status == STATUS_BUDGET_REJECTED
     from trading_research.storage.shadow_operations_repositories import list_leases, list_scheduler_runs
@@ -483,6 +484,7 @@ def test_budget_rejected_raises_budget_exceeded_alert(conn):
         now=DUE_NOW, conn=conn, shadow_config=shadow_config, cycle_configuration=cycle_configuration,
         candidate_symbols=lambda: ("AAPL",), run_cycle=_stub_run_cycle_success,
         cycle_kwargs_builder=lambda syms, as_of: {}, pricing_entries=(), clock=_clock_at(DUE_NOW),
+        research_provider_name="anthropic", research_model_name="claude-test-model",
     )
     assert result.status == STATUS_BUDGET_REJECTED
     from trading_research.storage.shadow_alerts_repositories import list_alerts, list_run_summaries

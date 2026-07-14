@@ -8,6 +8,17 @@ credentials are absent from this environment's `.env`. **No recurring scheduler 
 activated.** See "Scheduler support vs. deployment vs. activation" below for the exact,
 unambiguous distinction.
 
+> **Milestone 7.1 update (2026-07-13):** the runtime-integration gaps this document's own
+> "Known limitations"/"Deferred work" sections named — corporate status not wired into the
+> primary evidence snapshot, evidence-completeness not called from the scheduled-cycle
+> path, per-role budget enforcement not wired end-to-end, `CycleIntent.model_name` always
+> `None`, actual Claude usage never charged to the reservation — are now closed. See
+> `docs/milestone7-1-shadow-integration-closure.md` for the full detail and
+> `docs/adr/0005-production-shadow-operations-boundary.md`'s "Milestone 7.1 closure"
+> section for the architecture-decision update. The content below is preserved as
+> Milestone 7's own historical record and is not rewritten to imply these integrations
+> existed at that time.
+
 This document describes the shadow-operations control layer and evidence-completeness
 expansion added on top of Milestones 1-6.1. See `docs/adr/0005-production-shadow-operations-boundary.md`
 for the design decisions and why each boundary exists, and

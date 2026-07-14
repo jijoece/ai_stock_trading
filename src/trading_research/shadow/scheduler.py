@@ -49,7 +49,9 @@ from decimal import Decimal
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from ..research import usage as usage_mod
 from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration
+from ..storage.research_repositories import compute_cycle_telemetry
 from ..storage.shadow_alerts_repositories import save_run_summary
 from ..storage.shadow_operations_repositories import (
     find_scheduler_run_by_intended_schedule,
@@ -57,6 +59,7 @@ from ..storage.shadow_operations_repositories import (
     update_scheduler_run,
 )
 from . import alerts as alerts_mod
+from . import attempt_controller as attempt_controller_mod
 from . import budget as budget_mod
 from . import health as health_mod
 from . import lease as lease_mod
@@ -225,37 +228,31 @@ def _save_no_op_summary(
 
 
 def _build_health_inputs_from_cycle_result(
-    cycle_result: ResearchCycleResult | None, *, symbols_attempted: int, cycle_duration_seconds: float,
+    conn: sqlite3.Connection, cycle_result: ResearchCycleResult | None, *, symbols_attempted: int,
+    cycle_duration_seconds: float,
 ) -> health_mod.CycleHealthInputs:
-    """Computes what real aggregate rates are actually available from
-    `ResearchCycleResult.symbol_results` — `SymbolCycleResult` carries a
-    per-symbol `status` ("COMPLETED"/"FAILED"/"SKIPPED") and
-    `evidence_outcome` string, but no per-role/per-attempt retry or token
-    counters (those live in `research_attempts`/`research_attempt_failures`,
-    which this orchestrator does not query — that would require joining
-    against research-run IDs this function does not have easy access to
-    without a second query layer, out of scope for this integration slice).
+    """Computes real aggregate rates from `ResearchCycleResult.symbol_results`
+    plus, since docs/milestone-7.1.md Step 18, a real `ResearchCycleTelemetry`
+    join against `research_attempts`/`research_attempt_failures` for every
+    `research_run_id` the cycle actually produced (`storage/
+    research_repositories.py::compute_cycle_telemetry` — the one authoritative
+    query, not a duplicated in-memory counter).
 
-    Documented conservative defaults (NOT fabricated rosy numbers):
-      * `claude_role_success_rate`, `retry_rate`, `retry_exhaustion_rate`,
-        `unsupported_claim_rate`, `output_truncation_rate`: `None` ("no data
-        this cycle") rather than 0.0 — `evaluate_cycle_health` already
-        treats `None` as "does not contribute a failure," so this is the
-        correct conservative choice, not an optimistic fabrication.
-      * `provider_success_rate`: computed for real, from
-        `symbols_completed / symbols_attempted` — this IS available from
-        `cycle_result.symbol_results` and is the one rate this orchestrator
-        can honestly compute without deeper joins.
-      * `evidence_completeness_rate`: computed as the fraction of symbol
-        results whose `evidence_outcome` is a "COMPLETE*" outcome (matching
-        `evidence_providers/normalization.py`'s naming convention) — `None`
-        when no symbol result carries an `evidence_outcome` at all (e.g. all
-        symbols failed before evidence was ever fetched).
-      * `pricing_configured`: conservatively `True` when no cost was
-        recorded (nothing to verify) — this mirrors `budget.py`'s "no
-        pricing required for non-anthropic providers" default; a real-Claude
-        run's actual pricing-configured state is threaded through by the
-        caller when available, not by this helper.
+    Fields that still stay `None` are `None` because the underlying data
+    genuinely does not exist for this cycle (e.g. every symbol failed before
+    a research_run_id was ever created) — never a fabricated 0.0/0:
+      * `provider_success_rate`: `symbols_completed / symbols_attempted`.
+      * `evidence_completeness_rate`: fraction of symbol results whose
+        `evidence_outcome` is a "COMPLETE*" outcome.
+      * `claude_role_success_rate`/`retry_rate`/`retry_exhaustion_rate`/
+        `unsupported_claim_rate`/`output_truncation_rate`/`input_tokens`/
+        `output_tokens`/`cost_usd`: derived from `ResearchCycleTelemetry`,
+        `None` when `telemetry.attempt_count == 0` (no Claude attempt ran
+        this cycle at all, e.g. every symbol was completeness-blocked).
+      * `pricing_configured`: `False` only when `telemetry.pricing_status ==
+        "PRICING_NOT_CONFIGURED"` — every other status (including
+        `NOT_APPLICABLE`/`NO_DATA` for deterministic/scripted cycles, which
+        never require pricing) is conservatively `True`.
     """
     if cycle_result is None or symbols_attempted == 0:
         return health_mod.CycleHealthInputs(
@@ -276,11 +273,35 @@ def _build_health_inputs_from_cycle_result(
     else:
         evidence_completeness_rate = None
 
+    research_run_ids = tuple(
+        r.research_run_id for r in cycle_result.symbol_results if r.research_run_id is not None
+    )
+    telemetry = compute_cycle_telemetry(conn, research_run_ids)
+
+    if telemetry.attempt_count > 0:
+        claude_role_success_rate = telemetry.successful_attempt_count / telemetry.attempt_count
+        retry_rate = telemetry.retry_count / telemetry.attempt_count
+        unsupported_claim_rate = telemetry.unsupported_claim_count / telemetry.attempt_count
+        output_truncation_rate = telemetry.output_truncation_count / telemetry.attempt_count
+    else:
+        claude_role_success_rate = None
+        retry_rate = None
+        unsupported_claim_rate = None
+        output_truncation_rate = None
+    retry_exhaustion_rate = (
+        telemetry.retry_exhaustion_count / len(research_run_ids) if research_run_ids else None
+    )
+    pricing_configured = telemetry.pricing_status != "PRICING_NOT_CONFIGURED"
+
     return health_mod.CycleHealthInputs(
         provider_success_rate=provider_success_rate, evidence_completeness_rate=evidence_completeness_rate,
-        claude_role_success_rate=None, retry_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None,
-        output_truncation_rate=None, latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None,
-        pricing_configured=True, paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
+        claude_role_success_rate=claude_role_success_rate, retry_rate=retry_rate,
+        retry_exhaustion_rate=retry_exhaustion_rate, unsupported_claim_rate=unsupported_claim_rate,
+        output_truncation_rate=output_truncation_rate,
+        latency_seconds=(telemetry.latency_ms / 1000) if telemetry.latency_ms is not None else None,
+        input_tokens=telemetry.input_tokens, output_tokens=telemetry.output_tokens,
+        cost_usd=telemetry.priced_usage_cost_usd, pricing_configured=pricing_configured,
+        paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
         cycle_duration_seconds=cycle_duration_seconds,
     )
 
@@ -322,6 +343,9 @@ def run_due_shadow_cycle(
     cycle_kwargs_builder: Callable[[tuple[str, ...], datetime], dict[str, Any]],
     pricing_entries: tuple[Any, ...],
     clock: Clock,
+    research_provider_name: str = "deterministic",
+    research_model_name: str | None = None,
+    research_roles: tuple[str, ...] | None = None,
     owner: str | None = None,
     deployment_source: str = DEPLOYMENT_SOURCE_MANUAL,
 ) -> ShadowCycleRunResult:
@@ -342,6 +366,27 @@ def run_due_shadow_cycle(
     kwargs so real provider construction (which may need `conn`) happens
     only if the cycle actually proceeds past all preflight gates, never
     speculatively.
+
+    `research_provider_name`/`research_model_name` (docs/milestone-7.1.md
+    Step 11): the ACTUAL configured research provider/model — the same
+    values the caller passes into `cycle_kwargs_builder`'s own
+    `research_provider_name`/`research_model_name` kwargs for `run_cycle`,
+    and the single source of truth for `CycleIntent.provider`/`.model_name`
+    below (REPLACES the previous `cycle_configuration.provider_mode`-based
+    guess entirely — that mapping conflated the evidence-provider mode
+    "fixture"/"real" with the Claude-provider taxonomy
+    "deterministic"/"scripted"/"anthropic", which are two different axes).
+    Defaults preserve every existing caller's behavior (`"deterministic"`,
+    `None`) exactly.
+
+    `research_roles` (docs/milestone-7.1.md Steps 12-14, default `None`):
+    the exact `research_configuration.roles` tuple the caller's
+    `cycle_kwargs_builder`/`run_cycle` will invoke. When supplied, every
+    role attempt is budget-checked immediately before its provider call via
+    a per-symbol `shadow.attempt_controller.ShadowResearchAttemptController`
+    (threaded into `run_cycle` as `attempt_controller_factory`). `None`
+    (every existing caller) disables per-attempt enforcement exactly as
+    before this task — only the cycle-level reservation gates the run.
     """
     # --- Step 1: enabled check — before anything else is touched. ----------
     if not shadow_config.shadow_operations.enabled:
@@ -465,24 +510,24 @@ def run_due_shadow_cycle(
         bounded_symbols = tuple(symbols[: shadow_config.budgets.max_symbols_per_cycle])
 
         intent = budget_mod.CycleIntent(
-            provider=cycle_configuration.provider_mode if cycle_configuration.provider_mode != "real" else "anthropic",
-            model_name=None, max_symbols_per_cycle=shadow_config.budgets.max_symbols_per_cycle,
+            provider=research_provider_name, model_name=research_model_name,
+            max_symbols_per_cycle=shadow_config.budgets.max_symbols_per_cycle,
             max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
             max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
             max_output_tokens_per_cycle=shadow_config.budgets.max_output_tokens_per_cycle,
             max_input_tokens_per_cycle=shadow_config.budgets.max_input_tokens_per_cycle,
             max_latency_seconds_per_cycle=shadow_config.budgets.max_latency_seconds_per_cycle,
         )
-        # NOTE: `intent.provider` mapping above is a simplification for this
-        # task's scope — `cycle_configuration.provider_mode` is "fixture" or
-        # "real" (docs/milestone-6.md), not the research-provider name
-        # ("deterministic"/"scripted"/"anthropic") `estimate_cycle_cost`
-        # actually keys pricing-exemption on. The caller is responsible for
-        # supplying a `cycle_configuration` whose `provider_mode` reflects
-        # whether pricing must be enforced; a real-Claude scheduled run must
-        # go through provider_mode == "real" for this reservation to
-        # correctly require pricing. This mapping is documented here rather
-        # than silently assumed correct.
+        # `intent.provider`/`.model_name` come directly from the caller's
+        # `research_provider_name`/`research_model_name` — the actual
+        # configured Claude provider/model (docs/milestone-7.1.md Step 11),
+        # not derived from `cycle_configuration.provider_mode` (that field is
+        # the evidence-provider mode "fixture"/"real", a different axis).
+        # A caller wiring a real-Claude scheduled run supplies
+        # `research_provider_name="anthropic"` and the real model name so
+        # this reservation's pricing lookup and the pre-call role-budget
+        # checks (Step 13) both key off the SAME provider/model identity as
+        # every downstream Claude call.
         try:
             estimate = budget_mod.estimate_cycle_cost(intent, pricing_entries, now.date().isoformat())
         except budget_mod.BudgetConfigError as exc:
@@ -547,6 +592,32 @@ def run_due_shadow_cycle(
             )
         reservation = reservation_result
 
+        # docs/milestone-7.1.md Steps 12-14: build one attempt-controller
+        # factory for this cycle, reusing the EXACT same pricing entry
+        # `estimate_cycle_cost` already selected for the reservation above
+        # (same provider/model/as_of-date inputs to `select_pricing` — never
+        # a second, potentially-inconsistent lookup). Only activated when
+        # the caller supplies `research_roles` (Step 20's CLI wiring does);
+        # `research_roles=None` (every existing caller/test) preserves prior
+        # behavior exactly — no per-attempt enforcement, `attempt_controller_
+        # factory=None` passed to `run_cycle` unchanged from before this task.
+        attempt_controller_factory = None
+        if research_roles is not None:
+            pricing_for_roles = usage_mod.select_pricing(
+                pricing_entries, intent.provider, intent.model_name or "", now.date().isoformat(),
+            )
+
+            def attempt_controller_factory(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
+                return attempt_controller_mod.ShadowResearchAttemptController(
+                    conn=conn, reservation=reservation, provider=intent.provider, allowed_roles=research_roles,
+                    max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
+                    max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
+                    max_output_tokens_per_role=shadow_config.budgets.max_output_tokens_per_cycle,
+                    max_input_tokens_per_role=shadow_config.budgets.max_input_tokens_per_cycle,
+                    max_latency_seconds_per_role=shadow_config.budgets.max_latency_seconds_per_cycle,
+                    pricing=pricing_for_roles, clock=clock, scheduler_run_id=scheduler_run_id, cycle_id=None,
+                )
+
         # --- Step 6: record run start. ---------------------------------------
         start_time = clock()
         save_scheduler_run(
@@ -572,7 +643,7 @@ def run_due_shadow_cycle(
             cycle_kwargs = cycle_kwargs_builder(bounded_symbols, intended_schedule_time)
             cycle_result = run_cycle(
                 as_of=intended_schedule_time, symbols=bounded_symbols, configuration=cycle_configuration, conn=conn,
-                clock=clock, **cycle_kwargs,
+                clock=clock, attempt_controller_factory=attempt_controller_factory, **cycle_kwargs,
             )
         except Exception as exc:  # cycle-level crash — visible as a partial/failed run, never silently lost
             failure_reason = str(exc)
@@ -630,7 +701,7 @@ def run_due_shadow_cycle(
         # (COMPLETED/PARTIALLY_COMPLETE/FAILED — never for the lightweight
         # no-op paths above, which already returned before reaching here).
         health_inputs = _build_health_inputs_from_cycle_result(
-            cycle_result, symbols_attempted=len(bounded_symbols),
+            conn, cycle_result, symbols_attempted=len(bounded_symbols),
             cycle_duration_seconds=(finish_time - start_time).total_seconds(),
         )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)

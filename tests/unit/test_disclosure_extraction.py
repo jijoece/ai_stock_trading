@@ -107,6 +107,37 @@ def test_shell_company_disclosure_not_found():
     assert result.outcome == OUTCOME_EXPLICIT_DISCLOSURE_NOT_FOUND
 
 
+def test_shell_company_cover_page_checkbox_boilerplate_is_never_confirmed():
+    """Regression (found during Milestone 7.1 real SEC validation against
+    AAPL's actual 10-K): every 10-K/10-Q cover page carries the standard SEC
+    checkbox question ("Indicate by check mark whether the registrant is a
+    shell company...") regardless of the real Yes/No answer — a bare
+    substring match on "shell company" must never treat the mere presence
+    of that question as a confirmed answer."""
+    text = (
+        "UNITED STATES SECURITIES AND EXCHANGE COMMISSION\n"
+        "Indicate by check mark whether the registrant is a shell company "
+        "(as defined in Rule 12b-2 of the Exchange Act). Yes ☐ No ☒\n"
+        "The Company designs, manufactures and markets consumer electronics."
+    )
+    result = extract_disclosure(_doc(text), disclosure_type="shell_company")
+    assert result.outcome == OUTCOME_EXPLICIT_DISCLOSURE_NOT_FOUND
+
+
+def test_shell_company_confirmed_when_affirmative_statement_follows_cover_page_question():
+    """The exclusion is contextual, not global — a genuine affirmative
+    shell-company statement elsewhere in the same document (beyond the
+    cover-page checkbox context) must still be found."""
+    text = (
+        "Indicate by check mark whether the registrant is a shell company "
+        "(as defined in Rule 12b-2 of the Exchange Act). Yes ☒ No ☐\n"
+        + ("filler text " * 40)
+        + "Item 1. Business. The registrant is a shell company with no active operations."
+    )
+    result = extract_disclosure(_doc(text), disclosure_type="shell_company")
+    assert result.outcome == OUTCOME_EXPLICIT_DISCLOSURE_FOUND
+
+
 # --- bankruptcy disclosure -----------------------------------------------------
 
 def test_bankruptcy_disclosure_found():

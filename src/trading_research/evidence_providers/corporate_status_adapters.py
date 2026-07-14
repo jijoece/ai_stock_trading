@@ -21,8 +21,10 @@ treated as "the company is defunct").
 """
 from __future__ import annotations
 
+import dataclasses
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import Protocol
 
 from .corporate_status import (
     REPORTING_STATUS_ACTIVE,
@@ -40,7 +42,15 @@ from .corporate_status import (
     FilingReference,
     SourceRecord,
 )
+from .disclosure_extraction import (
+    OUTCOME_AMBIGUOUS_DISCLOSURE,
+    OUTCOME_DOCUMENT_UNAVAILABLE,
+    OUTCOME_EXPLICIT_DISCLOSURE_FOUND,
+    OUTCOME_SEARCH_INCOMPLETE,
+    extract_disclosure,
+)
 from .errors import ProviderError
+from .filing_documents import FilingDocument, FilingDocumentClient
 from .models import FilingRecord
 from .sec_provider import SecEdgarClient
 
@@ -363,4 +373,169 @@ def _derive_going_concern_placeholder_signals(filings: tuple[FilingRecord, ...])
             ),
             evidence_refs=tuple(_to_filing_reference(f) for f in annual[-3:]),
         ),
+    )
+
+
+# --- Step 4: corporate-status evidence-provider boundary -----------------
+
+
+class CorporateStatusEvidenceProvider(Protocol):
+    """Smallest safe extension point (docs/milestone-7.md Step 4): a typed,
+    point-in-time-safe `CorporateStatusEvidence` result, distinct from the
+    generic `research/evidence.py::EvidenceBundle` provider shape used by
+    the fundamentals/market/news/sentiment/filing Protocols (those return an
+    already-normalized bundle; this one returns the full typed result so
+    `research/evidence_completeness.py::evaluate_completeness` and
+    `storage/corporate_status_repositories.py` can consume it directly,
+    without lossy round-tripping through `EvidenceBundle` first)."""
+
+    def fetch(self, symbol: str, as_of: datetime) -> CorporateStatusEvidence: ...
+
+
+class SecCorporateStatusProvider:
+    """Real (or fixture, via an injected fixture `sec_client`) corporate-status
+    provider. `filing_document_client=None` (the fixture-mode default) skips
+    Step 6's text-level disclosure composition entirely and returns the
+    metadata-only `derive_corporate_status` result — deterministic, offline,
+    no HTTP. A real caller supplies a real `FilingDocumentClient` to enable
+    bounded text-level going-concern/shell-company/bankruptcy confirmation."""
+
+    def __init__(
+        self,
+        sec_client: SecEdgarClient,
+        *,
+        filing_document_client: FilingDocumentClient | None = None,
+        cik: str | None = None,
+    ):
+        self._sec_client = sec_client
+        self._filing_document_client = filing_document_client
+        self._cik = cik
+
+    def fetch(self, symbol: str, as_of: datetime) -> CorporateStatusEvidence:
+        return build_corporate_status_with_disclosures(
+            symbol, sec_client=self._sec_client, filing_document_client=self._filing_document_client,
+            as_of=as_of, cik=self._cik,
+        )
+
+
+# --- Step 6: bounded metadata + disclosure-extraction composition --------
+
+MAX_DISCLOSURE_DOCUMENTS = 2
+
+
+def _merge_disclosure_signal(
+    original: CorporateRiskSignal, document: FilingDocument, *, disclosure_type: str, filing_ref: FilingReference,
+) -> CorporateRiskSignal:
+    """Applies `extract_disclosure` to one bounded document and merges the
+    result into `original` (a metadata-only signal). Only an
+    `EXPLICIT_DISCLOSURE_FOUND` outcome may upgrade the signal to
+    `CONFIRMED`; every other outcome (not-found/ambiguous/search-incomplete/
+    document-unavailable) leaves `original.status` unchanged and only
+    appends an audit note to `basis` — never downgrades, never converts a
+    "not found" into a confirmed negative, never fabricates
+    `SOURCE_UNAVAILABLE` from one unavailable document (docs/milestone-7.md
+    Step 6: "extraction failures fail closed")."""
+    extraction = extract_disclosure(document, disclosure_type=disclosure_type)
+
+    if extraction.outcome == OUTCOME_EXPLICIT_DISCLOSURE_FOUND:
+        return CorporateRiskSignal(
+            signal_type=original.signal_type,
+            status=STATUS_CONFIRMED,
+            basis=(
+                f"text-level extraction ({extraction.extraction_rule_version}) found an explicit disclosure in "
+                f"{filing_ref.form_type} accession {filing_ref.accession_number}"
+                f"{', section=' + extraction.section if extraction.section else ''}"
+            ),
+            evidence_refs=(filing_ref,),
+        )
+    if extraction.outcome == OUTCOME_AMBIGUOUS_DISCLOSURE:
+        note = (
+            f"; text-level extraction ({extraction.extraction_rule_version}) found ambiguous/hedged language in "
+            f"{filing_ref.form_type} accession {filing_ref.accession_number} — flagged for human review, not confirmed"
+        )
+    elif extraction.outcome == OUTCOME_SEARCH_INCOMPLETE:
+        note = (
+            f"; text-level search of {filing_ref.form_type} accession {filing_ref.accession_number} was incomplete "
+            "(document text truncated) — metadata-only result preserved, explicit SEARCH_INCOMPLETE"
+        )
+    elif extraction.outcome == OUTCOME_DOCUMENT_UNAVAILABLE:
+        note = (
+            f"; filing document unavailable for text-level search ({filing_ref.form_type} accession "
+            f"{filing_ref.accession_number}) — metadata-only result preserved, explicit DOCUMENT_UNAVAILABLE"
+        )
+    else:  # EXPLICIT_DISCLOSURE_NOT_FOUND_IN_SEARCHED_SECTIONS
+        note = (
+            f"; text-level extraction ({extraction.extraction_rule_version}) searched {filing_ref.form_type} "
+            f"accession {filing_ref.accession_number}, no explicit disclosure found — not converted to a confirmed absence"
+        )
+    return CorporateRiskSignal(
+        signal_type=original.signal_type, status=original.status, basis=original.basis + note,
+        evidence_refs=original.evidence_refs,
+    )
+
+
+def build_corporate_status_with_disclosures(
+    symbol: str,
+    *,
+    sec_client: SecEdgarClient,
+    filing_document_client: FilingDocumentClient | None,
+    as_of: datetime,
+    cik: str | None = None,
+) -> CorporateStatusEvidence:
+    """Composes Step 5's metadata-only `derive_corporate_status` with Step 6's
+    bounded, deterministic text-level disclosure extraction.
+
+    Retrieves at most `MAX_DISCLOSURE_DOCUMENTS` filing documents total: the
+    latest annual filing's text (reused for both the going-concern and
+    shell-company searches, since they are typically disclosed in the same
+    document) and the most recent 8-K referenced by the bankruptcy signal's
+    own metadata-derived `evidence_refs`, if any. No new HTTP client method
+    is used beyond `filing_documents.py::FilingDocumentClient.get_document`,
+    which is already bounded (`MAX_DOCUMENT_BYTES`/`MAX_RETAINED_TEXT_CHARS`).
+    `filing_document_client=None` returns the unmodified metadata-only base
+    (fixture-mode/offline path — deterministic, no network).
+    """
+    base = derive_corporate_status(symbol, sec_client=sec_client, as_of=as_of, cik=cik)
+    if filing_document_client is None:
+        return base
+
+    going_concern = base.going_concern_signals
+    shell_company = base.shell_company_signals
+    bankruptcy = base.bankruptcy_signals
+    documents_fetched = 0
+
+    if base.latest_annual_filing is not None and documents_fetched < MAX_DISCLOSURE_DOCUMENTS and base.latest_annual_filing.source_url:
+        document = filing_document_client.get_document(
+            accession_number=base.latest_annual_filing.accession_number,
+            source_url=base.latest_annual_filing.source_url, retrieved_at=as_of,
+        )
+        documents_fetched += 1
+        if going_concern:
+            going_concern = (
+                _merge_disclosure_signal(
+                    going_concern[0], document, disclosure_type="going_concern", filing_ref=base.latest_annual_filing,
+                ),
+            )
+        if shell_company:
+            shell_company = (
+                _merge_disclosure_signal(
+                    shell_company[0], document, disclosure_type="shell_company", filing_ref=base.latest_annual_filing,
+                ),
+            )
+
+    if bankruptcy and bankruptcy[0].evidence_refs and documents_fetched < MAX_DISCLOSURE_DOCUMENTS:
+        latest_8k = max(bankruptcy[0].evidence_refs, key=lambda r: r.accepted_at)
+        if latest_8k.source_url:
+            document = filing_document_client.get_document(
+                accession_number=latest_8k.accession_number, source_url=latest_8k.source_url, retrieved_at=as_of,
+            )
+            documents_fetched += 1
+            bankruptcy = (
+                _merge_disclosure_signal(
+                    bankruptcy[0], document, disclosure_type="bankruptcy", filing_ref=latest_8k,
+                ),
+            )
+
+    return dataclasses.replace(
+        base, going_concern_signals=going_concern, shell_company_signals=shell_company, bankruptcy_signals=bankruptcy,
     )

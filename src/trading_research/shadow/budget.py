@@ -27,6 +27,8 @@ from ..storage.shadow_operations_repositories import (
     list_budget_usage,
     load_budget_reservation,
     load_budget_reservation_by_idempotency_key,
+    load_budget_usage_attempt,
+    save_budget_usage_attempt,
 )
 
 RESERVATION_STATUS_RESERVED = "RESERVED"
@@ -261,6 +263,51 @@ def record_actual_usage(
         (str(new_consumed_cost), actual_input_tokens, actual_output_tokens, actual_latency_seconds, reservation_id),
     )
     conn.commit()
+
+
+def record_actual_usage_for_attempt(
+    conn,
+    reservation_id: str,
+    attempt_id: str,
+    *,
+    actual_cost_usd: Decimal,
+    actual_input_tokens: int,
+    actual_output_tokens: int,
+    actual_latency_seconds: int,
+    provider: str,
+    model_name: str | None,
+    clock: Clock,
+) -> bool:
+    """Idempotent-on-`attempt_id` wrapper around `record_actual_usage`
+    (docs/milestone-7.1.md Step 15). Checks
+    `shadow_budget_usage_attempts` first — a second call for an
+    already-charged `attempt_id` (a resumed cycle re-processing the same
+    completed attempt, or a duplicate `after_attempt` hook invocation) is a
+    pure no-op, never a double-charge against the reservation. Returns
+    `True` when usage was newly recorded, `False` when it was already
+    recorded (so callers can distinguish "charged now" from "already
+    charged" without a second query)."""
+    if load_budget_usage_attempt(conn, attempt_id) is not None:
+        return False
+    record_actual_usage(
+        conn, reservation_id, actual_cost_usd=actual_cost_usd, actual_input_tokens=actual_input_tokens,
+        actual_output_tokens=actual_output_tokens, actual_latency_seconds=actual_latency_seconds,
+        provider=provider, model_name=model_name, clock=clock,
+    )
+    # `record_actual_usage` already inserted the `shadow_budget_usage` row and
+    # committed; the newest row for this reservation is the one just inserted
+    # (usage_id is a fresh uuid per call, not derivable from attempt_id alone,
+    # so it is looked up rather than regenerated here).
+    latest_usage = list_budget_usage(conn, reservation_id=reservation_id)[-1]
+    now = clock()
+    save_budget_usage_attempt(
+        conn,
+        {
+            "attempt_id": attempt_id, "usage_id": latest_usage["usage_id"], "reservation_id": reservation_id,
+            "recorded_at": now.isoformat(),
+        },
+    )
+    return True
 
 
 def check_emergency_margin_breach(conn, reservation_id: str, emergency_margin_fraction: Decimal) -> BudgetBreachReport:

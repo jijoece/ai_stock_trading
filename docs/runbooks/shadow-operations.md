@@ -10,6 +10,16 @@ has `shadow_operations.enabled: false` and `schedule.enabled: false` out of the 
 recurring schedule has ever been activated on any machine this code has run on — read
 "Activate the launchd artifact" below carefully before doing so for the first time.
 
+**Milestone 7.1 update:** `run-due-shadow-cycle` now accepts `--provider-mode {fixture,real}`
+(default `fixture`) and repeatable `--symbol`. Corporate-status evidence, evidence-completeness
+gating, and per-role budget enforcement are now active in the real scheduled-cycle path — see
+`docs/milestone7-1-shadow-integration-closure.md` for what changed and
+`docs/adr/0005-production-shadow-operations-boundary.md`'s "Milestone 7.1 closure" section.
+A real-mode invocation still requires `research.yaml`'s `provider`/`model` to be set and,
+for `provider: anthropic`, a matching `config/research_pricing.yaml` entry and
+`ANTHROPIC_API_KEY` — missing any of these fails closed before any lease/DB work, reported
+as `MISSING_CREDENTIALS`/`PRICING_NOT_CONFIGURED` in the CLI's JSON output.
+
 ## Enable shadow operations
 
 1. Open `config/shadow_operations.yaml`. The shipped defaults:

@@ -79,3 +79,34 @@ class SQLiteResearchCycleRepository:
             "SELECT * FROM research_cycle_symbol_results WHERE cycle_id = ? ORDER BY symbol", (cycle_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# --- research_cycle_symbol_evidence_status (Milestone 7.1, Step 7) -----------
+
+
+def save_symbol_evidence_status(conn: sqlite3.Connection, entry: dict) -> None:
+    """Idempotent: `INSERT OR REPLACE` keyed by `(cycle_id, symbol)`, exactly
+    like `SQLiteResearchCycleRepository.save_symbol_result`."""
+    conn.execute(
+        "INSERT OR REPLACE INTO research_cycle_symbol_evidence_status "
+        "(cycle_id, symbol, snapshot_id, corporate_status_evidence_id, completeness_result_id, "
+        "screening_completeness, research_completeness, blocking_categories_json, policy_version, created_at) "
+        "VALUES (:cycle_id, :symbol, :snapshot_id, :corporate_status_evidence_id, :completeness_result_id, "
+        ":screening_completeness, :research_completeness, :blocking_categories_json, :policy_version, :created_at)",
+        entry,
+    )
+    conn.commit()
+
+
+def load_symbol_evidence_status(conn: sqlite3.Connection, cycle_id: str, symbol: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM research_cycle_symbol_evidence_status WHERE cycle_id = ? AND symbol = ?", (cycle_id, symbol),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_symbol_evidence_status(conn: sqlite3.Connection, cycle_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM research_cycle_symbol_evidence_status WHERE cycle_id = ? ORDER BY symbol", (cycle_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]

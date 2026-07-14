@@ -14,8 +14,22 @@ import sqlite3
 from datetime import datetime
 from decimal import Decimal
 
+from ..research.cycle_telemetry import ResearchCycleTelemetry, STATUS_COMPLETE, STATUS_PARTIAL, STATUS_UNAVAILABLE
 from ..research.evidence import snapshot_from_row, snapshot_to_row
-from ..research.failure_taxonomy import ResearchValidationFailure
+from ..research.failure_taxonomy import (
+    CODE_BUDGET_EXHAUSTED,
+    CODE_MISSING_REQUIRED_ROLE,
+    CODE_OUTPUT_TRUNCATED,
+    CODE_PROVIDER_CLIENT_ERROR,
+    CODE_PROVIDER_RATE_LIMITED,
+    CODE_PROVIDER_SERVER_ERROR,
+    CODE_PROVIDER_TIMEOUT,
+    CODE_PROVIDER_UNAVAILABLE,
+    CODE_RETRY_EXHAUSTED,
+    CODE_UNSUPPORTED_MATERIAL_CLAIM,
+    CODE_UNSUPPORTED_NUMERIC_CLAIM,
+    ResearchValidationFailure,
+)
 from ..research.models import (
     EvidenceSnapshot,
     ExperimentAssignment,
@@ -25,6 +39,11 @@ from ..research.models import (
     RoleResearchReport,
 )
 from ..research.orchestration import ResearchAttemptRecord
+
+_PROVIDER_FAILURE_CODES = frozenset(
+    {CODE_PROVIDER_TIMEOUT, CODE_PROVIDER_RATE_LIMITED, CODE_PROVIDER_UNAVAILABLE, CODE_PROVIDER_CLIENT_ERROR, CODE_PROVIDER_SERVER_ERROR}
+)
+_UNSUPPORTED_CLAIM_CODES = frozenset({CODE_UNSUPPORTED_NUMERIC_CLAIM, CODE_UNSUPPORTED_MATERIAL_CLAIM})
 
 
 def save_evidence_snapshot(conn: sqlite3.Connection, snapshot: EvidenceSnapshot) -> bool:
@@ -406,3 +425,94 @@ def summarize_run_failures(conn: sqlite3.Connection, research_run_id: str) -> di
         "research_run_id": research_run_id, "total_failures": len(failures),
         "counts_by_stage": by_stage, "counts_by_code": by_code,
     }
+
+
+def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[str, ...]) -> ResearchCycleTelemetry:
+    """Derives `ResearchCycleTelemetry` (docs/milestone-7.1.md Step 16) from
+    real, already-persisted `research_attempts`/`research_attempt_failures`
+    rows for exactly the supplied `research_run_id`s — the authoritative
+    source, never a duplicated in-memory counter kept alongside the
+    orchestrator's own bookkeeping.
+
+    `status=UNAVAILABLE` when `research_run_ids` is empty (no research ran
+    this cycle — nothing was inspected, not "zero and healthy").
+    `status=PARTIAL` when any required-role-failure/retry-exhaustion/
+    budget-skip occurred. `status=COMPLETE` otherwise. Token/latency/cost
+    fields stay `None` when genuinely no attempt reported them (never a
+    fabricated 0) — `missing_usage_record_count` names how many attempts
+    that affects.
+    """
+    if not research_run_ids:
+        return ResearchCycleTelemetry(
+            status=STATUS_UNAVAILABLE, research_run_ids=(), attempt_count=0, successful_attempt_count=0,
+            failed_attempt_count=0, retry_count=0, retry_exhaustion_count=0, required_role_failure_count=0,
+            provider_failure_count=0, unsupported_claim_count=0, output_truncation_count=0,
+            budget_skipped_attempt_count=0, input_tokens=None, output_tokens=None, latency_ms=None,
+            priced_usage_cost_usd=None, pricing_status="NO_DATA", missing_usage_record_count=0,
+        )
+
+    placeholders = ",".join("?" for _ in research_run_ids)
+    attempt_rows = conn.execute(
+        f"SELECT * FROM research_attempts WHERE research_run_id IN ({placeholders})", research_run_ids,
+    ).fetchall()
+    failures = tuple(
+        f
+        for run_id in research_run_ids
+        for f in list_run_failures(conn, run_id)
+    )
+
+    attempt_count = len(attempt_rows)
+    successful_attempt_count = sum(1 for r in attempt_rows if r["success"])
+    failed_attempt_count = attempt_count - successful_attempt_count
+    retry_count = sum(1 for r in attempt_rows if r["attempt_number"] > 1)
+    retry_exhaustion_count = sum(1 for f in failures if f.code == CODE_RETRY_EXHAUSTED)
+    required_role_failure_count = sum(1 for f in failures if f.code == CODE_MISSING_REQUIRED_ROLE)
+    provider_failure_count = sum(1 for f in failures if f.code in _PROVIDER_FAILURE_CODES)
+    unsupported_claim_count = sum(1 for f in failures if f.code in _UNSUPPORTED_CLAIM_CODES)
+    output_truncation_count = sum(1 for f in failures if f.code == CODE_OUTPUT_TRUNCATED)
+    budget_skipped_attempt_count = sum(1 for f in failures if f.code == CODE_BUDGET_EXHAUSTED)
+
+    input_token_values = [r["input_tokens"] for r in attempt_rows if r["input_tokens"] is not None]
+    output_token_values = [r["output_tokens"] for r in attempt_rows if r["output_tokens"] is not None]
+    latency_values = [r["latency_ms"] for r in attempt_rows if r["latency_ms"] is not None]
+    missing_usage_record_count = sum(1 for r in attempt_rows if r["input_tokens"] is None or r["output_tokens"] is None)
+
+    cost_statuses = {r["cost_status"] for r in attempt_rows}
+    priced_costs = [Decimal(r["estimated_cost"]) for r in attempt_rows if r["cost_status"] == "CALCULATED" and r["estimated_cost"] is not None]
+    if not attempt_rows:
+        pricing_status = "NO_DATA"
+        priced_usage_cost_usd = None
+    elif cost_statuses == {"NOT_APPLICABLE"}:
+        pricing_status = "NOT_APPLICABLE"
+        priced_usage_cost_usd = None
+    elif "PRICING_NOT_CONFIGURED" in cost_statuses:
+        pricing_status = "PRICING_NOT_CONFIGURED"
+        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+    elif "USAGE_NOT_RETURNED" in cost_statuses:
+        pricing_status = "USAGE_NOT_RETURNED"
+        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+    elif cost_statuses == {"CALCULATED"}:
+        pricing_status = "CALCULATED"
+        priced_usage_cost_usd = sum(priced_costs)
+    else:
+        pricing_status = "MIXED"
+        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+
+    if required_role_failure_count > 0 or retry_exhaustion_count > 0 or budget_skipped_attempt_count > 0:
+        status = STATUS_PARTIAL
+    else:
+        status = STATUS_COMPLETE
+
+    return ResearchCycleTelemetry(
+        status=status, research_run_ids=tuple(research_run_ids), attempt_count=attempt_count,
+        successful_attempt_count=successful_attempt_count, failed_attempt_count=failed_attempt_count,
+        retry_count=retry_count, retry_exhaustion_count=retry_exhaustion_count,
+        required_role_failure_count=required_role_failure_count, provider_failure_count=provider_failure_count,
+        unsupported_claim_count=unsupported_claim_count, output_truncation_count=output_truncation_count,
+        budget_skipped_attempt_count=budget_skipped_attempt_count,
+        input_tokens=sum(input_token_values) if input_token_values else None,
+        output_tokens=sum(output_token_values) if output_token_values else None,
+        latency_ms=sum(latency_values) if latency_values else None,
+        priced_usage_cost_usd=priced_usage_cost_usd, pricing_status=pricing_status,
+        missing_usage_record_count=missing_usage_record_count,
+    )

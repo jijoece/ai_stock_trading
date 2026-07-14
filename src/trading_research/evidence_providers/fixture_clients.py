@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from ..research.fixtures import fixture_deterministic_factors, is_fixture_symbol
-from .models import CompanyFactValue, PriceBar
+from .models import CompanyFactValue, FilingRecord, PriceBar
 
 
 class FixtureMarketDataClient:
@@ -83,5 +83,41 @@ class FixtureSecClient:
             ))
         return tuple(values)
 
-    def list_filings(self, symbol: str, *, available_by: datetime):
-        return ()
+    def list_filings(self, symbol: str, *, available_by: datetime, cik: str | None = None) -> tuple[FilingRecord, ...]:
+        """Deterministic fixture filing history (docs/milestone-7.md Step 10),
+        anchored relative to `available_by` (exactly like `get_company_facts`
+        anchors its synthesized period dates) so the same fixture symbol
+        produces a stable, point-in-time-safe filing set regardless of which
+        `as_of`/`available_by` a given test or cycle happens to use. Covers
+        the full offline corporate-status path: an annual filing, a
+        quarterly filing, an amendment, a late-filing notice, a historical
+        earliest filing, a future filing that point-in-time filtering must
+        exclude, and one risk-signal fixture (an 8-K, exercising the
+        bankruptcy-signal metadata search)."""
+        if not is_fixture_symbol(symbol):
+            return ()
+        cik = cik or "0000000001"
+
+        def _mk(form_type: str, days_before_available: int, suffix: str, *, is_amendment: bool = False, report_period_days_before: int | None = None) -> FilingRecord:
+            accepted = available_by - timedelta(days=days_before_available)
+            accession = f"0000000001-{accepted.year:04d}-{suffix}"
+            return FilingRecord(
+                accession_number=accession, cik=cik, symbol=symbol.upper(), form_type=form_type,
+                filing_date=accepted.date(), accepted_at=accepted,
+                report_period=(accepted - timedelta(days=report_period_days_before)).date() if report_period_days_before else None,
+                primary_document_url=(
+                    f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession.replace('-', '')}/primary.htm"
+                ),
+                is_amendment=is_amendment,
+            )
+
+        candidates = (
+            _mk("10-K", 400, "000010", report_period_days_before=430),                       # latest annual filing
+            _mk("10-Q", 100, "000009", report_period_days_before=130),                        # latest quarterly filing
+            _mk("10-K/A", 395, "000011", is_amendment=True, report_period_days_before=430),   # amendment
+            _mk("NT 10-Q", 105, "000008"),                                                    # late-filing notice
+            _mk("10-K", 365 * 5, "000001", report_period_days_before=365 * 5 + 30),           # historical earliest filing
+            _mk("8-K", 200, "000007"),                                                        # risk-signal fixture (bankruptcy search)
+            _mk("10-Q", -30, "000099"),                                                        # future filing — must be excluded
+        )
+        return tuple(sorted((f for f in candidates if f.accepted_at <= available_by), key=lambda f: f.accepted_at))

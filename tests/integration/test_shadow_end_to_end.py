@@ -519,19 +519,17 @@ def test_critical_corporate_status_unknown_claude_skipped_explicit_reason(conn):
     symbol -> no recommendation execution -> the result carries an explicit
     evidence-completeness reason, never a silent skip.
 
-    `research/scheduled_cycle.py::_run_symbol` does not itself call
-    `derive_corporate_status`/`evaluate_completeness` yet (a documented,
-    intentional scope boundary — corporate-status evidence is wired into
-    `cli.py::corporate_status_cli` as its own read path in this milestone,
-    not yet fused into the scheduled-cycle symbol loop). This test proves
-    the *composition* end-to-end through the real orchestrator by using a
-    `run_cycle` stub that — exactly like a fused future implementation
-    would — calls the real `derive_corporate_status` and real
-    `evaluate_completeness` deterministic functions first, and only calls
-    the (call-counting) Claude provider when they pass; this is a
-    legitimate use of `run_cycle`'s injection seam (`scheduler.py`'s own
-    docstring: "kept injectable ... real CLI wrapper ... passes the real
-    function", i.e. any correctly-shaped callable is a valid `run_cycle`)."""
+    UPDATE (docs/milestone-7.1.md, Milestone 7.1): `research/scheduled_cycle.py::
+    _run_symbol` NOW calls `derive_corporate_status`/`evaluate_completeness`
+    directly as part of the real symbol loop — the "documented scope
+    boundary" this test's docstring used to describe was closed in
+    Milestone 7.1. This test is kept as a hand-rolled `run_cycle` stub
+    composing the same primitives directly (still a legitimate, faster unit
+    of coverage for the composition itself); the FUSED, real
+    `run_scheduled_research_cycle` path is covered end-to-end by
+    `tests/integration/test_milestone_7_1_shadow_integration.py::
+    test_blocking_completeness_no_claude_call` instead, which drives the
+    actual production code path with no stub in between."""
     from trading_research.evidence_providers.corporate_status_adapters import derive_corporate_status
     from trading_research.research.deterministic_provider import DeterministicResearchProvider
     from trading_research.research.evidence_completeness import evaluate_completeness

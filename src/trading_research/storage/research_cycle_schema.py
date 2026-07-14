@@ -42,11 +42,36 @@ CREATE TABLE IF NOT EXISTS research_cycle_symbol_results (
     completed_at TEXT,
     PRIMARY KEY (cycle_id, symbol)
 );
+
+-- Milestone 7.1 (docs/milestone-7.1.md Step 7): associates the per-cycle,
+-- per-symbol corporate-status evidence and evidence-completeness result
+-- with the cycle/symbol that produced them. Additive to the existing
+-- research_cycle_symbol_results table rather than overloading it, since
+-- that table is already keyed/consumed by Milestone 6's own resumability
+-- contract (ResearchCycleRepository Protocol) — adding new required-shape
+-- columns there would touch a Protocol every prior milestone depends on.
+-- INSERT OR REPLACE keyed by (cycle_id, symbol) — idempotent save, mirrors
+-- save_symbol_result's own pattern.
+CREATE TABLE IF NOT EXISTS research_cycle_symbol_evidence_status (
+    cycle_id TEXT NOT NULL REFERENCES research_cycles(cycle_id),
+    symbol TEXT NOT NULL,
+    snapshot_id TEXT,
+    corporate_status_evidence_id TEXT,
+    completeness_result_id TEXT,
+    screening_completeness TEXT NOT NULL,
+    research_completeness TEXT NOT NULL,
+    blocking_categories_json TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (cycle_id, symbol)
+);
 """
 
 RESEARCH_CYCLE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_research_cycles_universe ON research_cycles(universe_id, as_of);
 CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_results_cycle ON research_cycle_symbol_results(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_evidence_status_cycle ON research_cycle_symbol_evidence_status(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_evidence_status_symbol ON research_cycle_symbol_evidence_status(symbol);
 """
 
 

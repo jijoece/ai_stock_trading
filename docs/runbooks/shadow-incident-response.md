@@ -4,6 +4,13 @@ Playbooks for operational incidents in the Milestone 7 shadow-operations layer. 
 `docs/runbooks/shadow-operations.md` for routine commands and
 `docs/milestone7-production-shadow-operations.md` for architecture detail.
 
+**Milestone 7.1 update:** `shadow_role_budget_checks` is now a real, queryable audit trail
+(one row per pre-attempt budget decision, before every real Claude call) — when
+investigating an unexpected `BUDGET_REJECTED`/`SKIPPED_BUDGET_EXHAUSTED` outcome, query it
+directly (`SELECT * FROM shadow_role_budget_checks WHERE scheduler_run_id = ?`) rather than
+only inferring budget state from `shadow-budget-status`. See
+`docs/milestone7-1-shadow-integration-closure.md` for the full closure detail.
+
 ## First response — always start here
 
 Before taking any action (resuming, force-clearing a kill, force-releasing a lease), run

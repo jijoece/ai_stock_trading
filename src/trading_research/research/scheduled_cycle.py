@@ -24,12 +24,15 @@ from typing import Any, Callable, Protocol
 
 from ..analysis.scorer import ScoringConfig
 from ..analysis.screener import ScreeningConfig
+from ..evidence_providers.corporate_status import CorporateStatusEvidence
 from ..evidence_providers.evidence_adapters import (
+    PrefetchedEvidenceProvider,
     RealFilingEvidenceProvider,
     RealFundamentalsEvidenceProvider,
     RealMarketEvidenceProvider,
     RealNewsEvidenceProvider,
     RealSentimentEvidenceProvider,
+    corporate_status_to_evidence_bundle,
 )
 from ..evidence_providers.fundamentals import normalize_fundamentals
 from ..evidence_providers.market_data_provider import AlpacaMarketDataClient
@@ -51,6 +54,7 @@ from ..universe.tickers import TickerUniverse
 from . import experiment_policy
 from .configuration import ResearchConfiguration
 from .evidence import EvidenceBundle, build_evidence_snapshot
+from .evidence_completeness import evaluate_completeness
 from .experiment import build_experiment_assignments
 from .models import EvidenceSnapshot, ExperimentAssignment, ResearchOverlayDecision
 from .orchestration import ResearchRepository, analyze_with_research_committee
@@ -120,6 +124,7 @@ class EvidenceProviderRegistry:
     portfolio_context: Any | None
     market_data_client: Any  # exposes get_quote/get_price_history for baseline CandidateInput mapping
     sec_client: Any | None = None  # exposes get_company_facts for baseline fundamentals mapping
+    corporate_status: Any | None = None  # CorporateStatusEvidenceProvider (docs/milestone-7.1.md Step 4) — optional
 
 
 @dataclass(frozen=True)
@@ -241,11 +246,24 @@ def build_real_evidence_snapshot(
     symbol: str, as_of: datetime, *, providers: EvidenceProviderRegistry, deterministic_factors: dict[str, float],
     config_hash: str, git_sha: str, clock: Callable[[], datetime],
     max_evidence_items: int, max_items_per_source_category: int,
-) -> EvidenceSnapshot:
+) -> tuple[EvidenceSnapshot, CorporateStatusEvidence | None]:
+    """Returns `(snapshot, corporate_status)`. `corporate_status` is the raw
+    typed result (docs/milestone-7.1.md Step 4/5) — `None` only when no
+    `providers.corporate_status` was configured at all (distinct from a
+    fetched-but-uncertain result, which is a real `CorporateStatusEvidence`
+    with an `UNKNOWN`/`SOURCE_UNAVAILABLE` status). Callers need the typed
+    value for `research/evidence_completeness.py::evaluate_completeness` and
+    for persistence — `EvidenceBundle` alone would lose that typed shape."""
     sentiment_result = providers.sentiment.fetch(symbol, as_of) if providers.sentiment is not None else None
     sentiment_metrics: dict[str, Any] = {}
     if isinstance(sentiment_result, EvidenceBundle) and sentiment_result.evidence_items:
         sentiment_metrics = dict(sentiment_result.evidence_items[0].normalized_values)
+
+    corporate_status: CorporateStatusEvidence | None = None
+    corporate_status_provider = None
+    if providers.corporate_status is not None:
+        corporate_status = providers.corporate_status.fetch(symbol, as_of)
+        corporate_status_provider = PrefetchedEvidenceProvider(corporate_status_to_evidence_bundle(corporate_status))
 
     # News/sentiment are optional, environmentally-pending providers in this
     # milestone's minimum provider set (docs/milestone-6.md: "no provider
@@ -261,16 +279,20 @@ def build_real_evidence_snapshot(
     # entirely rather than passed through and crashing `build_evidence_snapshot`
     # (docs/milestone-6.md: "absent credentials fail closed").
     active_providers = [
-        p for p in (providers.fundamentals, providers.market, providers.filings, providers.news, providers.sentiment)
+        p for p in (
+            providers.fundamentals, providers.market, providers.filings, providers.news, providers.sentiment,
+            corporate_status_provider,
+        )
         if p is not None
     ]
 
-    return build_evidence_snapshot(
+    snapshot = build_evidence_snapshot(
         symbol, as_of, deterministic_factors=deterministic_factors, sentiment_metrics=sentiment_metrics,
         providers=tuple(active_providers),
         portfolio_context_provider=providers.portfolio_context, config_hash=config_hash, git_sha=git_sha,
         clock=clock, max_evidence_items=max_evidence_items, max_items_per_source_category=max_items_per_source_category,
     )
+    return snapshot, corporate_status
 
 
 class ResearchCycleRepository(Protocol):
@@ -302,11 +324,20 @@ def run_scheduled_research_cycle(
     paper_submitter: Callable[[str], Any] | None,
     clock: Callable[[], datetime],
     git_sha: str,
+    attempt_controller_factory: Callable[[str], Any] | None = None,
 ) -> ResearchCycleResult:
     """`paper_submitter`, when supplied, is a callable `(recommendation_id) ->
     PaperExecutionOutcome` — kept injectable so this module never imports the
     isolated-runtime client directly; the CLI wires a real one only when
-    `configuration.submit_paper_orders` is true."""
+    `configuration.submit_paper_orders` is true.
+
+    `attempt_controller_factory` (docs/milestone-7.1.md Steps 12-13, default
+    `None` = every prior milestone's exact behavior): an optional zero-arg-
+    per-symbol callable `(symbol) -> ResearchAttemptController`, invoked
+    once per symbol so a fresh instance (with its own per-symbol role-index
+    counter) is used for the committee call — this module never imports
+    `shadow`; a shadow-budget-aware factory is injected by the caller (see
+    `shadow/scheduler.py`)."""
     bounded_symbols = tuple(symbols[: configuration.max_candidates_per_cycle])
     cycle_id = derive_cycle_id(configuration.universe_id, as_of, configuration.config_hash)
 
@@ -333,6 +364,7 @@ def run_scheduled_research_cycle(
                 research_model_name=research_model_name, research_configuration=research_configuration,
                 research_repository=research_repository, prompt_registry=prompt_registry, portfolio=portfolio,
                 paper_submitter=paper_submitter, clock=clock, git_sha=git_sha,
+                attempt_controller=attempt_controller_factory(symbol) if attempt_controller_factory is not None else None,
             )
         except Exception as exc:  # per-symbol failure isolation — never loses the whole cycle
             result = SymbolCycleResult(symbol=symbol, status=SYMBOL_STATUS_FAILED, failure_reason=str(exc))
@@ -367,6 +399,7 @@ def _run_symbol(
     research_configuration: ResearchConfiguration, research_repository: ResearchRepository,
     prompt_registry: PromptRegistry, portfolio: PortfolioState | None,
     paper_submitter: Callable[[str], Any] | None, clock: Callable[[], datetime], git_sha: str,
+    attempt_controller: Any | None = None,
 ) -> SymbolCycleResult:
     candidate_run_id = _candidate_run_id(cycle_id, symbol)
     idempotency_key = f"{cycle_id}:{symbol}:baseline"
@@ -378,21 +411,58 @@ def _run_symbol(
     baseline_analysis: AnalysisResult = analyze_candidate(candidate, universe, screening_config, scoring_config, conn, as_of)
     baseline_rec = baseline_analysis.recommendation
 
-    snapshot = build_real_evidence_snapshot(
+    snapshot, corporate_status = build_real_evidence_snapshot(
         symbol, as_of, providers=evidence_providers, deterministic_factors=deterministic_factors,
         config_hash=research_configuration.config_hash, git_sha=git_sha, clock=clock,
         max_evidence_items=research_configuration.max_evidence_items,
         max_items_per_source_category=research_configuration.max_items_per_source_category,
     )
+    from ..storage.corporate_status_repositories import (
+        save_corporate_status_evidence,
+        save_evidence_completeness_result,
+    )
+    from ..storage.research_cycle_repositories import save_symbol_evidence_status
     from ..storage.research_repositories import save_evidence_snapshot
+
     save_evidence_snapshot(conn, snapshot)
 
+    corporate_status_id = save_corporate_status_evidence(conn, corporate_status, created_at=clock()) if corporate_status is not None else None
+
     required_categories = ("fundamentals",)
-    outcome, _reasons = classify_snapshot_outcome(
+    outcome, reasons = classify_snapshot_outcome(
         snapshot, required_categories=required_categories,
         require_point_in_time_safe=configuration.require_point_in_time_safe,
     )
-    evidence_blocks_enhanced = configuration.require_complete_evidence and outcome in BLOCKING_OUTCOMES
+
+    # Evidence-completeness gate (docs/milestone-7.1.md Steps 8-9; ADR 0005
+    # Decision 10): evaluated automatically for every symbol, before any
+    # Claude call, using the SAME snapshot outcome the pre-existing gate
+    # already computed plus the newly-built typed corporate-status result.
+    # `news_present`/`sentiment_present` reflect whether that category
+    # actually produced evidence items, not merely whether a provider was
+    # configured (an enabled-but-empty provider is "not present" too).
+    news_present = any(item.category == "news" for item in snapshot.evidence_items)
+    sentiment_present = any(item.category == "sentiment" for item in snapshot.evidence_items)
+    completeness_result = evaluate_completeness(
+        symbol=symbol, snapshot_outcome=outcome, snapshot_reasons=reasons, corporate_status=corporate_status,
+        news_present=news_present, sentiment_present=sentiment_present,
+    )
+    completeness_result_id = save_evidence_completeness_result(conn, completeness_result, created_at=clock())
+    save_symbol_evidence_status(
+        conn,
+        {
+            "cycle_id": cycle_id, "symbol": symbol, "snapshot_id": snapshot.snapshot_id,
+            "corporate_status_evidence_id": corporate_status_id, "completeness_result_id": completeness_result_id,
+            "screening_completeness": completeness_result.screening_completeness,
+            "research_completeness": completeness_result.research_completeness,
+            "blocking_categories_json": json.dumps(list(completeness_result.blocking_categories)),
+            "policy_version": completeness_result.policy_version, "created_at": clock().isoformat(),
+        },
+    )
+
+    evidence_blocks_enhanced = configuration.require_complete_evidence and (
+        outcome in BLOCKING_OUTCOMES or completeness_result.screening_blocked
+    )
 
     if evidence_blocks_enhanced:
         orchestration_status = "ANALYSIS_INCOMPLETE"
@@ -403,7 +473,7 @@ def _run_symbol(
             snapshot, provider=research_provider, provider_name=research_provider_name,
             model_name=research_model_name, prompt_registry=prompt_registry,
             research_repository=research_repository, configuration=research_configuration,
-            clock=clock, run_mode=research_provider_name,
+            clock=clock, run_mode=research_provider_name, attempt_controller=attempt_controller,
         )
         orchestration_status = orchestration_result.status
         decision = orchestration_result.decision

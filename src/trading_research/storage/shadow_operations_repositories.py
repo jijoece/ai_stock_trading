@@ -178,3 +178,71 @@ def list_operator_actions(conn: sqlite3.Connection, *, action_type: str | None =
     else:
         rows = conn.execute("SELECT * FROM shadow_operator_actions ORDER BY created_at ASC").fetchall()
     return [dict(r) for r in rows]
+
+
+# --- shadow_role_budget_checks (Milestone 7.1, Steps 13-14) -------------------
+
+
+def save_role_budget_check(conn: sqlite3.Connection, check: dict) -> None:
+    """Idempotent on `check_id` (deterministic — see
+    `shadow/attempt_controller.py::_compute_check_id`): `INSERT OR IGNORE`
+    so a resumed cycle's identical pre-attempt check never creates a
+    duplicate audit row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO shadow_role_budget_checks "
+        "(check_id, reservation_id, scheduler_run_id, cycle_id, research_run_id, symbol, role, attempt_number, "
+        "provider, model_name, decision, reason, remaining_input_tokens, remaining_output_tokens, "
+        "remaining_latency_ms, remaining_cost_usd, maximum_attempt_input_tokens, maximum_attempt_output_tokens, "
+        "maximum_attempt_latency_ms, maximum_attempt_cost_usd, checked_at) "
+        "VALUES (:check_id, :reservation_id, :scheduler_run_id, :cycle_id, :research_run_id, :symbol, :role, "
+        ":attempt_number, :provider, :model_name, :decision, :reason, :remaining_input_tokens, "
+        ":remaining_output_tokens, :remaining_latency_ms, :remaining_cost_usd, :maximum_attempt_input_tokens, "
+        ":maximum_attempt_output_tokens, :maximum_attempt_latency_ms, :maximum_attempt_cost_usd, :checked_at)",
+        check,
+    )
+    conn.commit()
+
+
+def list_role_budget_checks(
+    conn: sqlite3.Connection, *, scheduler_run_id: str | None = None, symbol: str | None = None,
+    role: str | None = None, decision: str | None = None,
+) -> list[dict]:
+    clauses = []
+    params: list[object] = []
+    if scheduler_run_id is not None:
+        clauses.append("scheduler_run_id = ?")
+        params.append(scheduler_run_id)
+    if symbol is not None:
+        clauses.append("symbol = ?")
+        params.append(symbol)
+    if role is not None:
+        clauses.append("role = ?")
+        params.append(role)
+    if decision is not None:
+        clauses.append("decision = ?")
+        params.append(decision)
+    query = "SELECT * FROM shadow_role_budget_checks"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY checked_at"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --- shadow_budget_usage_attempts (Milestone 7.1, Step 15) --------------------
+
+
+def load_budget_usage_attempt(conn: sqlite3.Connection, attempt_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_budget_usage_attempts WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_budget_usage_attempt(conn: sqlite3.Connection, entry: dict) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO shadow_budget_usage_attempts (attempt_id, usage_id, reservation_id, recorded_at) "
+        "VALUES (:attempt_id, :usage_id, :reservation_id, :recorded_at)",
+        entry,
+    )
+    conn.commit()

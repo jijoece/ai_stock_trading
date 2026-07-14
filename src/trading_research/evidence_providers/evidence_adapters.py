@@ -15,10 +15,13 @@ could not classify) is still allowed to propagate — "fail closed," not
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from ..research.evidence import EvidenceBundle
 from ..research.models import EvidenceItem, SourceRecord
+from .corporate_status import CorporateStatusEvidence
+from .disclosure_extraction import EXTRACTION_RULE_VERSION
 from .errors import ProviderConfigurationError, ProviderError
 from .fundamentals import normalize_fundamentals
 from .market_data_provider import AlpacaMarketDataClient
@@ -242,3 +245,122 @@ class RealSentimentEvidenceProvider:
             as_of=as_of, confidence="low", stale=False, conflict_group=None,
         )
         return EvidenceBundle(source_records=(record,), evidence_items=(item,))
+
+
+@dataclass(frozen=True)
+class PrefetchedEvidenceProvider:
+    """Wraps an already-built `EvidenceBundle` in the same `.fetch(symbol,
+    as_of) -> EvidenceBundle` shape every other provider in this module
+    satisfies (docs/milestone-7.md Step 5: "use the existing EvidenceBundle
+    provider shape if that fits"), so a value computed once outside
+    `build_evidence_snapshot`'s provider loop (corporate-status evidence is
+    fetched exactly once per symbol, not once per snapshot-build call
+    internally) can still participate in that same loop and in canonical
+    snapshot hashing without changing `build_evidence_snapshot`'s signature."""
+
+    bundle: EvidenceBundle
+
+    def fetch(self, symbol: str, as_of: datetime) -> EvidenceBundle:
+        return self.bundle
+
+
+def corporate_status_to_evidence_bundle(evidence: CorporateStatusEvidence) -> EvidenceBundle:
+    """Normalizes `CorporateStatusEvidence` (docs/milestone-7.md Step 4) into
+    bounded, provenance-backed `EvidenceItem`s (Step 5). Only facts that can
+    be supported precisely are included — see the module list in Step 5.
+
+    Every item cites the same single `SourceRecord` (one corporate-status
+    retrieval per symbol/as_of); stable evidence IDs
+    (`corporate-status-{symbol}-{as_of_date}-{field}`) make replay
+    deterministic. `NOT_FOUND_IN_SEARCHED_SOURCES` is retained verbatim in
+    each risk-signal item's summary — never rendered as "no risk" or
+    silently dropped. No full filing text is ever included (bounded to a
+    short human-readable `basis` string, already capped upstream by
+    `disclosure_extraction.py`'s own snippet bound).
+    """
+    symbol = evidence.symbol
+    as_of_date = evidence.as_of.date().isoformat()
+    source_id = f"corporate-status-{symbol}-{as_of_date}"
+
+    source = SourceRecord(
+        source_id=source_id, source_type="corporate_status", provider="sec-edgar-corporate-status",
+        source_locator=None, retrieved_at=evidence.as_of, published_at=None, effective_at=None,
+        available_at=evidence.as_of, content_hash=_content_hash(symbol, as_of_date, evidence.reporting_status),
+        status="ok" if evidence.completeness_status != "UNAVAILABLE" else "missing", is_stale=False,
+        # The retrieval methodology (SEC submissions endpoint, already point-in-time
+        # filtered by list_filings) is safe regardless of whether the resulting content
+        # is itself CONFIRMED/UNKNOWN — content certainty and retrieval safety are
+        # distinct axes (docs/milestone-7.md Step 5).
+        point_in_time_safe=True, error_code=None,
+    )
+
+    def _item(field: str, title: str, summary: str, normalized_values: dict, as_of: datetime = evidence.as_of) -> EvidenceItem:
+        return EvidenceItem(
+            evidence_id=f"{source_id}-{field}", source_id=source_id, category="corporate_status",
+            title=title, summary=summary, normalized_values=normalized_values, as_of=as_of,
+            confidence="high" if evidence.completeness_status == "COMPLETE" else "medium",
+            stale=False, conflict_group=None,
+        )
+
+    items: list[EvidenceItem] = [
+        _item(
+            "reporting-status", f"{symbol} corporate reporting status",
+            f"reporting_status={evidence.reporting_status}"
+            + (f" ({evidence.reporting_status_reason})" if evidence.reporting_status_reason else ""),
+            {"reporting_status": evidence.reporting_status},
+        ),
+        _item(
+            "disclosure-rule-version", f"{symbol} disclosure-extraction rule version",
+            f"corporate-status derivation used extraction_rule_version={EXTRACTION_RULE_VERSION}",
+            {"extraction_rule_version": EXTRACTION_RULE_VERSION},
+        ),
+    ]
+
+    if evidence.earliest_reliable_filing_date is not None:
+        items.append(_item(
+            "earliest-filing", f"{symbol} earliest reliable SEC filing date",
+            f"earliest_reliable_filing_date={evidence.earliest_reliable_filing_date.isoformat()} "
+            "(public-reporting-history proxy — NOT company age or years of actual operating history)",
+            {
+                "earliest_reliable_filing_date": evidence.earliest_reliable_filing_date.isoformat(),
+                "public_reporting_history_years_proxy": (
+                    float(evidence.operating_history_years) if evidence.operating_history_years is not None else None
+                ),
+            },
+        ))
+
+    for field, filing, label in (
+        ("latest-annual-filing", evidence.latest_annual_filing, "latest annual filing"),
+        ("latest-quarterly-filing", evidence.latest_quarterly_filing, "latest quarterly filing"),
+    ):
+        if filing is not None:
+            items.append(_item(
+                field, f"{symbol} {label}",
+                f"{filing.form_type} accession {filing.accession_number}, accepted {filing.accepted_at.isoformat()}",
+                {"form_type": filing.form_type, "accession_number": filing.accession_number, "is_amendment": filing.is_amendment},
+                as_of=filing.accepted_at,
+            ))
+
+    if evidence.late_filing_notices:
+        items.append(_item(
+            "late-filing-notices", f"{symbol} late-filing notices",
+            f"{len(evidence.late_filing_notices)} late-filing notice(s): "
+            + ", ".join(f"{f.form_type}({f.accession_number})" for f in evidence.late_filing_notices[:5]),
+            {"count": len(evidence.late_filing_notices)},
+        ))
+
+    for field, signals, label in (
+        ("bankruptcy", evidence.bankruptcy_signals, "bankruptcy-related signal"),
+        ("delisting", evidence.delisting_signals, "delisting signal"),
+        ("registration-status", evidence.registration_status_signals, "registration-termination signal"),
+        ("shell-company", evidence.shell_company_signals, "shell-company signal"),
+        ("going-concern", evidence.going_concern_signals, "going-concern extraction outcome"),
+    ):
+        for signal in signals:
+            items.append(_item(
+                field, f"{symbol} {label}",
+                f"status={signal.status}; {signal.basis}",
+                {"status": signal.status},
+            ))
+
+    return EvidenceBundle(source_records=(source,), evidence_items=tuple(items))

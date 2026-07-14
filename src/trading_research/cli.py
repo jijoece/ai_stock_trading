@@ -862,6 +862,7 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
     from .evidence_providers.alpaca_news_provider import AlpacaNewsClient
     from .evidence_providers.cache import ProviderCache
     from .evidence_providers.config import load_evidence_provider_config
+    from .evidence_providers.corporate_status_adapters import SecCorporateStatusProvider
     from .evidence_providers.evidence_adapters import (
         RealFilingEvidenceProvider,
         RealFundamentalsEvidenceProvider,
@@ -885,6 +886,9 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
             fundamentals=RealFundamentalsEvidenceProvider(sec), market=RealMarketEvidenceProvider(market),
             filings=RealFilingEvidenceProvider(sec), news=None, sentiment=None, portfolio_context=None,
             market_data_client=market, sec_client=sec,
+            # filing_document_client=None -> metadata-only corporate status (Step 6),
+            # deterministic and offline, matching every other fixture-mode provider here.
+            corporate_status=SecCorporateStatusProvider(sec),
         )
         return registry, ()
 
@@ -906,6 +910,16 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
         )
         sec = SecEdgarClient(http_client=sec_http, cache=sec_cache, user_agent=provider_config.sec.user_agent_contact)
         used_providers.append("sec-edgar")
+
+    filing_document_client = None
+    if sec is not None:
+        from .evidence_providers.filing_documents import FilingDocumentCache, FilingDocumentClient
+
+        filing_document_client = FilingDocumentClient(
+            user_agent=provider_config.sec.user_agent_contact,
+            rate_limiter=MinIntervalRateLimiter(provider_config.sec.min_request_interval_seconds),
+            cache=FilingDocumentCache(),
+        )
 
     market = None
     if provider_config.market_data.enabled and cfg.alpaca_market_data_api_key and cfg.alpaca_market_data_api_secret:
@@ -960,6 +974,9 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
         filings=RealFilingEvidenceProvider(sec) if sec else None,
         news=news, sentiment=sentiment, portfolio_context=None,
         market_data_client=market, sec_client=sec,
+        corporate_status=(
+            SecCorporateStatusProvider(sec, filing_document_client=filing_document_client) if sec else None
+        ),
     )
     return registry, tuple(used_providers)
 
@@ -1006,7 +1023,7 @@ def fetch_evidence_cli(symbol: str, as_of_str: str, db_path: Path, provider_mode
 
     with session(db_path) as conn:
         registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=cfg, conn=conn)
-        snapshot = build_real_evidence_snapshot(
+        snapshot, corporate_status = build_real_evidence_snapshot(
             symbol, as_of, providers=registry, deterministic_factors={}, config_hash=research_config.config_hash,
             git_sha=_git_sha(), clock=lambda: datetime.now(timezone.utc),
             max_evidence_items=research_config.max_evidence_items,
@@ -1019,6 +1036,7 @@ def fetch_evidence_cli(symbol: str, as_of_str: str, db_path: Path, provider_mode
         "symbol": snapshot.symbol, "as_of": snapshot.as_of.isoformat(), "evidence_item_count": len(snapshot.evidence_items),
         "source_record_count": len(snapshot.source_records), "missing_data_reasons": list(snapshot.missing_data_reasons),
         "point_in_time_safe": snapshot.point_in_time_safe, "newly_persisted": newly_persisted,
+        "corporate_reporting_status": corporate_status.reporting_status if corporate_status is not None else None,
     }
 
 
@@ -1272,61 +1290,102 @@ def _shadow_scheduler_run_view(row: dict) -> dict:
     return dict(row)
 
 
-def run_due_shadow_cycle_cli(db_path: Path) -> dict:
-    """`run-due-shadow-cycle` CLI command (docs/milestone-7.md Step 18/25).
-    Thin wiring only — delegates entirely to
+def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", symbols: list[str] | None = None) -> dict:
+    """`run-due-shadow-cycle` CLI command (docs/milestone-7.md Step 18/25;
+    docs/milestone-7.1.md Step 20). Thin wiring only — delegates entirely to
     `shadow/scheduler.py::run_due_shadow_cycle`. Every successful-no-op
     status (disabled, not-due, holiday, already-completed, lease-held,
     paused, killed) is NOT an error; only an actual internal exception is.
+
+    `--provider-mode fixture` (default) drives the offline/deterministic
+    path exactly as before this task — no network, no credentials, no real
+    Claude call. `--provider-mode real` builds the real SEC/corporate-status
+    provider and the configured market/news/sentiment providers (only those
+    explicitly enabled in `config/evidence_providers.yaml`), and, when
+    `research.yaml`'s `provider: anthropic`, the real Anthropic provider —
+    but ONLY after every preflight below passes. `real` is never selected
+    from credential presence alone; it requires this explicit flag.
     """
     from decimal import Decimal
     from datetime import timezone as _tz
 
     from .analysis.scorer import load_scoring_config
     from .analysis.screener import load_screening_config
-    from .evidence_providers.evidence_adapters import (
-        RealFilingEvidenceProvider,
-        RealFundamentalsEvidenceProvider,
-        RealMarketEvidenceProvider,
-    )
-    from .evidence_providers.fixture_clients import FixtureMarketDataClient, FixtureSecClient
     from .models.trading_models import PortfolioState
     from .research.configuration import load_research_config
     from .research.deterministic_provider import DeterministicResearchProvider
     from .research.prompt_registry import PromptRegistry
-    from .research.scheduled_cycle import EvidenceProviderRegistry, run_scheduled_research_cycle
+    from .research.scheduled_cycle import (
+        PROVIDER_MODE_FIXTURE,
+        PROVIDER_MODE_REAL,
+        run_scheduled_research_cycle,
+    )
     from .research.scheduled_research_config import load_scheduled_research_config
-    from .research.usage import load_pricing_config
+    from .research.usage import load_pricing_config, select_pricing
     from .shadow.config import load_shadow_operations_config
     from .shadow.scheduler import DEPLOYMENT_SOURCE_MANUAL, run_due_shadow_cycle
     from .storage.research_cycle_repositories import SQLiteResearchCycleRepository
     from .storage.research_repositories import SQLiteResearchRepository
     from .universe.tickers import default_universe
 
+    if provider_mode not in (PROVIDER_MODE_FIXTURE, PROVIDER_MODE_REAL):
+        return {"error": f"unknown --provider-mode {provider_mode!r} — must be 'fixture' or 'real'", "status": "INTERNAL_ERROR"}
+
     shadow_config = load_shadow_operations_config()
     sr_config = load_scheduled_research_config()
-    # This CLI entry point only ever drives the offline/fixture provider mode
-    # — a real-Claude scheduled run would require additional operator
-    # opt-in beyond this task's scope (matching the milestone doc's "manual
-    # smoke tests may remain separately gated" and this task's own
-    # instruction that the shipped default config is `enabled: false`).
-    cycle_config = sr_config.to_cycle_configuration(provider_mode="fixture")
+    cycle_config = sr_config.to_cycle_configuration(provider_mode=provider_mode)
     research_config = load_research_config()
     pricing_entries = load_pricing_config()
+    cfg = load_config()
 
-    def _cycle_kwargs_builder(symbols, as_of):
-        sec = FixtureSecClient()
-        market = FixtureMarketDataClient()
-        registry = EvidenceProviderRegistry(
-            fundamentals=RealFundamentalsEvidenceProvider(sec), market=RealMarketEvidenceProvider(market),
-            filings=RealFilingEvidenceProvider(sec), news=None, sentiment=None, portfolio_context=None,
-            market_data_client=market, sec_client=sec,
-        )
+    if provider_mode == PROVIDER_MODE_REAL:
+        research_provider_name = research_config.provider
+        research_model_name = research_config.model if research_config.provider == "anthropic" else f"{research_config.provider}-v1"
+    else:
+        research_provider_name, research_model_name = "deterministic", "deterministic-v1"
+
+    # --- Preflight: fail closed BEFORE any lease/budget/DB-session work
+    # (docs/milestone-7.1.md Step 21 pricing-failure requirement: "fail
+    # before lease work that could spend money, or before any Claude call").
+    if provider_mode == PROVIDER_MODE_REAL and research_config.provider == "anthropic":
+        research_config.require_ready()  # raises ResearchConfigError if model is unset
+        if not cfg.anthropic_api_key:
+            return {
+                "error": "research.provider=anthropic requires ANTHROPIC_API_KEY to be configured",
+                "status": "MISSING_CREDENTIALS",
+            }
+        as_of_date = datetime.now(_tz.utc).date().isoformat()
+        if select_pricing(pricing_entries, "anthropic", research_model_name or "", as_of_date) is None:
+            return {
+                "error": (
+                    f"no pricing configured for provider=anthropic model={research_model_name!r} "
+                    f"as_of={as_of_date!r} — scheduled real-Claude operation is blocked (fails closed)"
+                ),
+                "status": "PRICING_NOT_CONFIGURED",
+            }
+
+    candidate_symbols = tuple(s.upper() for s in symbols) if symbols else (
+        ("AAPL", "MSFT", "SHEL") if provider_mode == PROVIDER_MODE_FIXTURE else ()
+    )
+    if not candidate_symbols:
+        return {"error": "no candidate symbols supplied — pass --symbol at least once for --provider-mode real", "status": "INTERNAL_ERROR"}
+
+    def _cycle_kwargs_builder(cycle_symbols, as_of):
+        registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=cfg, conn=conn)
+        if provider_mode == PROVIDER_MODE_REAL and research_config.provider == "anthropic":
+            from .research.anthropic_provider import AnthropicProviderConfig, AnthropicResearchProvider
+
+            provider = AnthropicResearchProvider(AnthropicProviderConfig(
+                api_key=cfg.anthropic_api_key, request_timeout_seconds=research_config.request_timeout_seconds,
+                pricing_entries=pricing_entries,
+            ))
+        else:
+            provider = DeterministicResearchProvider()
         return dict(
             cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
             screening_config=load_screening_config(), scoring_config=load_scoring_config(),
-            evidence_providers=registry, research_provider=DeterministicResearchProvider(),
-            research_provider_name="deterministic", research_model_name="deterministic-v1",
+            evidence_providers=registry, research_provider=provider,
+            research_provider_name=research_provider_name, research_model_name=research_model_name,
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
             prompt_registry=PromptRegistry(),
             portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
@@ -1338,16 +1397,19 @@ def run_due_shadow_cycle_cli(db_path: Path) -> dict:
         with session(db_path) as conn:
             result = run_due_shadow_cycle(
                 now=now, conn=conn, shadow_config=shadow_config, cycle_configuration=cycle_config,
-                candidate_symbols=lambda: ("AAPL", "MSFT", "SHEL"), run_cycle=run_scheduled_research_cycle,
+                candidate_symbols=lambda: candidate_symbols, run_cycle=run_scheduled_research_cycle,
                 cycle_kwargs_builder=_cycle_kwargs_builder, pricing_entries=pricing_entries,
-                clock=lambda: datetime.now(_tz.utc), deployment_source=DEPLOYMENT_SOURCE_MANUAL,
+                clock=lambda: datetime.now(_tz.utc), research_provider_name=research_provider_name,
+                research_model_name=research_model_name, research_roles=research_config.roles,
+                deployment_source=DEPLOYMENT_SOURCE_MANUAL,
             )
     except Exception as exc:  # only a genuine internal error is non-zero-exit-worthy
         return {"error": str(exc), "status": "INTERNAL_ERROR"}
 
     return {
         "status": result.status, "is_successful_no_op": result.is_successful_no_op, "is_blocked": result.is_blocked,
-        "is_error": result.is_error, "scheduler_run_id": result.scheduler_run_id,
+        "is_error": result.is_error, "provider_mode": provider_mode, "research_provider": research_provider_name,
+        "research_model": research_model_name, "scheduler_run_id": result.scheduler_run_id,
         "intended_schedule_id": result.intended_schedule_id,
         "intended_schedule_time": result.intended_schedule_time.isoformat() if result.intended_schedule_time else None,
         "cycle_id": result.cycle_id, "symbols_attempted": result.symbols_attempted,
@@ -1786,7 +1848,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("evidence-provider-usage", help="Real evidence-provider request/cache-hit counts (Milestone 6)")
 
-    sub.add_parser("run-due-shadow-cycle", help="Single-invocation scheduler entry point for shadow operations (Milestone 7)")
+    p_run_due_shadow_cycle = sub.add_parser("run-due-shadow-cycle", help="Single-invocation scheduler entry point for shadow operations (Milestone 7)")
+    p_run_due_shadow_cycle.add_argument("--provider-mode", choices=("fixture", "real"), default="fixture")
+    p_run_due_shadow_cycle.add_argument("--symbol", dest="symbols", action="append", help="Repeatable; required for --provider-mode real")
 
     sub.add_parser("shadow-status", help="Current pause/kill state and recent shadow scheduler runs (Milestone 7)")
 
@@ -1988,7 +2052,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run-due-shadow-cycle":
         cfg = load_config()
-        outcome = run_due_shadow_cycle_cli(cfg.research_database_path)
+        outcome = run_due_shadow_cycle_cli(cfg.research_database_path, provider_mode=args.provider_mode, symbols=args.symbols)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 

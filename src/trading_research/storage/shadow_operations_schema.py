@@ -112,6 +112,47 @@ CREATE TABLE IF NOT EXISTS shadow_operator_actions (
     details TEXT,
     created_at TEXT NOT NULL
 );
+
+-- Milestone 7.1 (docs/milestone-7.1.md Steps 13-14): append-only audit trail
+-- of every pre-attempt role-budget check `shadow/attempt_controller.py`
+-- performs before a Claude call. Deterministic/idempotent check identity
+-- (`check_id`) so a resumed/retried attempt never creates a duplicate row.
+CREATE TABLE IF NOT EXISTS shadow_role_budget_checks (
+    check_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL,
+    scheduler_run_id TEXT,
+    cycle_id TEXT,
+    research_run_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    role TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model_name TEXT,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    remaining_input_tokens INTEGER,
+    remaining_output_tokens INTEGER,
+    remaining_latency_ms INTEGER,
+    remaining_cost_usd TEXT,
+    maximum_attempt_input_tokens INTEGER,
+    maximum_attempt_output_tokens INTEGER,
+    maximum_attempt_latency_ms INTEGER,
+    maximum_attempt_cost_usd TEXT,
+    checked_at TEXT NOT NULL
+);
+
+-- Milestone 7.1 (docs/milestone-7.1.md Step 15): idempotency companion for
+-- `shadow_budget_usage` — additive rather than an ALTER TABLE on the
+-- existing append-only usage table. One row per attempt_id ever charged;
+-- `record_actual_usage_for_attempt` checks this table before inserting a
+-- new `shadow_budget_usage` row, so a resumed cycle never double-charges
+-- the same attempt.
+CREATE TABLE IF NOT EXISTS shadow_budget_usage_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    usage_id TEXT NOT NULL,
+    reservation_id TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
 """
 
 SHADOW_OPERATIONS_INDEXES = """
@@ -125,6 +166,11 @@ CREATE INDEX IF NOT EXISTS idx_shadow_budget_usage_reservation ON shadow_budget_
 CREATE INDEX IF NOT EXISTS idx_shadow_pause_state_current ON shadow_pause_state(is_current);
 CREATE INDEX IF NOT EXISTS idx_shadow_operator_actions_type ON shadow_operator_actions(action_type);
 CREATE INDEX IF NOT EXISTS idx_shadow_operator_actions_created ON shadow_operator_actions(created_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_run ON shadow_role_budget_checks(scheduler_run_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_role ON shadow_role_budget_checks(role);
+CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_symbol ON shadow_role_budget_checks(symbol);
+CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_decision ON shadow_role_budget_checks(decision);
+CREATE INDEX IF NOT EXISTS idx_shadow_budget_usage_attempts_reservation ON shadow_budget_usage_attempts(reservation_id);
 """
 
 

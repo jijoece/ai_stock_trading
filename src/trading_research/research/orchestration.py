@@ -29,12 +29,14 @@ from .errors import (
 )
 from .evidence_validation import validate_snapshot_preconditions
 from .failure_taxonomy import (
+    CODE_BUDGET_EXHAUSTED,
     CODE_MANAGER_NOT_INVOKED,
     CODE_MISSING_BEAR_CASE,
     CODE_MISSING_REQUIRED_ROLE,
     CODE_RETRY_EXHAUSTED,
     CODE_SCHEMA_REQUIRED_FIELD_MISSING,
     CODE_UNSUPPORTED_MATERIAL_CLAIM,
+    STAGE_BUDGET_GATED,
     STAGE_CLAIM_EVIDENCE_VALIDATION,
     STAGE_MANAGER_SKIPPED,
     STAGE_REQUIRED_ROLE_FAILED,
@@ -86,6 +88,46 @@ class ResearchAttemptRecord:
     validated_payload_json: dict | None
     usage: UsageRecord
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class AttemptControlRequest:
+    """Framework-neutral description of one about-to-happen (or just-completed)
+    provider attempt (docs/milestone-7.1.md Step 12). Deliberately carries no
+    `shadow`/SQLite/budget-specific type — any `ResearchAttemptController`
+    implementation (a shadow-budget adapter, a rate limiter, a no-op) reads
+    only these framework-neutral fields."""
+
+    research_run_id: str
+    symbol: str
+    role: str
+    attempt_number: int
+    model_name: str
+    prompt_version: str
+    prompt_hash: str
+    max_input_tokens: int | None
+    max_output_tokens: int
+    requested_at: datetime
+
+
+@dataclass(frozen=True)
+class AttemptControlDecision:
+    allowed: bool
+    code: str
+    reason: str | None = None
+
+
+class ResearchAttemptController(Protocol):
+    """Optional, backward-compatible extension point (docs/milestone-7.1.md
+    Step 12). `research/orchestration.py` never imports `shadow` — a shadow-
+    specific implementation of this Protocol lives in
+    `shadow/attempt_controller.py` and is injected by the caller. Default
+    behavior (no controller supplied) is unchanged from every prior
+    milestone: every attempt proceeds, `after_attempt` is never called."""
+
+    def before_attempt(self, request: AttemptControlRequest) -> AttemptControlDecision: ...
+
+    def after_attempt(self, request: AttemptControlRequest, attempt: "ResearchAttemptRecord") -> None: ...
 
 
 @dataclass(frozen=True)
@@ -220,6 +262,7 @@ def _run_role_with_retries(
     configuration: ResearchConfiguration,
     clock: Callable[[], datetime],
     role_reports_for_manager: tuple[RoleResearchReport, ...] = (),
+    attempt_controller: "ResearchAttemptController | None" = None,
 ) -> tuple[RoleResearchReport | ResearchDecision | None, list[ResearchAttemptRecord], list[ResearchValidationFailure]]:
     attempts: list[ResearchAttemptRecord] = []
     all_failures: list[ResearchValidationFailure] = []
@@ -246,6 +289,39 @@ def _run_role_with_retries(
         created_at = clock()
         attempt_failures: list[ResearchValidationFailure] = []
 
+        control_request: "AttemptControlRequest | None" = None
+        if attempt_controller is not None:
+            control_request = AttemptControlRequest(
+                research_run_id=research_run_id, symbol=snapshot.symbol, role=role, attempt_number=attempt_number,
+                model_name=model_name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
+                max_input_tokens=None, max_output_tokens=configuration.max_output_tokens, requested_at=created_at,
+            )
+            control_decision = attempt_controller.before_attempt(control_request)
+            if not control_decision.allowed:
+                # No provider call — a budget/role-eligibility denial is
+                # structurally distinct from a provider failure (Step 12/13:
+                # "denial is not classified as provider failure"). Not
+                # retryable within this role invocation: the same denial
+                # would recur identically on the next attempt_number.
+                gate_failure = new_failure(
+                    research_run_id=research_run_id, attempt_id=attempt_id, role=role, attempt_number=attempt_number,
+                    stage=STAGE_BUDGET_GATED, code=CODE_BUDGET_EXHAUSTED,
+                    message=control_decision.reason or f"attempt gated: {control_decision.code}",
+                    retryable=False, model_name=model_name, prompt_version=prompt_def.version,
+                    schema_version=prompt_def.schema_version, occurred_at=created_at,
+                )
+                all_failures.append(gate_failure)
+                attempts.append(ResearchAttemptRecord(
+                    attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
+                    prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
+                    system_prompt_hash=prompt_registry.system_prompt_hash(), schema_version=prompt_def.schema_version,
+                    provider=provider_name, model_name=model_name, success=False,
+                    failure_reason=f"attempt gated: {control_decision.reason or control_decision.code}",
+                    raw_response_json=None, validated_payload_json=None,
+                    usage=_unavailable_usage(provider_name, model_name, role, attempt_number), created_at=created_at,
+                ))
+                break
+
         try:
             response = provider.generate_structured(request)
         except ProviderUnavailableError as exc:
@@ -263,6 +339,8 @@ def _run_role_with_retries(
                 raw_response_json=None, validated_payload_json=None,
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
             ))
+            if attempt_controller is not None and control_request is not None:
+                attempt_controller.after_attempt(control_request, attempts[-1])
             break  # not retryable — provider itself is not usable
         except _RETRYABLE_ERRORS as exc:
             if isinstance(exc, SchemaValidationError) and exc.schema_errors:
@@ -291,6 +369,8 @@ def _run_role_with_retries(
                 raw_response_json=None, validated_payload_json=None,
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
             ))
+            if attempt_controller is not None and control_request is not None:
+                attempt_controller.after_attempt(control_request, attempts[-1])
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 
@@ -357,6 +437,8 @@ def _run_role_with_retries(
                 raw_response_json=dict(response.parsed_json), validated_payload_json=None,
                 usage=response.usage, created_at=created_at,
             ))
+            if attempt_controller is not None and control_request is not None:
+                attempt_controller.after_attempt(control_request, attempts[-1])
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 
@@ -378,6 +460,8 @@ def _run_role_with_retries(
                 raw_response_json=dict(response.parsed_json), validated_payload_json=None,
                 usage=response.usage, created_at=created_at,
             ))
+            if attempt_controller is not None and control_request is not None:
+                attempt_controller.after_attempt(control_request, attempts[-1])
             validation_feedback = build_retry_feedback(tuple(claim_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 
@@ -389,6 +473,8 @@ def _run_role_with_retries(
             raw_response_json=dict(response.parsed_json), validated_payload_json=dict(response.parsed_json),
             usage=response.usage, created_at=created_at,
         ))
+        if attempt_controller is not None and control_request is not None:
+            attempt_controller.after_attempt(control_request, attempts[-1])
         return built, attempts, all_failures
 
     if configuration.max_attempts_per_role >= 1:
@@ -431,8 +517,16 @@ def analyze_with_research_committee(
     clock: Callable[[], datetime],
     run_mode: str,
     require_decision: bool = True,
+    attempt_controller: "ResearchAttemptController | None" = None,
 ) -> OrchestrationResult:
-    """`require_decision` (default `True`, preserving fail-closed production behavior):
+    """`attempt_controller` (docs/milestone-7.1.md Step 12, default `None` =
+    every prior milestone's exact behavior): an optional
+    `ResearchAttemptController` consulted before every analyst and manager
+    provider attempt, including retries. `research/orchestration.py` never
+    imports `shadow` — a shadow-budget-aware implementation is injected by
+    the caller (see `shadow/attempt_controller.py`).
+
+    `require_decision` (default `True`, preserving fail-closed production behavior):
     when `True` and `configuration.roles` does not include the manager role, raises
     `ManagerNotConfiguredError` immediately — before any provider call — rather than
     silently returning something that looks like a decision or making analyst-only calls
@@ -521,7 +615,7 @@ def analyze_with_research_committee(
         report, attempts, failures = _run_role_with_retries(
             role=role, research_run_id=research_run_id, snapshot=snapshot, provider=provider,
             provider_name=provider_name, model_name=model_name, prompt_registry=prompt_registry,
-            configuration=configuration, clock=clock,
+            configuration=configuration, clock=clock, attempt_controller=attempt_controller,
         )
         all_attempts.extend(attempts)
         all_failures.extend(failures)
@@ -602,6 +696,7 @@ def analyze_with_research_committee(
         role=MANAGER_ROLE, research_run_id=research_run_id, snapshot=snapshot, provider=provider,
         provider_name=provider_name, model_name=model_name, prompt_registry=prompt_registry,
         configuration=configuration, clock=clock, role_reports_for_manager=tuple(valid_reports),
+        attempt_controller=attempt_controller,
     )
     all_attempts.extend(manager_attempts)
     all_failures.extend(manager_failures)

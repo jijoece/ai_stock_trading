@@ -81,6 +81,35 @@ _SHELL_COMPANY_EXPLICIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Every 10-K/10-Q cover page carries the standard SEC checkbox question
+# ("Indicate by check mark whether the registrant is a shell company...")
+# regardless of whether the actual answer is Yes or No — a bare regex match
+# on "shell company" therefore matches nearly every filing's cover page
+# whether or not the filer is actually a shell company (confirmed against
+# real AAPL 10-K text during Milestone 7.1 real validation: this produced a
+# false CONFIRMED for a company that is obviously not a shell company).
+# `_looks_like_cover_page_checkbox_context` filters these boilerplate
+# matches out — never treats "the form asked the question" as "the answer
+# was yes" (the same fail-closed posture as every other status in this
+# module, applied to a false-positive risk instead of a false-negative one).
+_COVER_PAGE_CHECKBOX_MARKERS = (
+    "indicate by check mark",
+    "check the appropriate box",
+    "check if the registrant",
+)
+
+
+def _looks_like_cover_page_checkbox_context(text: str, match: re.Match, *, window_chars: int = 200) -> bool:
+    preceding = text[max(0, match.start() - window_chars):match.start()].lower()
+    return any(marker in preceding for marker in _COVER_PAGE_CHECKBOX_MARKERS)
+
+
+def _find_first_valid_explicit_match(text: str, pattern: re.Pattern) -> re.Match | None:
+    for candidate in pattern.finditer(text):
+        if not _looks_like_cover_page_checkbox_context(text, candidate):
+            return candidate
+    return None
+
 _BANKRUPTCY_EXPLICIT_RE = re.compile(
     r"\b(?:filed|filing)\s+(?:a\s+)?(?:voluntary\s+)?petition\s+(?:for|under)\s+(?:chapter\s+(?:7|11)|bankruptcy)",
     re.IGNORECASE,
@@ -144,7 +173,7 @@ def extract_disclosure(
         )
 
     explicit_re, ambiguous_re = _RULES[disclosure_type]
-    explicit_match = explicit_re.search(document.text)
+    explicit_match = _find_first_valid_explicit_match(document.text, explicit_re)
     if explicit_match:
         excerpt_hash, snippet = _excerpt(document.text, explicit_match)
         return DisclosureExtractionResult(

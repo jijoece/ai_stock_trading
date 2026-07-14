@@ -73,3 +73,43 @@ Before each role invocation inside a shadow cycle, `shadow/role_budget.py::check
 
 * Every money-affecting or Claude-cost-affecting decision in the shadow path is deterministic application code (lease, pause/kill, budget, health, alerts) — Claude's role is unchanged from ADR 0003: it analyzes supplied evidence and returns a decision object that deterministic code may or may not act on, and in the shadow-enhanced arm, never acts on for execution.
 * The known, accepted limitation this ADR records: real news and real Reddit sentiment remain code-complete but environmentally pending in this session (no Alpaca market-data credential pair, no Reddit app credentials configured) — a future session with those credentials present validates them without further code changes, per Decisions in `docs/adr/0004`'s own precedent for optional providers.
+
+## Milestone 7.1 closure (2026-07-13)
+
+When this ADR was accepted, Decision 6 ("role/token/attempt/latency/cost enforcement
+happens once per role call") and Decision 10's completeness-gates-Claude claim described
+**target** behavior only — Milestone 7's own scratchpad honestly recorded both as not yet
+wired into the running scheduler. Milestone 7.1 (`docs/milestone-7.1.md`,
+`docs/milestone7-1-shadow-integration-closure.md`) closed this gap:
+
+* Decision 6 is now RUNTIME-INTEGRATED: `shadow/attempt_controller.py::
+  ShadowResearchAttemptController` (a shadow-specific adapter to a new, framework-neutral
+  `research/orchestration.py::ResearchAttemptController` hook) checks
+  `shadow/role_budget.py::check_role_budget` before every analyst and manager attempt,
+  including retries, when the scheduler caller supplies `research_roles` — real-validated
+  against a live Claude API call (2 role-budget checks persisted, both `PROCEED`, before
+  the corresponding real attempts).
+* Decision 10 is now RUNTIME-INTEGRATED: `research/scheduled_cycle.py::_run_symbol` calls
+  `evaluate_completeness` automatically, before any Claude call, using a real corporate-status
+  fetch — real-validated against live SEC EDGAR data for AAPL.
+* Decision 5's own "actual usage... never fabricated" posture is now also
+  RUNTIME-INTEGRATED at attempt granularity, not just cycle granularity:
+  `shadow/budget.py::record_actual_usage_for_attempt` charges the reservation once per
+  real attempt (idempotent on `attempt_id`), settled and reconciled — real-validated
+  (`consumed_cost_usd` exactly equals the sum of persisted attempt-level priced usage
+  after a real Claude run).
+* `CycleIntent.model_name`/`.provider` are no longer derived from a
+  `cycle_configuration.provider_mode` guess — `run_due_shadow_cycle` now takes explicit
+  `research_provider_name`/`research_model_name` parameters, the single source of truth
+  for both budget-pricing lookup and the attempt-controller's role-budget checks.
+
+**What remains explicitly pending, honestly, after Milestone 7.1** (see that document's
+own "Known limitations"/"Deferred work" sections for full detail — not restated here to
+avoid this ADR drifting out of sync with the closure document over time):
+real Alpaca news/market-data, real Reddit sentiment, destructive retention, full-schema
+retention coverage, corporate-action evidence-registry wiring, and — unchanged from
+Decision 9 — no actual recurring deployment has ever been activated.
+
+This section does not rewrite the history above: every Decision 1-11 paragraph describes
+what was true and accepted at Milestone 7's own completion, including the target-vs-active
+distinction Milestone 7 itself documented honestly at the time.
