@@ -408,6 +408,27 @@ def test_end_to_end_real_scheduled_cycle_with_fixture_providers(conn):
     assert result.symbols_attempted == 1
 
 
+# --- Part 11 (docs/milestone-7.2.md): no automatic resume/kill-clear --------
+
+
+def test_scheduler_never_calls_resume_or_force_clear_kill():
+    """docs/milestone-7.2.md Part 11: no automatic resume, no automatic kill
+    clearing. Structural (AST-based) check on the orchestrator module
+    itself, mirroring `test_shadow_health.py::
+    test_apply_health_result_never_calls_resume`'s approach for `health.py`."""
+    import ast
+    import trading_research.shadow.scheduler as scheduler_module
+
+    source = Path(scheduler_module.__file__).read_text()
+    tree = ast.parse(source)
+    forbidden_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("resume", "force_clear_kill")
+    ]
+    assert forbidden_calls == []
+
+
 # --- Part 1 (this session): health/alerts wiring -----------------------------
 
 
@@ -505,7 +526,7 @@ def test_failed_cycle_raises_cycle_failed_alert_and_writes_health_summary(conn):
     summaries = list_run_summaries(conn)
     assert len(summaries) == 1
     assert summaries[0]["health_status"] in ("HEALTHY", "DEGRADED", "PAUSE_RECOMMENDED", "PAUSE_REQUIRED")
-    assert summaries[0]["policy_version"] == "health/v1"
+    assert summaries[0]["policy_version"] == "health/v2"
 
 
 def test_completed_cycle_writes_health_summary_with_real_provider_success_rate(conn):
@@ -524,6 +545,293 @@ def test_completed_cycle_writes_health_summary_with_real_provider_success_rate(c
     assert summaries[0]["health_status"] == "HEALTHY"
     # No alert on a fully-healthy COMPLETED cycle.
     assert list_alerts(conn) == []
+
+
+def test_retry_exhaustion_rate_denominator_reflects_roles_invoked_not_symbol_count(conn):
+    """docs/milestone-7.2.md Part 6-9: the real-validated bug. With 3
+    analyst roles configured and only ONE (technical) exhausting its
+    attempt budget while the other two succeed, the OLD denominator
+    (`len(research_run_ids)` == 1 symbol) produced `retry_exhaustion_rate ==
+    1.0` (100%) — a single role's failure misreported as if every attempted
+    role had failed. The FIXED denominator (`distinct_roles_invoked_count`
+    == 3) correctly reports `1/3`, staying under the 0.50 pause threshold."""
+    from trading_research.research.deterministic_provider import ScriptedResearchProvider, ScriptedStep
+    from trading_research.research.fixtures import build_fixture_snapshot
+    from trading_research.research.orchestration import analyze_with_research_committee
+    from trading_research.research.prompt_registry import PromptRegistry
+    from trading_research.research.scheduled_cycle import ResearchCycleResult
+    from trading_research.shadow.scheduler import _build_health_inputs_from_cycle_result
+    from trading_research.storage.research_repositories import SQLiteResearchRepository, save_evidence_snapshot
+    from tests.unit.test_attempt_control_hooks import ANALYST_PAYLOAD, _config
+
+    as_of = datetime(2026, 7, 13, tzinfo=timezone.utc)
+    snapshot = build_fixture_snapshot("AAPL", as_of, config_hash="d" * 64, git_sha="sha1", clock=lambda: as_of)
+    save_evidence_snapshot(conn, snapshot)
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
+        ("technical", 1): ScriptedStep(kind="malformed", raw_text="bad"),
+        ("bull", 1): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
+    })
+    repo = SQLiteResearchRepository(conn)
+    orchestration_result = analyze_with_research_committee(
+        snapshot, provider=provider, provider_name="scripted", model_name="test-model", prompt_registry=PromptRegistry(),
+        research_repository=repo, configuration=_config(roles=("fundamental", "technical", "bull", "manager"), max_attempts_per_role=1),
+        clock=lambda: as_of, run_mode="scripted",
+    )
+
+    cycle_result = ResearchCycleResult(
+        cycle_id="cycle-test", universe_id="test-universe", as_of=as_of, status="COMPLETED",
+        symbol_results=(
+            SymbolCycleResult(
+                symbol="AAPL", status="COMPLETED", evidence_outcome="COMPLETE",
+                research_run_id=orchestration_result.research_run_id,
+            ),
+        ),
+        reused_existing_cycle=False,
+    )
+    inputs = _build_health_inputs_from_cycle_result(
+        conn, cycle_result, symbols_attempted=1, cycle_duration_seconds=1.0,
+    )
+    assert inputs.retry_exhaustion_rate == pytest.approx(1 / 3)
+    assert inputs.retry_exhaustion_rate < 0.50  # correctly under the pause threshold
+
+
+def test_emergency_margin_breach_is_reflected_in_budget_breached_health_input(conn):
+    """docs/milestone-7.2.md Part 9 fix: `budget_breached` was previously
+    ALWAYS the CycleHealthInputs default (False) — `check_emergency_margin_breach`
+    existed and was fully unit-tested but was never called from the
+    scheduler. Pre-inflate the reservation this cycle will idempotently
+    reuse (same `shadow-budget:{intended_schedule_id}` key) so its consumed
+    cost already exceeds the configured emergency margin before
+    `run_due_shadow_cycle` even starts the cycle."""
+    from trading_research.shadow import budget as budget_mod
+    from trading_research.shadow import schedule as schedule_mod
+
+    shadow_config = _shadow_config(safety={"pause_on_budget_breach": True})
+    intended_time = schedule_mod.intended_schedule_time_for_day(DUE_NOW.date(), shadow_config)
+    intended_id = schedule_mod.intended_schedule_id(intended_time)
+    idempotency_key = f"shadow-budget:{intended_id}"
+
+    intent = budget_mod.CycleIntent(
+        provider="deterministic", model_name=None, max_symbols_per_cycle=1, max_roles_per_symbol=1,
+        max_attempts_per_role=1, max_output_tokens_per_cycle=100, max_input_tokens_per_cycle=100,
+        max_latency_seconds_per_cycle=60,
+    )
+    estimate = budget_mod.estimate_cycle_cost(intent, (), DUE_NOW.date().isoformat())
+    reservation = budget_mod.reserve_budget(
+        conn, idempotency_key, intent, estimate, max_actual_cost_per_day_usd=Decimal("10"),
+        max_actual_cost_per_month_usd=Decimal("100"), clock=_clock_at(DUE_NOW),
+    )
+    # Reserved cost is $0 (non-anthropic provider) — any positive consumed
+    # cost at all exceeds `reserved * (1 + margin)` for a zero reservation.
+    budget_mod.record_actual_usage(
+        conn, reservation.reservation_id, actual_cost_usd=Decimal("50.00"), actual_input_tokens=0,
+        actual_output_tokens=0, actual_latency_seconds=0, provider="deterministic", model_name=None,
+        clock=_clock_at(DUE_NOW),
+    )
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn, shadow_config=shadow_config))
+    assert result.status == STATUS_COMPLETED
+
+    from trading_research.storage.shadow_alerts_repositories import list_run_summaries
+    summaries = list_run_summaries(conn)
+    assert summaries[0]["health_status"] == "PAUSE_REQUIRED"
+    assert "budget_breached is True" in summaries[0]["health_reasons_json"]
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_PAUSED_BUDGET
+
+    from trading_research.storage.shadow_alerts_repositories import list_alerts
+
+    alerts = [a for a in list_alerts(conn) if a["alert_type"] == "PAUSE_ACTIVATED"]
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "CRITICAL"
+    assert "budget_breached is True" in alerts[0]["message"]
+
+
+def test_budget_breach_with_flag_disabled_recommends_pause_and_alerts_but_does_not_pause(conn):
+    """docs/milestone-7.2.md Part 11: `PAUSE_RECOMMENDED -> alert only`."""
+    from trading_research.shadow import budget as budget_mod
+    from trading_research.shadow import schedule as schedule_mod
+
+    shadow_config = _shadow_config(safety={"pause_on_budget_breach": False})
+    intended_time = schedule_mod.intended_schedule_time_for_day(DUE_NOW.date(), shadow_config)
+    intended_id = schedule_mod.intended_schedule_id(intended_time)
+    idempotency_key = f"shadow-budget:{intended_id}"
+
+    intent = budget_mod.CycleIntent(
+        provider="deterministic", model_name=None, max_symbols_per_cycle=1, max_roles_per_symbol=1,
+        max_attempts_per_role=1, max_output_tokens_per_cycle=100, max_input_tokens_per_cycle=100,
+        max_latency_seconds_per_cycle=60,
+    )
+    estimate = budget_mod.estimate_cycle_cost(intent, (), DUE_NOW.date().isoformat())
+    reservation = budget_mod.reserve_budget(
+        conn, idempotency_key, intent, estimate, max_actual_cost_per_day_usd=Decimal("10"),
+        max_actual_cost_per_month_usd=Decimal("100"), clock=_clock_at(DUE_NOW),
+    )
+    budget_mod.record_actual_usage(
+        conn, reservation.reservation_id, actual_cost_usd=Decimal("50.00"), actual_input_tokens=0,
+        actual_output_tokens=0, actual_latency_seconds=0, provider="deterministic", model_name=None,
+        clock=_clock_at(DUE_NOW),
+    )
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn, shadow_config=shadow_config))
+    assert result.status == STATUS_COMPLETED  # an expected health verdict is never a scheduler crash
+
+    from trading_research.storage.shadow_alerts_repositories import list_alerts, list_run_summaries
+
+    summaries = list_run_summaries(conn)
+    assert summaries[0]["health_status"] == "PAUSE_RECOMMENDED"
+    # No automatic pause — the flag was disabled.
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_ACTIVE
+
+    alerts = [a for a in list_alerts(conn) if a["alert_type"] == "PAUSE_ACTIVATED"]
+    assert len(alerts) == 1
+    assert alerts[0]["severity"] == "WARNING"
+    assert "no automatic action taken" in alerts[0]["message"]
+
+
+def test_healthy_cycle_raises_no_pause_alert(conn):
+    """docs/milestone-7.2.md Part 11: `HEALTHY -> no pause` and no alert."""
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    assert result.status == STATUS_COMPLETED
+    from trading_research.storage.shadow_alerts_repositories import list_alerts, list_run_summaries
+
+    assert list_run_summaries(conn)[0]["health_status"] == "HEALTHY"
+    assert list_alerts(conn) == []
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_ACTIVE
+
+
+def test_degraded_cycle_raises_no_pause_alert_and_no_pause(conn):
+    """docs/milestone-7.2.md Part 11: `DEGRADED -> no automatic pause` (and
+    no alert either — DEGRADED is this module's own "approaching the line"
+    interpretation, not a configured policy breach)."""
+    from trading_research.research.scheduled_cycle import ResearchCycleResult
+
+    def _stub_one_of_two_symbols_fails(*, as_of, symbols, configuration, conn, clock, **_kwargs):
+        results = tuple(
+            SymbolCycleResult(symbol=s, status="COMPLETED" if i == 0 else "FAILED", evidence_outcome="COMPLETE")
+            for i, s in enumerate(symbols)
+        )
+        return ResearchCycleResult(
+            cycle_id=f"cycle-{as_of.isoformat()}", universe_id=configuration.universe_id, as_of=as_of,
+            status="PARTIALLY_COMPLETE", symbol_results=results, reused_existing_cycle=False,
+        )
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW),
+        **_base_kwargs(conn, run_cycle=_stub_one_of_two_symbols_fails, symbols=("AAPL", "MSFT")),
+    )
+    assert result.status == "PARTIALLY_COMPLETE"
+
+    from trading_research.storage.shadow_alerts_repositories import list_run_summaries
+
+    summary = [s for s in list_run_summaries(conn) if s["scheduler_run_id"] == result.scheduler_run_id][0]
+    assert summary["provider_success_rate"] == 0.5  # 1 of 2 symbols completed -> failure_rate 0.5
+    assert summary["health_status"] == "DEGRADED"  # 0.5 > degraded threshold 0.3, not > pause threshold 0.5
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_ACTIVE
+
+    from trading_research.storage.shadow_alerts_repositories import list_alerts
+
+    assert [a for a in list_alerts(conn) if a["alert_type"] == "PAUSE_ACTIVATED"] == []
+
+
+def test_pause_alert_context_excludes_scheduler_run_id_so_dedup_actually_works(conn):
+    """docs/milestone-7.2.md Part 11: duplicate pause alerts deduplicate.
+    The scheduler's health-triggered alert context deliberately excludes
+    `scheduler_run_id` (always unique per invocation) — otherwise two
+    scheduler runs producing the IDENTICAL underlying health condition
+    (same `health_status`/`triggering_flags`/`health_reasons`) would never
+    share a `dedup_key` and `raise_alert`'s suppression could never fire.
+    Verified directly against `shadow/alerts.py::raise_alert` using the EXACT
+    context shape `shadow/scheduler.py` builds for this alert (Part 11's own
+    "duplicate pause alerts deduplicate" requirement), rather than fighting
+    the scheduler's own daily-cadence idempotency to force two due cycles
+    within one 15-minute dedup window."""
+    from trading_research.shadow import alerts as alerts_mod
+
+    context = {
+        "pause_state": pause_mod.STATE_PAUSED_BUDGET, "health_status": "PAUSE_REQUIRED",
+        "triggering_flags": ["budget_breach"], "health_reasons": ["budget_breached is True"],
+    }
+    alert1 = alerts_mod.OperationalAlert(
+        severity=alerts_mod.SEVERITY_CRITICAL, alert_type=alerts_mod.ALERT_TYPE_PAUSE_ACTIVATED,
+        message="shadow operations automatically paused (PAUSED_BUDGET) after scheduler run shadow-run-AAA: budget_breached is True",
+        context=context, created_at=DUE_NOW,
+    )
+    alert2 = alerts_mod.OperationalAlert(
+        severity=alerts_mod.SEVERITY_CRITICAL, alert_type=alerts_mod.ALERT_TYPE_PAUSE_ACTIVATED,
+        message="shadow operations automatically paused (PAUSED_BUDGET) after scheduler run shadow-run-BBB: budget_breached is True",
+        context=context, created_at=DUE_NOW,
+    )
+    assert alert1.dedup_key == alert2.dedup_key  # identical despite different scheduler_run_id in the message only
+
+    sinks = (alerts_mod.PersistenceOnlyAlertSink(),)
+    alerts_mod.raise_alert(conn, alert1, sinks, _clock_at(DUE_NOW))
+    alerts_mod.raise_alert(conn, alert2, sinks, _clock_at(DUE_NOW))
+
+    from trading_research.storage.shadow_alerts_repositories import list_alerts
+
+    pause_alerts = [a for a in list_alerts(conn) if a["alert_type"] == "PAUSE_ACTIVATED"]
+    assert len(pause_alerts) == 1  # the second, identical alert was suppressed, not duplicated
+    assert pause_alerts[0]["suppressed_count"] == 1  # but the suppression itself is recorded
+
+
+def test_completed_cycle_persists_one_health_check_per_dimension(conn):
+    from trading_research.shadow.health import CHECK_NAMES_IN_ORDER
+    from trading_research.storage.shadow_alerts_repositories import list_health_checks
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    checks = list_health_checks(conn, scheduler_run_id=result.scheduler_run_id)
+    assert {c["check_name"] for c in checks} == set(CHECK_NAMES_IN_ORDER)
+    assert len(checks) == len(CHECK_NAMES_IN_ORDER)
+    for c in checks:
+        assert c["policy_version"] == "health/v2"
+        assert c["scheduler_run_id"] == result.scheduler_run_id
+
+
+def test_health_checks_queryable_by_cycle_id(conn):
+    from trading_research.storage.shadow_alerts_repositories import list_health_checks
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    checks = list_health_checks(conn, cycle_id=result.cycle_id)
+    assert len(checks) > 0
+    assert all(c["cycle_id"] == result.cycle_id for c in checks)
+
+
+def test_health_checks_queryable_by_check_name(conn):
+    from trading_research.storage.shadow_alerts_repositories import list_health_checks
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    checks = list_health_checks(conn, check_name="provider_failure_rate")
+    assert len(checks) == 1
+    assert checks[0]["scheduler_run_id"] == result.scheduler_run_id
+
+
+def test_health_checks_not_duplicated_on_reevaluation(conn):
+    from trading_research.shadow import health as health_mod
+    from trading_research.storage.shadow_alerts_repositories import list_health_checks
+
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    before = list_health_checks(conn, scheduler_run_id=result.scheduler_run_id)
+
+    # Simulate a resumed/re-evaluated invocation persisting the identical
+    # checks a second time for the same scheduler_run_id — must be a no-op.
+    from trading_research.shadow.scheduler import _save_health_checks
+
+    inputs = health_mod.CycleHealthInputs(
+        provider_success_rate=1.0, evidence_completeness_rate=1.0, claude_role_success_rate=None, retry_rate=None,
+        retry_exhaustion_rate=None, unsupported_claim_rate=None, output_truncation_rate=None, latency_seconds=None,
+        input_tokens=None, output_tokens=None, cost_usd=None, pricing_configured=True,
+        paper_reconciliation_mismatch=False, duplicate_prevention_violation=False, cycle_duration_seconds=1.0,
+    )
+    config = health_mod.HealthPolicyConfig.from_shadow_config(_shadow_config())
+    health_result = health_mod.evaluate_cycle_health(inputs, config)
+    _save_health_checks(
+        conn, scheduler_run_id=result.scheduler_run_id, cycle_id=result.cycle_id, health_result=health_result,
+        clock=_clock_at(DUE_NOW),
+    )
+    after = list_health_checks(conn, scheduler_run_id=result.scheduler_run_id)
+    assert len(after) == len(before)
 
 
 def test_partially_complete_cycle_raises_partial_alert(conn):

@@ -24,6 +24,7 @@ from trading_research.cli import (
     shadow_alerts_cli,
     shadow_budget_status_cli,
     shadow_force_clear_kill_cli,
+    shadow_health_explain_cli,
     shadow_kill_cli,
     shadow_lease_status_cli,
     shadow_pause_cli,
@@ -88,6 +89,19 @@ def test_shadow_readiness_insufficient_data_when_empty(db_path):
     assert outcome["overall_status"] in ("INSUFFICIENT_DATA", "NOT_READY")
     assert "categories" in outcome
     assert len(outcome["categories"]) > 0
+
+
+def test_shadow_readiness_includes_activation_readiness_block(db_path):
+    """docs/milestone-7.2.md Part 12: `shadow-readiness` also reports the
+    honest manual-vs-recurring activation decision."""
+    outcome = shadow_readiness_cli(db_path)
+    assert "activation_readiness" in outcome
+    assert outcome["activation_readiness"]["status"] in (
+        "READY_FOR_MANUAL_SHADOW_RUNS", "READY_FOR_LIMITED_RECURRING_SHADOW", "NOT_READY_HEALTH_UNEXPLAINED",
+        "NOT_READY_PAUSE_ACTIVE", "NOT_READY_PRICING", "NOT_READY_PROVIDER_HEALTH",
+        "NOT_READY_INSUFFICIENT_HISTORY", "ENVIRONMENTALLY_BLOCKED",
+    )
+    assert isinstance(outcome["activation_readiness"]["reasons"], list)
 
 
 # --- shadow-run-history ------------------------------------------------------
@@ -205,6 +219,83 @@ def test_shadow_kill_requires_reason_and_operator(db_path):
 def test_shadow_lease_status_empty_db(db_path):
     outcome = shadow_lease_status_cli(db_path)
     assert outcome["leases"] == []
+
+
+# --- shadow-health-explain (Milestone 7.2) ------------------------------------
+
+
+def test_shadow_health_explain_requires_a_selector(db_path):
+    outcome = shadow_health_explain_cli(db_path)
+    assert "error" in outcome
+
+
+def test_shadow_health_explain_unknown_scheduler_run_id_errors(db_path):
+    outcome = shadow_health_explain_cli(db_path, scheduler_run_id="nope")
+    assert "error" in outcome
+
+
+def test_shadow_health_explain_unknown_cycle_id_errors(db_path):
+    outcome = shadow_health_explain_cli(db_path, cycle_id="nope")
+    assert "error" in outcome
+
+
+def _run_one_completed_cycle(db_path):
+    from datetime import datetime
+
+    from zoneinfo import ZoneInfo
+
+    from trading_research.shadow.scheduler import run_due_shadow_cycle
+    from tests.unit.test_shadow_scheduler import RAW_BASE, _cycle_configuration, _stub_run_cycle_success
+    from trading_research.shadow.config import load_shadow_operations_config
+    import tempfile
+    import yaml
+
+    la = ZoneInfo("America/Los_Angeles")
+    due_now = datetime(2026, 7, 13, 7, 0, tzinfo=la)
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg_path = Path(tmp) / "shadow_operations.yaml"
+        cfg_path.write_text(yaml.safe_dump(RAW_BASE))
+        shadow_config = load_shadow_operations_config(cfg_path)
+
+    with session(db_path) as conn:
+        result = run_due_shadow_cycle(
+            now=due_now, conn=conn, clock=lambda: due_now, shadow_config=shadow_config,
+            cycle_configuration=_cycle_configuration(), candidate_symbols=lambda: ("AAPL",),
+            run_cycle=_stub_run_cycle_success, cycle_kwargs_builder=lambda symbols, as_of: {}, pricing_entries=(),
+        )
+    return result
+
+
+def test_shadow_health_explain_by_scheduler_run_id(db_path):
+    result = _run_one_completed_cycle(db_path)
+    outcome = shadow_health_explain_cli(db_path, scheduler_run_id=result.scheduler_run_id)
+    assert "error" not in outcome
+    assert outcome["scheduler_run_id"] == result.scheduler_run_id
+    assert outcome["health_status"] in ("HEALTHY", "DEGRADED", "PAUSE_RECOMMENDED", "PAUSE_REQUIRED")
+    assert outcome["policy_version"] == "health/v2"
+    assert isinstance(outcome["reasons"], list)
+    assert isinstance(outcome["triggering_flags"], list)
+    from trading_research.shadow.health import CHECK_NAMES_IN_ORDER
+
+    assert [c["check_name"] for c in outcome["checks"]] == list(CHECK_NAMES_IN_ORDER)
+
+
+def test_shadow_health_explain_by_cycle_id(db_path):
+    result = _run_one_completed_cycle(db_path)
+    outcome = shadow_health_explain_cli(db_path, cycle_id=result.cycle_id)
+    assert "error" not in outcome
+    assert outcome["scheduler_run_id"] == result.scheduler_run_id
+    assert outcome["cycle_id"] == result.cycle_id
+
+
+def test_shadow_health_explain_output_deterministic_and_sanitized(db_path):
+    result = _run_one_completed_cycle(db_path)
+    outcome1 = shadow_health_explain_cli(db_path, scheduler_run_id=result.scheduler_run_id)
+    outcome2 = shadow_health_explain_cli(db_path, scheduler_run_id=result.scheduler_run_id)
+    assert outcome1 == outcome2
+    serialized = str(outcome1).lower()
+    for forbidden in ("api_key", "authorization", "sk-ant-", "password", "secret", "bearer "):
+        assert forbidden not in serialized
 
 
 # --- retention-plan / retention-apply -----------------------------------------

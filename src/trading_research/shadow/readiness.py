@@ -23,9 +23,10 @@ from ..research.failure_metrics import (
     compute_research_failure_metrics,
 )
 from ..storage.research_repositories import list_all_attempt_failures, list_attempt_rows_for_metrics
-from ..storage.shadow_alerts_repositories import list_alert_deliveries, list_alerts, list_run_summaries
+from ..storage.shadow_alerts_repositories import list_alert_deliveries, list_alerts, list_health_checks, list_run_summaries
 from ..storage.shadow_operations_repositories import list_scheduler_runs
 from .config import ShadowOperationsConfiguration
+from . import pause as pause_mod
 
 POLICY_VERSION = "readiness/v1"
 
@@ -340,4 +341,184 @@ def build_readiness_report(
         average_cycle_duration_seconds=avg_duration, scheduler_miss_count=scheduler_misses,
         lease_conflict_count=lease_conflicts, reconciliation_mismatch_count=reconciliation_mismatches,
         alert_delivery_failure_count=alert_delivery_failures, reasons=tuple(overall_reasons),
+    )
+
+
+# --- Activation readiness (docs/milestone-7.2.md Part 12) ---------------------
+# Extends (does not replace) `build_readiness_report` above with an explicit,
+# honest activation decision: is shadow operations ready for MANUAL invocation
+# only, or for LIMITED RECURRING (unattended, scheduled) operation? Built on
+# top of the existing category readiness, the real pause state, and the
+# field-level health-check persistence this milestone added — never a new,
+# independent data source.
+
+ACTIVATION_READY_FOR_MANUAL_SHADOW_RUNS = "READY_FOR_MANUAL_SHADOW_RUNS"
+ACTIVATION_READY_FOR_LIMITED_RECURRING_SHADOW = "READY_FOR_LIMITED_RECURRING_SHADOW"
+ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED = "NOT_READY_HEALTH_UNEXPLAINED"
+ACTIVATION_NOT_READY_PAUSE_ACTIVE = "NOT_READY_PAUSE_ACTIVE"
+ACTIVATION_NOT_READY_PRICING = "NOT_READY_PRICING"
+ACTIVATION_NOT_READY_PROVIDER_HEALTH = "NOT_READY_PROVIDER_HEALTH"
+ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY = "NOT_READY_INSUFFICIENT_HISTORY"
+ACTIVATION_ENVIRONMENTALLY_BLOCKED = "ENVIRONMENTALLY_BLOCKED"
+
+ACTIVATION_READINESS_STATUSES = (
+    ACTIVATION_READY_FOR_MANUAL_SHADOW_RUNS, ACTIVATION_READY_FOR_LIMITED_RECURRING_SHADOW,
+    ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED, ACTIVATION_NOT_READY_PAUSE_ACTIVE, ACTIVATION_NOT_READY_PRICING,
+    ACTIVATION_NOT_READY_PROVIDER_HEALTH, ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY,
+    ACTIVATION_ENVIRONMENTALLY_BLOCKED,
+)
+
+
+@dataclass(frozen=True)
+class ActivationReadinessResult:
+    status: str
+    reasons: tuple[str, ...]
+    readiness_report: ReadinessReport
+
+    def __post_init__(self) -> None:
+        if self.status not in ACTIVATION_READINESS_STATUSES:
+            raise ReadinessPolicyError(f"activation status {self.status!r} is not one of {ACTIVATION_READINESS_STATUSES} — fails closed")
+
+
+def _unexplained_pause_required_runs(conn) -> list[str]:
+    """Scheduler runs whose `shadow_run_summaries.health_status ==
+    PAUSE_REQUIRED` but carry ZERO persisted `shadow_run_health_checks` rows
+    — a `PAUSE_REQUIRED` this milestone's own diagnostics cannot explain
+    (e.g. a run predating this milestone's persistence, or a persistence
+    failure). Returns the affected `scheduler_run_id`s, never fabricated."""
+    unexplained = []
+    for summary in list_run_summaries(conn):
+        if summary["health_status"] != "PAUSE_REQUIRED":
+            continue
+        checks = list_health_checks(conn, scheduler_run_id=summary["scheduler_run_id"])
+        if not checks:
+            unexplained.append(summary["scheduler_run_id"])
+    return unexplained
+
+
+def _latest_run_safety_flags(conn) -> tuple[bool, bool]:
+    """`(paper_reconciliation_mismatch, duplicate_prevention_violation)` from
+    the most recent scheduler run's persisted health checks — `False, False`
+    when no run has ever completed (never fabricated `True`)."""
+    summaries = list_run_summaries(conn)
+    if not summaries:
+        return False, False
+    checks = list_health_checks(conn, scheduler_run_id=summaries[0]["scheduler_run_id"])
+    by_name = {c["check_name"]: c for c in checks}
+    recon = by_name.get("paper_reconciliation_mismatch")
+    dup = by_name.get("duplicate_prevention_violation")
+    return (
+        recon is not None and recon["input_value"] == "True",
+        dup is not None and dup["input_value"] == "True",
+    )
+
+
+def _pricing_not_configured_in_history(conn) -> bool:
+    """`True` only if some run's `cost_usd_pricing` check genuinely FAILed
+    (real cost accrued, pricing unverifiable) — never inferred from the
+    mere absence of any real-provider run (that case is `INSUFFICIENT_DATA`,
+    not a pricing failure)."""
+    for summary in list_run_summaries(conn):
+        checks = list_health_checks(conn, scheduler_run_id=summary["scheduler_run_id"])
+        cost_check = next((c for c in checks if c["check_name"] == "cost_usd_pricing"), None)
+        if cost_check is not None and cost_check["check_status"] == "FAIL":
+            return True
+    return False
+
+
+def evaluate_activation_readiness(
+    conn, as_of: datetime, config: ShadowOperationsConfiguration, *, thresholds: ReadinessThresholds | None = None,
+    environmentally_blocked_reason: str | None = None,
+) -> ActivationReadinessResult:
+    """Honest activation decision (docs/milestone-7.2.md Part 12). Never
+    claims `ACTIVATION_READY_FOR_LIMITED_RECURRING_SHADOW` merely because a
+    `PAUSE_REQUIRED` result is now *explained* — the minimum completed-cycle
+    and real-provider-cycle floors (`build_readiness_report`'s own, unchanged
+    since Milestone 7) must independently be satisfied. `allow_enhanced_submission`
+    is structurally impossible to be `true` (`ShadowOperationsSection.__post_init__`)
+    and no live-trading path exists anywhere in this repository — "no enhanced
+    or live execution" is therefore a standing structural invariant, not a
+    runtime check this function performs.
+
+    `environmentally_blocked_reason` (optional, caller-supplied): set by a CLI
+    layer that has already determined a hard environmental block (e.g. a
+    configured real-Claude provider with no `ANTHROPIC_API_KEY` present) —
+    this function itself never inspects environment variables or credentials,
+    matching this module's existing "aggregates only already-persisted data"
+    boundary.
+    """
+    readiness_report = build_readiness_report(conn, as_of, config, thresholds=thresholds)
+    reasons: list[str] = []
+
+    if environmentally_blocked_reason:
+        return ActivationReadinessResult(
+            status=ACTIVATION_ENVIRONMENTALLY_BLOCKED, reasons=(environmentally_blocked_reason,),
+            readiness_report=readiness_report,
+        )
+
+    pause_state = pause_mod.current_state(conn)
+    if pause_state.is_blocking:
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_PAUSE_ACTIVE,
+            reasons=(f"pause state is {pause_state.state} ({pause_state.reason})",), readiness_report=readiness_report,
+        )
+
+    reconciliation_mismatch, duplicate_violation = _latest_run_safety_flags(conn)
+    if reconciliation_mismatch or duplicate_violation:
+        flagged = []
+        if reconciliation_mismatch:
+            flagged.append("paper_reconciliation_mismatch")
+        if duplicate_violation:
+            flagged.append("duplicate_prevention_violation")
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_PAUSE_ACTIVE,
+            reasons=(f"most recent run flags {flagged} True — investigate before considering ready",),
+            readiness_report=readiness_report,
+        )
+
+    unexplained = _unexplained_pause_required_runs(conn)
+    if unexplained:
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED,
+            reasons=(f"scheduler run(s) {unexplained} report PAUSE_REQUIRED with no persisted health-check explanation",),
+            readiness_report=readiness_report,
+        )
+
+    if _pricing_not_configured_in_history(conn):
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_PRICING,
+            reasons=("at least one run accrued real cost with pricing unverifiable (cost_usd_pricing check FAILED)",),
+            readiness_report=readiness_report,
+        )
+
+    provider_category = next((c for c in readiness_report.categories if c.category == "provider"), None)
+    if provider_category is not None and provider_category.status == STATUS_NOT_READY:
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_PROVIDER_HEALTH, reasons=provider_category.reasons,
+            readiness_report=readiness_report,
+        )
+
+    if readiness_report.overall_status == STATUS_INSUFFICIENT_DATA:
+        return ActivationReadinessResult(
+            status=ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY, reasons=readiness_report.reasons,
+            readiness_report=readiness_report,
+        )
+
+    if readiness_report.overall_status in (STATUS_READY, STATUS_READY_WITH_WARNINGS):
+        reasons.append(
+            "no unexplained PAUSE_REQUIRED; pause state ACTIVE; pricing verified where accrued; "
+            "minimum completed-cycle and real-provider-cycle history satisfied"
+        )
+        return ActivationReadinessResult(
+            status=ACTIVATION_READY_FOR_LIMITED_RECURRING_SHADOW, reasons=tuple(reasons),
+            readiness_report=readiness_report,
+        )
+
+    # Some other NOT_READY category (e.g. evidence/research/scheduler/paper/
+    # operational) exists, but none of the specific gates above tripped —
+    # manual invocation remains reasonable (an operator watching each run),
+    # recurring unattended operation is not.
+    reasons.append(f"readiness category status(es): {[(c.category, c.status) for c in readiness_report.categories]}")
+    return ActivationReadinessResult(
+        status=ACTIVATION_READY_FOR_MANUAL_SHADOW_RUNS, reasons=tuple(reasons), readiness_report=readiness_report,
     )

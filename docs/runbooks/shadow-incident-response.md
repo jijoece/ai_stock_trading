@@ -11,6 +11,17 @@ directly (`SELECT * FROM shadow_role_budget_checks WHERE scheduler_run_id = ?`) 
 only inferring budget state from `shadow-budget-status`. See
 `docs/milestone7-1-shadow-integration-closure.md` for the full closure detail.
 
+**Milestone 7.2 update:** for ANY unexplained `health_status` (`DEGRADED`/`PAUSE_RECOMMENDED`/
+`PAUSE_REQUIRED`), run `shadow-health-explain --scheduler-run-id <id>` first — it returns the
+exact input value, threshold, comparison, and pause-flag state for every one of the 16 health
+dimensions, not just the summary reasons string. A health-triggered pause/recommendation now
+also appears in `shadow-alerts` (`alert_type=PAUSE_ACTIVATED`), so `shadow-alerts` is no longer
+silent about an automatic pause the way it was before this update. If `retry_exhaustion_rate`
+is the triggering dimension, remember its denominator is "roles actually invoked this cycle,"
+not "symbols" — a single required role failing its only attempt can legitimately produce a
+100% rate when only that one role ever ran (see
+`docs/milestone7-2-shadow-health-diagnostics.md` Section 7 for the real, investigated example).
+
 ## First response — always start here
 
 Before taking any action (resuming, force-clearing a kill, force-releasing a lease), run

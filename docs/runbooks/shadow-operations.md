@@ -20,6 +20,21 @@ for `provider: anthropic`, a matching `config/research_pricing.yaml` entry and
 `ANTHROPIC_API_KEY` — missing any of these fails closed before any lease/DB work, reported
 as `MISSING_CREDENTIALS`/`PRICING_NOT_CONFIGURED` in the CLI's JSON output.
 
+**Milestone 7.2 update:** every `run-due-shadow-cycle` invocation that reaches health
+evaluation now persists one field-level diagnostic row per health dimension. Explain any
+run's verdict directly:
+
+```bash
+python -m trading_research.cli shadow-health-explain --scheduler-run-id <id>
+python -m trading_research.cli shadow-health-explain --cycle-id <id>
+```
+
+`shadow-readiness` also now reports an `activation_readiness` block (`READY_FOR_MANUAL_SHADOW_RUNS`
+/ `READY_FOR_LIMITED_RECURRING_SHADOW` / `NOT_READY_*` / `ENVIRONMENTALLY_BLOCKED`) — see
+`docs/milestone7-2-shadow-health-diagnostics.md` for the full vocabulary and evaluation order.
+An automatic health-triggered pause (or `PAUSE_RECOMMENDED` verdict) now also raises a
+`shadow-alerts` entry, which it previously did not.
+
 ## Enable shadow operations
 
 1. Open `config/shadow_operations.yaml`. The shipped defaults:

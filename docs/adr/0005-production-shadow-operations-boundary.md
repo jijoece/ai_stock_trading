@@ -113,3 +113,23 @@ Decision 9 — no actual recurring deployment has ever been activated.
 This section does not rewrite the history above: every Decision 1-11 paragraph describes
 what was true and accepted at Milestone 7's own completion, including the target-vs-active
 distinction Milestone 7 itself documented honestly at the time.
+
+## Milestone 7.2 closure (2026-07-13)
+
+Decision 7's "health evaluation detects, a separate caller acts" boundary is unchanged, but
+`evaluate_cycle_health` now additionally returns one `HealthCheckResult` per evaluated
+dimension (`shadow/health.py`), persisted to a new, additive `shadow_run_health_checks` table
+and explainable via a new `shadow-health-explain` CLI command — the summary verdict Decision 7
+already produced is no longer opaque. Milestone 7.1's own real-validation run returned an
+unexplained `health_status=PAUSE_REQUIRED`; Milestone 7.2 root-caused it as a
+**RATE-DENOMINATOR BUG** (`retry_exhaustion_rate`'s denominator conflated a symbol count with
+a role-invocation count) and fixed the denominator — the pause itself was, and remains,
+intentional (a required role's only attempt genuinely failed to produce a valid report).
+Decision 8's alerting boundary gained one addition: an automatic health-triggered pause (or a
+`PAUSE_RECOMMENDED` verdict) now raises an alert where previously it raised none — the
+underlying "persist before any sink is attempted, delivery failure never erases the alert"
+guarantee is unchanged. See `docs/milestone7-2-shadow-health-diagnostics.md` for full detail,
+including a demonstrated (but session-undemonstrated-by-real-evidence, hence unfixed)
+`unsupported_claim_rate` denominator concern, and an honest activation-readiness decision
+(`shadow/readiness.py::evaluate_activation_readiness`) that still reports
+`NOT_READY_INSUFFICIENT_HISTORY` against this repository's real history.

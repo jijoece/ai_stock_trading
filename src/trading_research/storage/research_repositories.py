@@ -445,10 +445,10 @@ def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[st
     if not research_run_ids:
         return ResearchCycleTelemetry(
             status=STATUS_UNAVAILABLE, research_run_ids=(), attempt_count=0, successful_attempt_count=0,
-            failed_attempt_count=0, retry_count=0, retry_exhaustion_count=0, required_role_failure_count=0,
-            provider_failure_count=0, unsupported_claim_count=0, output_truncation_count=0,
-            budget_skipped_attempt_count=0, input_tokens=None, output_tokens=None, latency_ms=None,
-            priced_usage_cost_usd=None, pricing_status="NO_DATA", missing_usage_record_count=0,
+            failed_attempt_count=0, retry_count=0, retry_exhaustion_count=0, distinct_roles_invoked_count=0,
+            required_role_failure_count=0, provider_failure_count=0, unsupported_claim_count=0,
+            output_truncation_count=0, budget_skipped_attempt_count=0, input_tokens=None, output_tokens=None,
+            latency_ms=None, priced_usage_cost_usd=None, pricing_status="NO_DATA", missing_usage_record_count=0,
         )
 
     placeholders = ",".join("?" for _ in research_run_ids)
@@ -465,6 +465,11 @@ def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[st
     successful_attempt_count = sum(1 for r in attempt_rows if r["success"])
     failed_attempt_count = attempt_count - successful_attempt_count
     retry_count = sum(1 for r in attempt_rows if r["attempt_number"] > 1)
+    # docs/milestone-7.2.md Part 9 fix: distinct ROLES that had at least one
+    # attempt this cycle — a role gated/skipped before ever attempting
+    # (e.g. manager after a required analyst role failed) never has an
+    # attempt row, so it correctly does not inflate this denominator.
+    distinct_roles_invoked_count = len({r["role"] for r in attempt_rows})
     retry_exhaustion_count = sum(1 for f in failures if f.code == CODE_RETRY_EXHAUSTED)
     required_role_failure_count = sum(1 for f in failures if f.code == CODE_MISSING_REQUIRED_ROLE)
     provider_failure_count = sum(1 for f in failures if f.code in _PROVIDER_FAILURE_CODES)
@@ -507,6 +512,7 @@ def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[st
         status=status, research_run_ids=tuple(research_run_ids), attempt_count=attempt_count,
         successful_attempt_count=successful_attempt_count, failed_attempt_count=failed_attempt_count,
         retry_count=retry_count, retry_exhaustion_count=retry_exhaustion_count,
+        distinct_roles_invoked_count=distinct_roles_invoked_count,
         required_role_failure_count=required_role_failure_count, provider_failure_count=provider_failure_count,
         unsupported_claim_count=unsupported_claim_count, output_truncation_count=output_truncation_count,
         budget_skipped_attempt_count=budget_skipped_attempt_count,

@@ -40,6 +40,7 @@ scratchpad "Known limitations" entry.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -52,7 +53,7 @@ from zoneinfo import ZoneInfo
 from ..research import usage as usage_mod
 from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration
 from ..storage.research_repositories import compute_cycle_telemetry
-from ..storage.shadow_alerts_repositories import save_run_summary
+from ..storage.shadow_alerts_repositories import save_health_check, save_run_summary
 from ..storage.shadow_operations_repositories import (
     find_scheduler_run_by_intended_schedule,
     save_scheduler_run,
@@ -229,7 +230,7 @@ def _save_no_op_summary(
 
 def _build_health_inputs_from_cycle_result(
     conn: sqlite3.Connection, cycle_result: ResearchCycleResult | None, *, symbols_attempted: int,
-    cycle_duration_seconds: float,
+    cycle_duration_seconds: float, budget_breached: bool = False,
 ) -> health_mod.CycleHealthInputs:
     """Computes real aggregate rates from `ResearchCycleResult.symbol_results`
     plus, since docs/milestone-7.1.md Step 18, a real `ResearchCycleTelemetry`
@@ -253,6 +254,14 @@ def _build_health_inputs_from_cycle_result(
         "PRICING_NOT_CONFIGURED"` — every other status (including
         `NOT_APPLICABLE`/`NO_DATA` for deterministic/scripted cycles, which
         never require pricing) is conservatively `True`.
+
+    `budget_breached` (docs/milestone-7.2.md Part 9 fix): caller-supplied,
+    real result of `shadow/budget.py::check_emergency_margin_breach` against
+    the cycle's own settled reservation — previously this was always the
+    dataclass default `False` regardless of actual consumption, because
+    nothing in this module ever called that function. It is threaded through
+    here rather than recomputed, so this function stays a pure mapper from
+    already-computed inputs to `CycleHealthInputs`.
     """
     if cycle_result is None or symbols_attempted == 0:
         return health_mod.CycleHealthInputs(
@@ -260,7 +269,7 @@ def _build_health_inputs_from_cycle_result(
             retry_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None, output_truncation_rate=None,
             latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None, pricing_configured=True,
             paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
-            cycle_duration_seconds=cycle_duration_seconds,
+            cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
         )
 
     completed = sum(1 for r in cycle_result.symbol_results if r.status == "COMPLETED")
@@ -288,8 +297,19 @@ def _build_health_inputs_from_cycle_result(
         retry_rate = None
         unsupported_claim_rate = None
         output_truncation_rate = None
+    # docs/milestone-7.2.md Part 6-9: previously divided by `len(research_run_ids)`
+    # (a count of SYMBOLS) — a mismatched-unit denominator against a per-ROLE
+    # numerator (`retry_exhaustion_count`, at most one CODE_RETRY_EXHAUSTED
+    # failure per role that never produced a valid report). A single failed
+    # role out of several configured roles for one symbol could read as a
+    # misleading 100% rate. Real-validated (docs/milestone-7.2.md's bounded
+    # real rerun: bear's sole attempt failed, manager was never invoked,
+    # `distinct_roles_invoked_count=1` — the fixed rate is numerically
+    # unchanged for THIS specific 2-role cycle, but is no longer
+    # structurally wrong for a cycle with more configured roles).
     retry_exhaustion_rate = (
-        telemetry.retry_exhaustion_count / len(research_run_ids) if research_run_ids else None
+        telemetry.retry_exhaustion_count / telemetry.distinct_roles_invoked_count
+        if telemetry.distinct_roles_invoked_count else None
     )
     pricing_configured = telemetry.pricing_status != "PRICING_NOT_CONFIGURED"
 
@@ -302,7 +322,7 @@ def _build_health_inputs_from_cycle_result(
         input_tokens=telemetry.input_tokens, output_tokens=telemetry.output_tokens,
         cost_usd=telemetry.priced_usage_cost_usd, pricing_configured=pricing_configured,
         paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
-        cycle_duration_seconds=cycle_duration_seconds,
+        cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
     )
 
 
@@ -330,6 +350,43 @@ def _save_health_summary(
             "cycle_duration_seconds": inputs.cycle_duration_seconds, "created_at": now.isoformat(),
         },
     )
+
+
+def _compute_health_check_id(*, scheduler_run_id: str, check_name: str, policy_version: str) -> str:
+    """Deterministic identity (docs/milestone-7.2.md Part 3: "stable or
+    deterministic check ID") — the same (scheduler_run, check, policy)
+    tuple always produces the same `check_id`, so re-evaluating/resuming the
+    same scheduler run never inserts a duplicate diagnostic row
+    (`save_health_check` uses `INSERT OR IGNORE`)."""
+    payload = f"{scheduler_run_id}|{check_name}|{policy_version}"
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"hcheck-{digest[:32]}"
+
+
+def _save_health_checks(
+    conn: sqlite3.Connection, *, scheduler_run_id: str, cycle_id: str | None,
+    health_result: health_mod.HealthResult, clock: Clock,
+) -> None:
+    """Persists one row per `HealthCheckResult` (docs/milestone-7.2.md Part
+    3) — field-level diagnostics behind the single `shadow_run_summaries`
+    verdict, queryable by scheduler run, by cycle, and by check name."""
+    now = clock().isoformat()
+    for check in health_result.checks:
+        save_health_check(
+            conn,
+            {
+                "check_id": _compute_health_check_id(
+                    scheduler_run_id=scheduler_run_id, check_name=check.check_name,
+                    policy_version=health_result.policy_version,
+                ),
+                "scheduler_run_id": scheduler_run_id, "cycle_id": cycle_id, "check_name": check.check_name,
+                "check_status": check.status, "input_value": check.input_value, "input_unit": check.input_unit,
+                "threshold_value": check.threshold_value, "threshold_unit": check.threshold_unit,
+                "comparison": check.comparison, "applicable": int(check.applicable),
+                "pause_flag_enabled": int(check.pause_flag_enabled), "reason": check.reason,
+                "policy_version": health_result.policy_version, "evaluated_at": now,
+            },
+        )
 
 
 def run_due_shadow_cycle(
@@ -667,6 +724,18 @@ def run_due_shadow_cycle(
         )
         budget_mod.settle_reservation(conn, reservation.reservation_id, clock)
         updated_reservation = budget_mod.remaining_reservation_budget(conn, reservation.reservation_id)
+        # docs/milestone-7.2.md Part 9 fix: `budget_breached` was previously
+        # ALWAYS the CycleHealthInputs dataclass default (False), because
+        # nothing in this module ever called the already-existing, already
+        # unit-tested `check_emergency_margin_breach` — the "budget breach"
+        # health dimension was entirely inert. This reads the reservation's
+        # REAL settled consumption (populated by per-attempt charging via
+        # `shadow/attempt_controller.py`, independent of this function's own
+        # always-$0 `record_actual_usage` call above) against the configured
+        # emergency margin — never fabricated, never silently skipped.
+        emergency_margin_report = budget_mod.check_emergency_margin_breach(
+            conn, reservation.reservation_id, Decimal(str(shadow_config.budgets.emergency_margin_fraction)),
+        )
 
         # --- Step 9: update shadow_scheduler_runs with final status. ---------
         if cycle_result is not None:
@@ -703,14 +772,56 @@ def run_due_shadow_cycle(
         health_inputs = _build_health_inputs_from_cycle_result(
             conn, cycle_result, symbols_attempted=len(bounded_symbols),
             cycle_duration_seconds=(finish_time - start_time).total_seconds(),
+            budget_breached=emergency_margin_report.breached,
         )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)
         health_result = health_mod.evaluate_cycle_health(health_inputs, health_config)
-        health_mod.apply_health_result(conn, health_result, health_config, clock)
+        new_pause_state = health_mod.apply_health_result(conn, health_result, health_config, clock)
+        # docs/milestone-7.2.md Part 11 fix: previously an automatic
+        # health-triggered pause produced NO alert at all — an operator
+        # watching `shadow-alerts` would see nothing explaining a sudden
+        # `PAUSED_*` transition unless they separately checked pause
+        # history, and a `PAUSE_RECOMMENDED` verdict (deliberately never
+        # auto-paused) was entirely invisible to `shadow-alerts` too.
+        # Raised for both `PAUSE_RECOMMENDED` (alert-only, per this task's
+        # own "PAUSE_RECOMMENDED -> alert only" requirement) and
+        # `PAUSE_REQUIRED` (whether or not the corresponding `pause_on_*`
+        # flag actually caused `apply_health_result` to act) — never for
+        # `HEALTHY`/`DEGRADED` ("DEGRADED -> no automatic pause" and no
+        # alert either, since it is this module's own "approaching the
+        # line" interpretation, not a configured policy breach).
+        if health_result.status in (health_mod.STATUS_PAUSE_RECOMMENDED, health_mod.STATUS_PAUSE_REQUIRED):
+            paused = new_pause_state is not None
+            _raise(
+                conn, severity=alerts_mod.SEVERITY_CRITICAL if paused else alerts_mod.SEVERITY_WARNING,
+                alert_type=alerts_mod.ALERT_TYPE_PAUSE_ACTIVATED,
+                message=(
+                    (
+                        f"shadow operations automatically paused ({new_pause_state.state}) after scheduler run "
+                        f"{scheduler_run_id}: "
+                        if paused else
+                        f"shadow operations health check recommended a pause after scheduler run "
+                        f"{scheduler_run_id} (no automatic action taken): "
+                    ) + "; ".join(health_result.reasons)
+                ),
+                context={
+                    # `scheduler_run_id` deliberately excluded from context —
+                    # it is unique per invocation, so including it would
+                    # defeat `raise_alert`'s dedup_key entirely (the same
+                    # recurring health condition must be recognized as the
+                    # same underlying event across different scheduler
+                    # runs). It remains in the human-readable `message` above.
+                    "pause_state": new_pause_state.state if paused else None,
+                    "health_status": health_result.status, "triggering_flags": list(health_result.triggering_flags),
+                    "health_reasons": list(health_result.reasons),
+                },
+                clock=clock,
+            )
         _save_health_summary(
             conn, scheduler_run_id=scheduler_run_id, intended_schedule_id=intended_schedule_id,
             health_result=health_result, inputs=health_inputs, clock=clock,
         )
+        _save_health_checks(conn, scheduler_run_id=scheduler_run_id, cycle_id=cycle_id, health_result=health_result, clock=clock)
 
         if final_status == STATUS_FAILED:
             _raise(

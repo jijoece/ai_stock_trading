@@ -24,7 +24,7 @@ from trading_research.shadow.readiness import (
     build_readiness_report,
 )
 from trading_research.storage.database import connect
-from trading_research.storage.shadow_alerts_repositories import save_run_summary
+from trading_research.storage.shadow_alerts_repositories import save_health_check, save_run_summary
 from trading_research.storage.shadow_operations_repositories import save_scheduler_run
 
 BASE_TIME = datetime(2026, 7, 13, 13, 30, tzinfo=timezone.utc)
@@ -276,6 +276,149 @@ def test_category_status_fails_closed_on_unrecognized_value():
 
     with pytest.raises(ReadinessPolicyError):
         CategoryReadiness(category="evidence", status="NOT_A_STATUS", reasons=())
+
+
+def _seed_health_check(conn, *, scheduler_run_id: str, check_name: str, status: str, input_value: str | None, pause_flag_enabled: bool = True) -> None:
+    save_health_check(
+        conn,
+        {
+            "check_id": f"hcheck-{scheduler_run_id}-{check_name}", "scheduler_run_id": scheduler_run_id,
+            "cycle_id": None, "check_name": check_name, "check_status": status, "input_value": input_value,
+            "input_unit": "fraction", "threshold_value": "0.5", "threshold_unit": "fraction", "comparison": ">",
+            "applicable": 1, "pause_flag_enabled": int(pause_flag_enabled), "reason": "test", "policy_version": "health/v2",
+            "evaluated_at": BASE_TIME.isoformat(),
+        },
+    )
+
+
+# --- Activation readiness (docs/milestone-7.2.md Part 12) ---------------------------------
+
+
+def test_activation_readiness_not_ready_insufficient_history_by_default(conn, shadow_config):
+    """Given this repo's current limited run history, the default outcome
+    must remain NOT_READY_INSUFFICIENT_HISTORY (or READY_FOR_MANUAL_SHADOW_RUNS)
+    — never a claim of recurring readiness from a handful of cycles."""
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY, evaluate_activation_readiness
+
+    run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=0)
+    _seed_run_summary(conn, scheduler_run_id=run_id, offset_minutes=0)
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY
+
+
+def test_activation_readiness_pause_active_blocks(conn, shadow_config):
+    from trading_research.shadow import pause as pause_mod
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_PAUSE_ACTIVE, evaluate_activation_readiness
+
+    pause_mod.request_pause(conn, "operator maintenance", pause_mod.SOURCE_OPERATOR, clock=_clock_at(BASE_TIME))
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_PAUSE_ACTIVE
+
+
+def test_activation_readiness_environmentally_blocked_short_circuits_everything(conn, shadow_config):
+    from trading_research.shadow.readiness import ACTIVATION_ENVIRONMENTALLY_BLOCKED, evaluate_activation_readiness
+
+    result = evaluate_activation_readiness(
+        conn, BASE_TIME, shadow_config, environmentally_blocked_reason="ANTHROPIC_API_KEY absent",
+    )
+    assert result.status == ACTIVATION_ENVIRONMENTALLY_BLOCKED
+    assert result.reasons == ("ANTHROPIC_API_KEY absent",)
+
+
+def test_activation_readiness_unexplained_pause_required_blocks(conn, shadow_config):
+    """A PAUSE_REQUIRED summary with NO persisted health-check rows (e.g. a
+    run predating this milestone's diagnostics) must be flagged as
+    unexplained — never silently treated as fine."""
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED, evaluate_activation_readiness
+
+    run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=0)
+    created_at = BASE_TIME.isoformat()
+    save_run_summary(
+        conn,
+        {
+            "scheduler_run_id": run_id, "intended_schedule_id": "intended-0", "policy_version": "health/v2",
+            "health_status": "PAUSE_REQUIRED", "health_reasons_json": '["retry_exhaustion_rate 1.000 > 0.500"]',
+            "provider_success_rate": 1.0, "evidence_completeness_rate": 1.0, "claude_role_success_rate": 0.0,
+            "retry_rate": 0.0, "retry_exhaustion_rate": 1.0, "unsupported_claim_rate": 0.0,
+            "output_truncation_rate": 0.0, "latency_seconds": 5.0, "input_tokens": 100, "output_tokens": 50,
+            "cost_usd": "0.05", "paper_reconciliation_mismatch": 0, "duplicate_prevention_violation": 0,
+            "cycle_duration_seconds": 30.0, "created_at": created_at,
+        },
+    )
+    # No shadow_run_health_checks rows persisted for this run — unexplained.
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED
+
+
+def test_activation_readiness_explained_pause_required_not_reported_unexplained(conn, shadow_config):
+    """Once health checks ARE persisted for a PAUSE_REQUIRED run (this
+    milestone's own fix), it is no longer 'unexplained' — but recurring
+    readiness still correctly requires the minimum-history floor
+    separately (docs/milestone-7.2.md: 'do not claim recurring readiness
+    solely because the health issue is explained')."""
+    from trading_research.shadow.readiness import (
+        ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED,
+        ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY,
+        evaluate_activation_readiness,
+    )
+
+    run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=0)
+    _seed_run_summary(conn, scheduler_run_id=run_id, offset_minutes=0)
+    conn.execute("UPDATE shadow_run_summaries SET health_status = 'PAUSE_REQUIRED' WHERE scheduler_run_id = ?", (run_id,))
+    conn.commit()
+    _seed_health_check(conn, scheduler_run_id=run_id, check_name="retry_exhaustion_rate", status="FAIL", input_value="1.000000")
+
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status != ACTIVATION_NOT_READY_HEALTH_UNEXPLAINED
+    assert result.status == ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY  # still not enough history
+
+
+def test_activation_readiness_reconciliation_flag_true_blocks(conn, shadow_config):
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_PAUSE_ACTIVE, evaluate_activation_readiness
+
+    run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=0)
+    _seed_run_summary(conn, scheduler_run_id=run_id, offset_minutes=0)
+    _seed_health_check(conn, scheduler_run_id=run_id, check_name="paper_reconciliation_mismatch", status="FAIL", input_value="True")
+
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_PAUSE_ACTIVE
+
+
+def test_activation_readiness_pricing_failure_blocks(conn, shadow_config):
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_PRICING, evaluate_activation_readiness
+
+    run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=0)
+    _seed_run_summary(conn, scheduler_run_id=run_id, offset_minutes=0)
+    _seed_health_check(conn, scheduler_run_id=run_id, check_name="cost_usd_pricing", status="FAIL", input_value="1.50", pause_flag_enabled=False)
+
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_PRICING
+
+
+def test_activation_readiness_manual_ok_with_some_history_but_not_enough_for_recurring(conn, shadow_config):
+    from trading_research.shadow.readiness import ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY, evaluate_activation_readiness
+
+    for i in range(3):
+        run_id = _seed_scheduler_run(conn, status="COMPLETED", offset_minutes=i)
+        _seed_run_summary(conn, scheduler_run_id=run_id, offset_minutes=i)
+    # Default thresholds (10 completed / 5 real-provider) are far from met.
+    result = evaluate_activation_readiness(conn, BASE_TIME, shadow_config)
+    assert result.status == ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY
+
+
+def test_activation_readiness_result_fails_closed_on_unrecognized_status():
+    from trading_research.shadow.readiness import ActivationReadinessResult, ReadinessReport
+
+    dummy_report = ReadinessReport(
+        as_of=BASE_TIME, policy_version="v1", overall_status=STATUS_INSUFFICIENT_DATA, categories=(),
+        completed_cycle_count=0, real_provider_cycle_count=0, evidence_completeness_rate=None,
+        role_completion_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None,
+        provider_failure_rate=None, cost_per_completed_cycle_usd=None, average_cycle_duration_seconds=None,
+        scheduler_miss_count=0, lease_conflict_count=0, reconciliation_mismatch_count=0,
+        alert_delivery_failure_count=0, reasons=(),
+    )
+    with pytest.raises(ReadinessPolicyError):
+        ActivationReadinessResult(status="NOT_A_STATUS", reasons=(), readiness_report=dummy_report)
 
 
 def test_report_status_fails_closed_on_unrecognized_value():

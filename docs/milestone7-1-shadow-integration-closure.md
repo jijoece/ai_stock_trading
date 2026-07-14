@@ -6,6 +6,15 @@
 redesign the shadow-operations architecture, does not begin Milestone 8, does not activate
 a recurring deployment.
 
+> **Milestone 7.2 update (2026-07-13):** Section 26's open item — this session's real
+> validation run returning `health_status=PAUSE_REQUIRED` on an otherwise fully successful
+> cycle, with the cause not investigated to avoid further real spend — is now explained,
+> root-caused, and fixed. See `docs/milestone7-2-shadow-health-diagnostics.md` for the full
+> field-level diagnostic instrumentation, the real-rerun capture, and the demonstrated
+> `RATE-DENOMINATOR BUG` fix (`retry_exhaustion_rate`'s denominator conflated symbol count
+> with role-invocation count). This document's own content below is preserved as Milestone
+> 7.1's historical record and is not rewritten to imply the cause was known at the time.
+
 ## 1. Original Milestone 7 integration gaps (confirmed from code before editing)
 
 All 13 gaps named in `docs/milestone-7.1.md` were confirmed present in the actual code

@@ -108,6 +108,32 @@ def test_unknown_cost_remains_unknown_not_fabricated_zero(conn):
     assert telemetry.priced_usage_cost_usd is None
 
 
+def test_distinct_roles_invoked_count_excludes_never_attempted_manager(conn):
+    """docs/milestone-7.2.md Part 9 fix: the manager role is gated/skipped
+    (never attempted, never gets an attempt row) when a required analyst
+    role fails — `distinct_roles_invoked_count` must reflect only roles that
+    actually attempted at least once, so it is the correct denominator for
+    `retry_exhaustion_rate` (a single analyst failure out of one attempted
+    role reads as 1/1, not conflated with the un-invoked manager)."""
+    snapshot = _snapshot()
+    save_evidence_snapshot(conn, snapshot)
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="malformed", raw_text="bad"),
+    })
+    repo = SQLiteResearchRepository(conn)
+    result = analyze_with_research_committee(
+        snapshot, provider=provider, provider_name="scripted", model_name="test-model", prompt_registry=PromptRegistry(),
+        research_repository=repo, configuration=_config(max_attempts_per_role=1), clock=lambda: NOW, run_mode="scripted",
+    )
+    telemetry = compute_cycle_telemetry(conn, (result.research_run_id,))
+    assert telemetry.attempt_count == 1  # only fundamental's single attempt — manager never invoked
+    assert telemetry.retry_exhaustion_count == 1
+    assert telemetry.distinct_roles_invoked_count == 1
+    # Correct denominator: 1 exhausted role out of 1 actually-invoked role = 1.0,
+    # not conflated with a symbol-level or manager-inclusive count.
+    assert telemetry.retry_exhaustion_count / telemetry.distinct_roles_invoked_count == 1.0
+
+
 def test_budget_skip_distinguished_from_provider_failure(conn):
     from trading_research.research.orchestration import AttemptControlDecision
 

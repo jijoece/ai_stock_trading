@@ -229,3 +229,145 @@ def test_apply_health_result_does_not_act_on_already_killed_system(conn):
     outcome = apply_health_result(conn, result, _config(), clock=_clock_at(BASE_TIME))
     assert outcome is None
     assert pause_mod.current_state(conn).state == pause_mod.STATE_KILLED
+
+
+# --- Field-level health diagnostics (docs/milestone-7.2.md Part 2) --------------------
+
+
+def test_checks_cover_every_named_dimension_in_deterministic_order():
+    from trading_research.shadow.health import CHECK_NAMES_IN_ORDER
+
+    result = evaluate_cycle_health(_healthy_inputs(), _config())
+    assert tuple(c.check_name for c in result.checks) == CHECK_NAMES_IN_ORDER
+    # Identical inputs always produce the identical check order/content.
+    result2 = evaluate_cycle_health(_healthy_inputs(), _config())
+    assert result.checks == result2.checks
+
+
+def test_provider_failure_rate_check_reports_exact_value_unit_threshold_comparison():
+    inputs = _healthy_inputs(provider_success_rate=0.40)  # failure_rate = 0.60
+    result = evaluate_cycle_health(inputs, _config())
+    check = next(c for c in result.checks if c.check_name == "provider_failure_rate")
+    assert check.status == "FAIL"
+    assert check.input_value == "0.600000"
+    assert check.input_unit == "fraction"
+    assert check.threshold_value == "0.500000"
+    assert check.threshold_unit == "fraction"
+    assert check.comparison == ">"
+    assert check.applicable is True
+    assert check.pause_flag_enabled is True
+    assert "provider_failure_rate" in check.reason
+
+
+def test_missing_telemetry_reports_insufficient_data_not_zero():
+    inputs = _healthy_inputs(provider_success_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None)
+    result = evaluate_cycle_health(inputs, _config())
+    for name in ("provider_failure_rate", "retry_exhaustion_rate", "unsupported_claim_rate"):
+        check = next(c for c in result.checks if c.check_name == name)
+        assert check.status == "INSUFFICIENT_DATA"
+        assert check.input_value is None  # never fabricated as "0.000000"
+
+
+def test_observational_dimensions_are_not_applicable_and_never_pass_fail():
+    result = evaluate_cycle_health(_healthy_inputs(), _config())
+    for name in ("evidence_completeness_rate", "claude_role_success_rate", "retry_rate", "input_tokens", "output_tokens", "latency_seconds", "pricing_configured"):
+        check = next(c for c in result.checks if c.check_name == name)
+        assert check.status == "NOT_APPLICABLE"
+        assert check.applicable is False
+        assert check.pause_flag_enabled is False
+
+
+def test_output_truncation_rate_check_has_no_pause_flag():
+    inputs = _healthy_inputs(output_truncation_rate=0.5)
+    result = evaluate_cycle_health(inputs, _config())
+    check = next(c for c in result.checks if c.check_name == "output_truncation_rate")
+    assert check.status == "FAIL"
+    assert check.applicable is True
+    assert check.pause_flag_enabled is False  # no safety.pause_on_* flag exists for this dimension
+    assert result.status == "PAUSE_RECOMMENDED"  # ceiling — never PAUSE_REQUIRED for this dimension alone
+
+
+def test_cycle_duration_seconds_check_uses_seconds_not_milliseconds():
+    inputs = _healthy_inputs(cycle_duration_seconds=901.0)
+    result = evaluate_cycle_health(inputs, _config(max_cycle_duration_seconds=900))
+    check = next(c for c in result.checks if c.check_name == "cycle_duration_seconds")
+    assert check.status == "FAIL"
+    assert check.input_unit == "seconds"
+    assert check.threshold_unit == "seconds"
+    assert check.input_value == "901.000000"
+
+
+def test_cycle_duration_seconds_boundary_equal_passes():
+    inputs = _healthy_inputs(cycle_duration_seconds=900.0)
+    result = evaluate_cycle_health(inputs, _config(max_cycle_duration_seconds=900))
+    check = next(c for c in result.checks if c.check_name == "cycle_duration_seconds")
+    assert check.status == "PASS"
+
+
+def test_boolean_checks_report_boolean_unit_and_pause_flag():
+    inputs = _healthy_inputs(paper_reconciliation_mismatch=True)
+    result = evaluate_cycle_health(inputs, _config(pause_on_reconciliation_mismatch=True))
+    check = next(c for c in result.checks if c.check_name == "paper_reconciliation_mismatch")
+    assert check.status == "FAIL"
+    assert check.input_value == "True"
+    assert check.input_unit == "boolean"
+    assert check.pause_flag_enabled is True
+
+
+def test_duplicate_prevention_violation_always_pause_flag_enabled_regardless_of_reconciliation_flag():
+    """docs/milestone-7.2.md Part 9 fix: a duplicate-prevention violation must
+    remain eligible to auto-pause even when an operator has disabled
+    safety.pause_on_reconciliation_mismatch — it is a distinct, structural
+    safety-guarantee break, not the same configurable rate."""
+    inputs = _healthy_inputs(duplicate_prevention_violation=True)
+    config = _config(pause_on_reconciliation_mismatch=False)
+    result = evaluate_cycle_health(inputs, config)
+    check = next(c for c in result.checks if c.check_name == "duplicate_prevention_violation")
+    assert check.status == "FAIL"
+    assert check.pause_flag_enabled is True
+    assert result.status == STATUS_PAUSE_REQUIRED
+    from trading_research.shadow.health import REASON_DUPLICATE_PREVENTION_VIOLATION
+    assert REASON_DUPLICATE_PREVENTION_VIOLATION in result.triggering_flags
+
+
+def test_apply_health_result_pauses_on_duplicate_prevention_violation_even_when_reconciliation_flag_disabled(conn):
+    inputs = _healthy_inputs(duplicate_prevention_violation=True)
+    config = _config(pause_on_reconciliation_mismatch=False)
+    result = evaluate_cycle_health(inputs, config)
+    assert result.status == STATUS_PAUSE_REQUIRED
+    new_state = apply_health_result(conn, result, config, clock=_clock_at(BASE_TIME))
+    assert new_state is not None
+    assert new_state.state == pause_mod.STATE_PAUSED_RECONCILIATION
+
+
+def test_checks_serialize_to_stable_json_with_no_secrets():
+    import json
+
+    result = evaluate_cycle_health(_healthy_inputs(), _config())
+    for check in result.checks:
+        payload = json.dumps({
+            "check_name": check.check_name, "status": check.status, "input_value": check.input_value,
+            "input_unit": check.input_unit, "threshold_value": check.threshold_value,
+            "threshold_unit": check.threshold_unit, "comparison": check.comparison, "applicable": check.applicable,
+            "pause_flag_enabled": check.pause_flag_enabled, "reason": check.reason,
+        })
+        lowered = payload.lower()
+        for secret_marker in ("sk-ant-", "api_key", "authorization", "bearer "):
+            assert secret_marker not in lowered
+
+
+def test_cycle_health_result_alias_is_same_type():
+    from trading_research.shadow.health import CycleHealthResult, HealthResult
+
+    assert CycleHealthResult is HealthResult
+
+
+def test_unrecognized_check_status_raises():
+    from trading_research.shadow.health import HealthCheckResult
+
+    with pytest.raises(HealthPolicyError):
+        HealthCheckResult(
+            check_name="provider_failure_rate", status="NOT_A_STATUS", input_value=None, input_unit=None,
+            threshold_value=None, threshold_unit=None, comparison=">", applicable=True, pause_flag_enabled=True,
+            reason="x",
+        )

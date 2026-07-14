@@ -62,6 +62,32 @@ CREATE TABLE IF NOT EXISTS shadow_run_summaries (
     cycle_duration_seconds REAL,
     created_at TEXT NOT NULL
 );
+
+-- Milestone 7.2 (docs/milestone-7.2.md Part 3): one row per field-level
+-- health-check dimension (shadow/health.py::HealthCheckResult), so the
+-- summary verdict on `shadow_run_summaries` is fully explainable after the
+-- fact without re-deriving it from raw telemetry. `check_id` is
+-- deterministic (sha256 of scheduler_run_id|check_name|policy_version) and
+-- inserted via `INSERT OR IGNORE`, so re-evaluating/resuming the same
+-- scheduler run never creates duplicate rows. Additive only — no change to
+-- `shadow_run_summaries` above.
+CREATE TABLE IF NOT EXISTS shadow_run_health_checks (
+    check_id TEXT PRIMARY KEY,
+    scheduler_run_id TEXT NOT NULL,
+    cycle_id TEXT,
+    check_name TEXT NOT NULL,
+    check_status TEXT NOT NULL,
+    input_value TEXT,
+    input_unit TEXT,
+    threshold_value TEXT,
+    threshold_unit TEXT,
+    comparison TEXT NOT NULL,
+    applicable INTEGER NOT NULL,
+    pause_flag_enabled INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL
+);
 """
 
 SHADOW_ALERTS_INDEXES = """
@@ -74,6 +100,9 @@ CREATE INDEX IF NOT EXISTS idx_shadow_alert_deliveries_sink ON shadow_alert_deli
 CREATE INDEX IF NOT EXISTS idx_shadow_run_summaries_intended ON shadow_run_summaries(intended_schedule_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_run_summaries_status ON shadow_run_summaries(health_status);
 CREATE INDEX IF NOT EXISTS idx_shadow_run_summaries_created ON shadow_run_summaries(created_at);
+CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_run ON shadow_run_health_checks(scheduler_run_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_cycle ON shadow_run_health_checks(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_name ON shadow_run_health_checks(check_name);
 """
 
 

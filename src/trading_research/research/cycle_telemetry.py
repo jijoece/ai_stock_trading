@@ -31,6 +31,13 @@ class ResearchCycleTelemetry:
     failed_attempt_count: int
     retry_count: int
     retry_exhaustion_count: int
+    # docs/milestone-7.2.md Part 9 fix: distinct count of ROLES that had at
+    # least one attempt this cycle — the correct denominator for
+    # `retry_exhaustion_rate` (a per-ROLE event count divided by a per-SYMBOL
+    # `len(research_run_ids)` produced a rate that could read 100% even when
+    # only one of several configured roles failed; real-validated via
+    # docs/milestone-7.2.md's bounded real rerun).
+    distinct_roles_invoked_count: int
     required_role_failure_count: int
     provider_failure_count: int
     unsupported_claim_count: int

@@ -19,6 +19,14 @@ unambiguous distinction.
 > Milestone 7's own historical record and is not rewritten to imply these integrations
 > existed at that time.
 
+> **Milestone 7.2 update (2026-07-13):** field-level health diagnostics
+> (`shadow_run_health_checks`), a diagnostic CLI (`shadow-health-explain`), a
+> health-triggered pause/recommendation alert, and an activation-readiness decision
+> (`shadow-readiness`'s `activation_readiness` block) were added. The
+> `health_status=PAUSE_REQUIRED` this document's own Section "Real Claude validation"
+> reported without explanation is now root-caused and fixed — see
+> `docs/milestone7-2-shadow-health-diagnostics.md`.
+
 This document describes the shadow-operations control layer and evidence-completeness
 expansion added on top of Milestones 1-6.1. See `docs/adr/0005-production-shadow-operations-boundary.md`
 for the design decisions and why each boundary exists, and

@@ -55,6 +55,13 @@ def find_scheduler_run_by_intended_schedule(conn: sqlite3.Connection, intended_s
     return dict(row) if row is not None else None
 
 
+def find_scheduler_run_by_cycle_id(conn: sqlite3.Connection, cycle_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_scheduler_runs WHERE cycle_id = ? ORDER BY created_at DESC LIMIT 1", (cycle_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def list_scheduler_runs(conn: sqlite3.Connection, *, status: str | None = None) -> list[dict]:
     if status is not None:
         rows = conn.execute(

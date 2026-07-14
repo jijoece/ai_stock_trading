@@ -1441,16 +1441,33 @@ def shadow_status_cli(db_path: Path) -> dict:
 
 
 def shadow_readiness_cli(db_path: Path) -> dict:
-    """`shadow-readiness` CLI command (docs/milestone-7.md Step 23/25)."""
+    """`shadow-readiness` CLI command (docs/milestone-7.md Step 23/25;
+    docs/milestone-7.2.md Part 12 added the `activation_readiness` block —
+    an honest manual-vs-recurring activation decision built on top of the
+    same category readiness, never a new independent data source)."""
+    import os
     from datetime import timezone as _tz
 
+    from .research.configuration import load_research_config
     from .shadow.config import load_shadow_operations_config
-    from .shadow.readiness import build_readiness_report
+    from .shadow.readiness import build_readiness_report, evaluate_activation_readiness
 
     shadow_config = load_shadow_operations_config()
     now = datetime.now(_tz.utc)
+
+    environmentally_blocked_reason = None
+    try:
+        research_config = load_research_config()
+        if research_config.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
+            environmentally_blocked_reason = "research.provider=anthropic but ANTHROPIC_API_KEY is absent"
+    except Exception:
+        pass  # research config errors are reported by other commands; never block readiness reporting itself
+
     with session(db_path) as conn:
         report = build_readiness_report(conn, now, shadow_config)
+        activation = evaluate_activation_readiness(
+            conn, now, shadow_config, environmentally_blocked_reason=environmentally_blocked_reason,
+        )
 
     return {
         "as_of": report.as_of.isoformat(), "policy_version": report.policy_version,
@@ -1471,6 +1488,7 @@ def shadow_readiness_cli(db_path: Path) -> dict:
         "scheduler_miss_count": report.scheduler_miss_count, "lease_conflict_count": report.lease_conflict_count,
         "reconciliation_mismatch_count": report.reconciliation_mismatch_count,
         "alert_delivery_failure_count": report.alert_delivery_failure_count, "reasons": list(report.reasons),
+        "activation_readiness": {"status": activation.status, "reasons": list(activation.reasons)},
     }
 
 
@@ -1641,6 +1659,66 @@ def shadow_lease_status_cli(db_path: Path) -> dict:
         leases = list_leases(conn)
 
     return {"leases": [dict(l) for l in leases]}
+
+
+def shadow_health_explain_cli(
+    db_path: Path, *, scheduler_run_id: str | None = None, cycle_id: str | None = None,
+) -> dict:
+    """`shadow-health-explain --scheduler-run-id <id>` (or `--cycle-id <id>`)
+    CLI command (docs/milestone-7.2.md Part 10): explains every field-level
+    health check behind one scheduler run's `shadow_run_summaries` verdict.
+    Sanitized output only (no credentials, no raw model content — the
+    persisted `shadow_run_health_checks` rows this reads already only ever
+    carry bounded, structured diagnostic fields). An unknown run is reported
+    as `{"error": ...}` (mapped to a nonzero exit code by the caller), never
+    an unhandled exception or a fabricated empty-but-successful result."""
+    from .shadow.health import CHECK_NAMES_IN_ORDER
+    from .storage.shadow_alerts_repositories import list_health_checks, load_run_summary
+    from .storage.shadow_operations_repositories import find_scheduler_run_by_cycle_id
+
+    if not scheduler_run_id and not cycle_id:
+        return {"error": "either --scheduler-run-id or --cycle-id is required"}
+
+    with session(db_path) as conn:
+        resolved_scheduler_run_id = scheduler_run_id
+        if resolved_scheduler_run_id is None:
+            scheduler_run = find_scheduler_run_by_cycle_id(conn, cycle_id)
+            if scheduler_run is None:
+                return {"error": f"no scheduler run found for cycle_id={cycle_id!r}"}
+            resolved_scheduler_run_id = scheduler_run["scheduler_run_id"]
+
+        summary = load_run_summary(conn, resolved_scheduler_run_id)
+        if summary is None:
+            return {"error": f"no shadow_run_summaries row found for scheduler_run_id={resolved_scheduler_run_id!r}"}
+
+        checks = list_health_checks(conn, scheduler_run_id=resolved_scheduler_run_id)
+
+    # Deterministic ordering: the same canonical, versioned dimension order
+    # `shadow/health.py::evaluate_cycle_health` builds `HealthResult.checks`
+    # in — not merely SQL's own alphabetical `ORDER BY check_name`.
+    checks_by_name = {c["check_name"]: c for c in checks}
+    ordered_checks = [checks_by_name[name] for name in CHECK_NAMES_IN_ORDER if name in checks_by_name]
+
+    return {
+        "scheduler_run_id": resolved_scheduler_run_id,
+        "cycle_id": checks[0]["cycle_id"] if checks else None,
+        "health_status": summary["health_status"],
+        "policy_version": summary["policy_version"],
+        "reasons": json.loads(summary["health_reasons_json"]),
+        "triggering_flags": [
+            c["check_name"] for c in ordered_checks if c["check_status"] == "FAIL" and c["pause_flag_enabled"]
+        ],
+        "checks": [
+            {
+                "check_name": c["check_name"], "status": c["check_status"], "input_value": c["input_value"],
+                "input_unit": c["input_unit"], "threshold_value": c["threshold_value"],
+                "threshold_unit": c["threshold_unit"], "comparison": c["comparison"],
+                "applicable": bool(c["applicable"]), "pause_flag_enabled": bool(c["pause_flag_enabled"]),
+                "reason": c["reason"],
+            }
+            for c in ordered_checks
+        ],
+    }
 
 
 def corporate_status_cli(symbol: str, as_of_str: str, db_path: Path) -> dict:
@@ -1885,6 +1963,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("shadow-lease-status", help="Current shadow_run_leases state (Milestone 7)")
 
+    p_shadow_health_explain = sub.add_parser(
+        "shadow-health-explain", help="Explain every field-level health check behind a scheduler run's verdict (Milestone 7.2)"
+    )
+    p_shadow_health_explain.add_argument("--scheduler-run-id", default=None)
+    p_shadow_health_explain.add_argument("--cycle-id", default=None)
+
     p_corporate_status = sub.add_parser("corporate-status", help="Real SEC-derived corporate-status evidence for one symbol (Milestone 7)")
     p_corporate_status.add_argument("--symbol", required=True)
     p_corporate_status.add_argument("--as-of", required=True)
@@ -2115,6 +2199,14 @@ def main(argv: list[str] | None = None) -> int:
         outcome = shadow_lease_status_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0
+
+    if args.command == "shadow-health-explain":
+        cfg = load_config()
+        outcome = shadow_health_explain_cli(
+            cfg.research_database_path, scheduler_run_id=args.scheduler_run_id, cycle_id=args.cycle_id,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
 
     if args.command == "corporate-status":
         cfg = load_config()

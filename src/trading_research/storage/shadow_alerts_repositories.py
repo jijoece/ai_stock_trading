@@ -132,3 +132,47 @@ def list_run_summaries(conn: sqlite3.Connection, *, since_iso: str | None = None
     else:
         rows = conn.execute("SELECT * FROM shadow_run_summaries ORDER BY created_at DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+# --- shadow_run_health_checks (Milestone 7.2, Part 3) ---------------------------
+
+
+def save_health_check(conn: sqlite3.Connection, check: dict) -> None:
+    """Idempotent on `check_id` (deterministic — see
+    `shadow/scheduler.py::_compute_health_check_id`): `INSERT OR IGNORE` so
+    re-evaluating/resuming the same scheduler run never creates a duplicate
+    diagnostic row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO shadow_run_health_checks "
+        "(check_id, scheduler_run_id, cycle_id, check_name, check_status, input_value, input_unit, "
+        "threshold_value, threshold_unit, comparison, applicable, pause_flag_enabled, reason, policy_version, "
+        "evaluated_at) "
+        "VALUES (:check_id, :scheduler_run_id, :cycle_id, :check_name, :check_status, :input_value, :input_unit, "
+        ":threshold_value, :threshold_unit, :comparison, :applicable, :pause_flag_enabled, :reason, "
+        ":policy_version, :evaluated_at)",
+        check,
+    )
+    conn.commit()
+
+
+def list_health_checks(
+    conn: sqlite3.Connection, *, scheduler_run_id: str | None = None, cycle_id: str | None = None,
+    check_name: str | None = None,
+) -> list[dict]:
+    clauses = []
+    params: list[object] = []
+    if scheduler_run_id is not None:
+        clauses.append("scheduler_run_id = ?")
+        params.append(scheduler_run_id)
+    if cycle_id is not None:
+        clauses.append("cycle_id = ?")
+        params.append(cycle_id)
+    if check_name is not None:
+        clauses.append("check_name = ?")
+        params.append(check_name)
+    query = "SELECT * FROM shadow_run_health_checks"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY check_name"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
