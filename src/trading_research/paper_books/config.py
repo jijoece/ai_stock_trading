@@ -51,6 +51,19 @@ def _require_no_unknown_keys(section: dict, known: set[str], section_name: str) 
         raise PaperBooksConfigError(f"{section_name} has unknown keys: {sorted(unknown)} — fails closed")
 
 
+def _strict_bool(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise PaperBooksConfigError(f"{field_name} must be a boolean — got {value!r}")
+    return value
+
+
+def _strict_int(value: object, field_name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        comparison = ">= 0" if minimum == 0 else "> 0"
+        raise PaperBooksConfigError(f"{field_name} must be an integer {comparison} — got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class PaperBookDefinition:
     enabled: bool
@@ -200,6 +213,23 @@ class LifecycleSection:
     soak: SoakSection
 
 
+@dataclass(frozen=True)
+class SoakCampaignSection:
+    enabled: bool
+    minimum_market_days: int
+    minimum_completed_cycles: int
+    minimum_successful_real_provider_cycles: int
+    maximum_unresolved_warnings: int
+    stop_on_blocker: bool
+
+    def __post_init__(self) -> None:
+        for name in ("minimum_market_days", "minimum_completed_cycles", "minimum_successful_real_provider_cycles"):
+            if getattr(self, name) <= 0:
+                raise PaperBooksConfigError(f"soak_campaign.{name} must be > 0")
+        if self.maximum_unresolved_warnings < 0:
+            raise PaperBooksConfigError("soak_campaign.maximum_unresolved_warnings must be >= 0")
+
+
 _DISABLED_LIFECYCLE_SECTION = LifecycleSection(
     enabled=False, pending_orders=PendingOrdersSection(expire_after_market_days=1),
     exits=ExitsSection(
@@ -207,6 +237,11 @@ _DISABLED_LIFECYCLE_SECTION = LifecycleSection(
         maximum_holding_market_days=20, exit_on_recommendation_reversal=True,
     ),
     soak=SoakSection(minimum_completed_cycles=10, minimum_market_days=5),
+)
+
+_DISABLED_SOAK_CAMPAIGN_SECTION = SoakCampaignSection(
+    enabled=False, minimum_market_days=5, minimum_completed_cycles=10,
+    minimum_successful_real_provider_cycles=5, maximum_unresolved_warnings=0, stop_on_blocker=True,
 )
 
 
@@ -227,6 +262,7 @@ class PaperBooksConfiguration:
     # milestone) keep working unchanged — defaults fully disabled, matching
     # every other Milestone 9 gate's "absent = closed" convention.
     lifecycle: LifecycleSection = _DISABLED_LIFECYCLE_SECTION
+    soak_campaign: SoakCampaignSection = _DISABLED_SOAK_CAMPAIGN_SECTION
 
     def __post_init__(self) -> None:
         if self.baseline.book_id == self.enhanced.book_id:
@@ -259,7 +295,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         raise PaperBooksConfigError("paper-books config missing top-level 'paper_books' section")
 
     _require_no_unknown_keys(
-        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle"}, "paper_books"
+        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle", "soak_campaign"}, "paper_books"
     )
 
     books = pb.get("books")
@@ -382,6 +418,36 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             enabled=bool(lifecycle_raw.get("enabled", False)),
             pending_orders=pending_orders_section, exits=exits_section, soak=soak_section,
         )
+
+        campaign_raw = pb.get("soak_campaign", {})
+        if not isinstance(campaign_raw, dict):
+            raise PaperBooksConfigError("paper_books.soak_campaign must be a mapping")
+        _require_no_unknown_keys(
+            campaign_raw,
+            {"enabled", "minimum_market_days", "minimum_completed_cycles",
+             "minimum_successful_real_provider_cycles", "maximum_unresolved_warnings", "stop_on_blocker"},
+            "soak_campaign",
+        )
+        campaign_section = SoakCampaignSection(
+            enabled=_strict_bool(campaign_raw.get("enabled", False), "soak_campaign.enabled"),
+            minimum_market_days=_strict_int(
+                campaign_raw.get("minimum_market_days", soak_section.minimum_market_days),
+                "soak_campaign.minimum_market_days", minimum=1,
+            ),
+            minimum_completed_cycles=_strict_int(
+                campaign_raw.get("minimum_completed_cycles", soak_section.minimum_completed_cycles),
+                "soak_campaign.minimum_completed_cycles", minimum=1,
+            ),
+            minimum_successful_real_provider_cycles=_strict_int(
+                campaign_raw.get("minimum_successful_real_provider_cycles", 5),
+                "soak_campaign.minimum_successful_real_provider_cycles", minimum=1,
+            ),
+            maximum_unresolved_warnings=_strict_int(
+                campaign_raw.get("maximum_unresolved_warnings", 0),
+                "soak_campaign.maximum_unresolved_warnings", minimum=0,
+            ),
+            stop_on_blocker=_strict_bool(campaign_raw.get("stop_on_blocker", True), "soak_campaign.stop_on_blocker"),
+        )
     except PaperBooksConfigError:
         raise
     except Exception as exc:
@@ -390,6 +456,6 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
     return PaperBooksConfiguration(
         version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
-        scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section,
+        scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section, soak_campaign=campaign_section,
         config_hash=hash_config(raw), raw=raw,
     )

@@ -61,7 +61,12 @@ from .orchestration import ResearchRepository, analyze_with_research_committee
 from .overlay import apply_research_overlay
 from .prompt_registry import PromptRegistry
 from .provider_protocol import ResearchModelProvider
-from .provider_provenance import claude_provider_row, evidence_provider_row, record_cycle_provider_provenance
+from .provider_provenance import (
+    aggregate_evidence_status,
+    claude_provider_row,
+    evidence_provider_row,
+    record_cycle_provider_provenance,
+)
 from .recommendation_overlay import apply_overlay_to_recommendation
 
 CYCLE_STATUS_RUNNING = "RUNNING"
@@ -441,7 +446,9 @@ def _run_symbol(
                     cycle_id=cycle_id, research_run_id=None, symbol=symbol, provider_category=category,
                     provider_name=next(s.provider for s in snapshot.source_records if s.source_type == category),
                     request_or_source_id=next(s.source_id for s in snapshot.source_records if s.source_type == category),
-                    status=next(s.status for s in snapshot.source_records if s.source_type == category),
+                    status=aggregate_evidence_status([
+                        s.status for s in snapshot.source_records if s.source_type == category
+                    ]),
                     cycle_provider_mode=configuration.provider_mode, observed_at=clock(),
                 )
                 for category in observed_categories
@@ -510,10 +517,18 @@ def _run_symbol(
                 [
                     claude_provider_row(
                         cycle_id=cycle_id, research_run_id=research_run_id, symbol=symbol,
-                        provider_name=research_provider_name, observed_at=clock(),
+                        provider_name=research_provider_name, observed_at=clock(), status=orchestration_status,
                     )
                 ],
             )
+            # Evidence facts were persisted before the run ID existed. Link
+            # them append-only now; never rewrite the immutable fact rows.
+            from ..storage.research_cycle_repositories import link_provider_provenance_to_research_run
+            for category in observed_categories:
+                link_provider_provenance_to_research_run(
+                    conn, cycle_id=cycle_id, symbol=symbol, provider_category=category,
+                    research_run_id=research_run_id, created_at=clock().isoformat(),
+                )
 
     baseline_score = None
     factors = baseline_rec.payload.get("factors") or []

@@ -21,6 +21,16 @@ paper_books:
   scheduled_integration:
     enabled: false
 
+  # Milestone 9.3: manual multi-day campaign runner. This cannot be enabled
+  # by an environment variable and never installs a recurring schedule.
+  soak_campaign:
+    enabled: false
+    minimum_market_days: 5
+    minimum_completed_cycles: 10
+    minimum_successful_real_provider_cycles: 5
+    maximum_unresolved_warnings: 0
+    stop_on_blocker: true
+
   books:
     baseline:
       enabled: true

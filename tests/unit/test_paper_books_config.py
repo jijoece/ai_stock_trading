@@ -49,6 +49,7 @@ def test_shipped_config_loads_and_is_disabled_by_default():
     assert cfg.baseline.enabled is True
     assert cfg.execution.allow_live_broker is False
     assert cfg.execution.allow_external_paper_broker is False
+    assert cfg.soak_campaign.enabled is False
 
 
 def test_valid_config_round_trips(tmp_path):
@@ -147,3 +148,38 @@ def test_is_book_enabled_requires_both_global_and_book_flag(tmp_path):
     cfg = load_paper_books_config(path)
     assert cfg.is_book_enabled("BASELINE") is True
     assert cfg.is_book_enabled("ENHANCED") is False
+
+
+def test_soak_campaign_config_loads_and_contributes_to_hash(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["soak_campaign"] = {
+        "enabled": True, "minimum_market_days": 5, "minimum_completed_cycles": 10,
+        "minimum_successful_real_provider_cycles": 5, "maximum_unresolved_warnings": 0,
+        "stop_on_blocker": True,
+    }
+    cfg = load_paper_books_config(_write(tmp_path, data))
+    first_hash = cfg.config_hash
+    assert cfg.soak_campaign.enabled is True
+    data["paper_books"]["soak_campaign"]["minimum_market_days"] = 6
+    assert load_paper_books_config(_write(tmp_path, data)).config_hash != first_hash
+
+
+def test_soak_campaign_unknown_key_fails_closed(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["soak_campaign"] = {"enabled": False, "typo": 1}
+    with pytest.raises(PaperBooksConfigError, match="unknown keys"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_soak_campaign_booleans_are_strict(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["soak_campaign"] = {"enabled": "false"}
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_soak_campaign_positive_thresholds_fail_closed(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["soak_campaign"] = {"enabled": False, "minimum_market_days": 0}
+    with pytest.raises(PaperBooksConfigError, match="> 0"):
+        load_paper_books_config(_write(tmp_path, data))

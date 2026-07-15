@@ -37,7 +37,7 @@ from enum import Enum
 # module, which imports this module — a module-level import here would be
 # circular.
 
-CLASSIFICATION_VERSION = "provider-provenance/v1"
+CLASSIFICATION_VERSION = "provider-provenance/v2"
 
 # Evidence-category source types this module classifies (mirrors
 # `research/models.py::SourceRecord.source_type` values produced by
@@ -66,6 +66,30 @@ class ProviderProvenanceClassification(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class ProviderOutcome(str, Enum):
+    SUCCEEDED = "SUCCEEDED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+    ATTEMPTED = "ATTEMPTED"
+    UNKNOWN = "UNKNOWN"
+
+
+SUCCESSFUL_OUTCOMES = (ProviderOutcome.SUCCEEDED,)
+FAILURE_OUTCOMES = (ProviderOutcome.FAILED, ProviderOutcome.SOURCE_UNAVAILABLE)
+
+_EVIDENCE_SUCCESS = {"ok", "success", "succeeded", "complete", "completed", "available"}
+_EVIDENCE_PARTIAL = {"partial", "partially_complete", "incomplete", "stale"}
+_EVIDENCE_UNAVAILABLE = {"missing", "source_unavailable", "unavailable", "not_available"}
+_EVIDENCE_FAILED = {
+    "error", "failed", "failure", "timeout", "timed_out", "invalid", "invalid_response",
+    "rate_limited", "exhausted",
+}
+_CLAUDE_SUCCESS = {"completed", "succeeded", "ok"}
+_CLAUDE_PARTIAL = {"analysis_incomplete", "analyst_reports_complete_no_manager", "partial", "partially_complete"}
+_CLAUDE_FAILED = {"failed", "failure", "timeout", "timed_out", "exhausted", "invalid_response", "error"}
+
+
 REAL_CLASSIFICATIONS = (
     ProviderProvenanceClassification.REAL_EVIDENCE_ONLY,
     ProviderProvenanceClassification.REAL_CLAUDE_ONLY,
@@ -86,6 +110,66 @@ class ProviderProvenanceSummary:
     real_evidence_and_claude_cycle_count: int
     mixed_cycle_count: int
     unknown_cycle_count: int
+    completed_cycle_count: int = 0
+    real_provider_attempt_cycle_count: int = 0
+    real_provider_success_cycle_count: int = 0
+    real_provider_failure_cycle_count: int = 0
+    partial_provider_cycle_count: int = 0
+    excluded_partial_cycle_count: int = 0
+    excluded_failed_cycle_count: int = 0
+    excluded_running_cycle_count: int = 0
+
+
+def normalize_evidence_outcome(status: str | None) -> ProviderOutcome:
+    value = (status or "").strip().lower()
+    if value in _EVIDENCE_SUCCESS:
+        return ProviderOutcome.SUCCEEDED
+    if value in _EVIDENCE_PARTIAL:
+        return ProviderOutcome.PARTIAL
+    if value in _EVIDENCE_UNAVAILABLE:
+        return ProviderOutcome.SOURCE_UNAVAILABLE
+    if value in _EVIDENCE_FAILED:
+        return ProviderOutcome.FAILED
+    if value in {"attempted", "pending", "running"}:
+        return ProviderOutcome.ATTEMPTED
+    return ProviderOutcome.UNKNOWN
+
+
+def normalize_claude_outcome(status: str | None) -> ProviderOutcome:
+    value = (status or "").strip().lower()
+    if value in _CLAUDE_SUCCESS:
+        return ProviderOutcome.SUCCEEDED
+    if value in _CLAUDE_PARTIAL:
+        return ProviderOutcome.PARTIAL
+    if value in _CLAUDE_FAILED:
+        return ProviderOutcome.FAILED
+    if value in {"attempted", "pending", "running"}:
+        return ProviderOutcome.ATTEMPTED
+    return ProviderOutcome.UNKNOWN
+
+
+def aggregate_evidence_status(statuses: list[str]) -> str:
+    """Aggregate same-category SourceRecord statuses conservatively."""
+    outcomes = {normalize_evidence_outcome(status) for status in statuses}
+    if outcomes == {ProviderOutcome.SUCCEEDED}:
+        return "ok"
+    if ProviderOutcome.SUCCEEDED in outcomes or ProviderOutcome.PARTIAL in outcomes:
+        return "partial"
+    if ProviderOutcome.FAILED in outcomes:
+        return "failed"
+    if ProviderOutcome.SOURCE_UNAVAILABLE in outcomes:
+        return "source_unavailable"
+    if ProviderOutcome.ATTEMPTED in outcomes:
+        return "attempted"
+    return "unknown"
+
+
+def _row_outcome(row: dict) -> str:
+    stored = row.get("normalized_outcome")
+    if stored and stored != ProviderOutcome.UNKNOWN.value:
+        return stored
+    normalizer = normalize_claude_outcome if row.get("provider_category") == CLAUDE_PROVIDER_CATEGORY else normalize_evidence_outcome
+    return normalizer(row.get("status")).value
 
 
 def evidence_provider_row(
@@ -107,13 +191,15 @@ def evidence_provider_row(
         "cycle_id": cycle_id, "research_run_id": research_run_id, "symbol": symbol,
         "provider_category": provider_category, "provider_name": provider_name, "provider_mode": mode,
         "is_fixture": int(is_fixture), "is_real": int(is_real), "request_or_source_id": request_or_source_id,
-        "status": status, "observed_at": observed_at.isoformat(), "classification_version": CLASSIFICATION_VERSION,
+        "status": status, "normalized_outcome": normalize_evidence_outcome(status).value,
+        "observed_at": observed_at.isoformat(), "classification_version": CLASSIFICATION_VERSION,
         "created_at": observed_at.isoformat(),
     }
 
 
 def claude_provider_row(
     *, cycle_id: str, research_run_id: str, symbol: str, provider_name: str, observed_at: datetime,
+    status: str = "COMPLETED",
 ) -> dict:
     """Builds the `claude` provenance row from `research_provider_name`
     (the actual configured value passed to `analyze_with_research_committee`
@@ -130,7 +216,8 @@ def claude_provider_row(
         "cycle_id": cycle_id, "research_run_id": research_run_id, "symbol": symbol,
         "provider_category": CLAUDE_PROVIDER_CATEGORY, "provider_name": provider_name, "provider_mode": mode,
         "is_fixture": int(is_fixture), "is_real": int(is_real), "request_or_source_id": research_run_id,
-        "status": "ok", "observed_at": observed_at.isoformat(), "classification_version": CLASSIFICATION_VERSION,
+        "status": status, "normalized_outcome": normalize_claude_outcome(status).value,
+        "observed_at": observed_at.isoformat(), "classification_version": CLASSIFICATION_VERSION,
         "created_at": observed_at.isoformat(),
     }
 
@@ -144,6 +231,12 @@ def record_cycle_provider_provenance(conn, rows: list[dict]) -> int:
 
 
 def _classify_rows(rows: list[dict]) -> ProviderProvenanceClassification:
+    if not rows:
+        return ProviderProvenanceClassification.UNKNOWN
+
+    # Provider identity alone never invents success. Category classification
+    # is based only on rows whose normalized outcome is explicitly SUCCEEDED.
+    rows = [r for r in rows if _row_outcome(r) == ProviderOutcome.SUCCEEDED.value]
     if not rows:
         return ProviderProvenanceClassification.UNKNOWN
 
@@ -185,24 +278,43 @@ def classify_cycle(conn, cycle_id: str) -> ProviderProvenanceClassification:
 
 
 def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSummary:
-    """Aggregates every cycle with persisted provenance at-or-before `as_of`
-    into the bounded, queryable counts Section 4 requires. Cycles never
-    given a provenance record (e.g. predating this milestone) are simply
-    absent — never counted anywhere, never fabricated as UNKNOWN."""
+    """Aggregate completed cycles at-or-before ``as_of``.
+
+    Only ``research_cycles.status == COMPLETED`` participates in the category
+    invariant. Missing provenance is explicitly UNKNOWN. PARTIALLY_COMPLETE,
+    FAILED, and still-running cycles are excluded and reported separately.
+    The successful-provider floor uses only explicit SUCCEEDED real activity.
+    """
     from ..storage import research_cycle_repositories as cycle_repo
 
     rows = cycle_repo.list_provider_provenance_upto(conn, as_of.isoformat())
+    cycles = cycle_repo.list_cycle_headers_upto(conn, as_of.isoformat())
     by_cycle: dict[str, list[dict]] = {}
     for row in rows:
         by_cycle.setdefault(row["cycle_id"], []).append(row)
 
+    completed = [c for c in cycles if c["status"] == "COMPLETED"]
     counts = {c: 0 for c in ProviderProvenanceClassification}
-    for cycle_rows in by_cycle.values():
+    attempt_count = success_count = failure_count = partial_count = 0
+    for cycle in completed:
+        cycle_rows = by_cycle.get(cycle["cycle_id"], [])
         counts[_classify_rows(cycle_rows)] += 1
+        real_rows = [r for r in cycle_rows if r["is_real"]]
+        outcomes = {_row_outcome(r) for r in real_rows}
+        if real_rows:
+            attempt_count += 1
+        if ProviderOutcome.SUCCEEDED.value in outcomes:
+            success_count += 1
+        if outcomes.intersection(o.value for o in FAILURE_OUTCOMES):
+            failure_count += 1
+        if ProviderOutcome.PARTIAL.value in outcomes or (
+            ProviderOutcome.SUCCEEDED.value in outcomes and outcomes.intersection(o.value for o in FAILURE_OUTCOMES)
+        ):
+            partial_count += 1
 
-    real_count = sum(counts[c] for c in REAL_CLASSIFICATIONS)
+    real_count = success_count
     return ProviderProvenanceSummary(
-        as_of=as_of, policy_version=CLASSIFICATION_VERSION, total_classified_cycles=len(by_cycle),
+        as_of=as_of, policy_version=CLASSIFICATION_VERSION, total_classified_cycles=len(completed),
         real_provider_cycle_count=real_count,
         fixture_only_cycle_count=counts[ProviderProvenanceClassification.FIXTURE_ONLY],
         real_evidence_only_cycle_count=counts[ProviderProvenanceClassification.REAL_EVIDENCE_ONLY],
@@ -210,4 +322,10 @@ def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSu
         real_evidence_and_claude_cycle_count=counts[ProviderProvenanceClassification.REAL_EVIDENCE_AND_CLAUDE],
         mixed_cycle_count=counts[ProviderProvenanceClassification.MIXED],
         unknown_cycle_count=counts[ProviderProvenanceClassification.UNKNOWN],
+        completed_cycle_count=len(completed), real_provider_attempt_cycle_count=attempt_count,
+        real_provider_success_cycle_count=success_count, real_provider_failure_cycle_count=failure_count,
+        partial_provider_cycle_count=partial_count,
+        excluded_partial_cycle_count=sum(c["status"] == "PARTIALLY_COMPLETE" for c in cycles),
+        excluded_failed_cycle_count=sum(c["status"] == "FAILED" for c in cycles),
+        excluded_running_cycle_count=sum(c["status"] == "RUNNING" for c in cycles),
     )

@@ -24,13 +24,15 @@ requirement).
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 
 from ..storage import paper_books_repositories as pb_repo
 from .config import PaperBooksConfiguration
 
-POLICY_VERSION = "cross-book-verification/v1"
+POLICY_VERSION = "cross-book-verification/v2"
 
 STATUS_PASSED = "PASSED"
 STATUS_FAILED = "FAILED"
@@ -64,17 +66,82 @@ class CrossBookVerificationResult:
     checks: tuple[CrossBookCheck, ...]
     violation_count: int
     policy_version: str
+    verification_scope_id: str = ""
+    source_state_hash: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in VERIFICATION_STATUSES:
             raise CrossBookVerificationError(f"status {self.status!r} is not one of {VERIFICATION_STATUSES} — fails closed")
 
 
-def _verification_id(as_of: datetime, operator_run_id: str | None, lifecycle_run_id: str | None) -> str:
+def _verification_scope_id(as_of: datetime, operator_run_id: str | None, lifecycle_run_id: str | None) -> str:
     digest = hashlib.sha256(
-        f"{as_of.isoformat()}|{operator_run_id or ''}|{lifecycle_run_id or ''}|{POLICY_VERSION}".encode()
+        f"{as_of.isoformat()}|{operator_run_id or ''}|{lifecycle_run_id or ''}".encode()
+    ).hexdigest()[:32]
+    return f"cbvs-{digest}"
+
+
+def _verification_id(scope_id: str, source_state_hash: str, checks: tuple[CrossBookCheck, ...]) -> str:
+    normalized_checks = [
+        {"name": c.name, "status": c.status, "observed": c.observed, "expected": c.expected,
+         "source": c.source, "reason": c.reason}
+        for c in checks
+    ]
+    digest = hashlib.sha256(
+        json.dumps(
+            {"scope_id": scope_id, "policy_version": POLICY_VERSION, "source_state_hash": source_state_hash,
+             "checks": normalized_checks},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
     ).hexdigest()[:32]
     return f"cbv-{digest}"
+
+
+_STATE_TABLES = (
+    ("paper_books", "created_at"),
+    ("paper_book_risk_decisions", "created_at"),
+    ("paper_book_orders", "as_of"),
+    ("paper_book_fills", "fill_timestamp"),
+    ("paper_book_cash_ledger", "event_timestamp"),
+    ("paper_book_position_lots", "opened_at"),
+    ("paper_book_positions", None),
+    ("paper_book_snapshots", "as_of"),
+    ("paper_book_snapshot_positions", None),
+    ("paper_book_daily_metrics", "window_end"),
+    ("paper_book_corporate_actions_applied", "applied_at"),
+    ("paper_book_experiment_assignments", "as_of"),
+    ("paper_book_exit_decisions", "as_of"),
+    ("paper_book_manual_exit_requests", "requested_at"),
+    ("paper_book_lifecycle_runs", "as_of"),
+    ("paper_book_lifecycle_symbol_results", None),
+    ("paper_book_reconciliations", "as_of"),
+)
+
+
+def source_state_hash(conn, as_of: datetime) -> str:
+    """Hash the bounded source state used by verification, including mutable
+    position/lot state. No verification table is included (avoids recursion)."""
+    state: dict[str, list[dict]] = {}
+    for table, cutoff_column in _STATE_TABLES:
+        if cutoff_column:
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE {cutoff_column} <= ?", (as_of.isoformat(),)
+            ).fetchall()
+        else:
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        normalized_rows = [dict(row) for row in rows]
+        state[table] = sorted(
+            normalized_rows,
+            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"), default=str),
+        )
+    return hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def verification_is_stale(conn, verification: dict, as_of: datetime) -> bool:
+    stored = verification.get("source_state_hash")
+    return not stored or stored != source_state_hash(conn, as_of)
 
 
 def _check_book_and_arm_identity(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
@@ -157,20 +224,38 @@ def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_
     book_ids = (cfg.baseline.book_id, cfg.enhanced.book_id)
     fills_by_book = {b: {f["fill_id"] for f in pb_repo.list_fills(conn, b)} for b in book_ids}
     orders_by_book = {b: {o["paper_order_intent_id"] for o in pb_repo.list_order_intents(conn, b)} for b in book_ids}
+    actions_by_book = {
+        b: {r["action_id"] for r in conn.execute(
+            "SELECT action_id FROM paper_book_corporate_actions_applied WHERE book_id = ?", (b,)
+        ).fetchall()} for b in book_ids
+    }
 
     violations = []
     total = 0
     for book_id in book_ids:
         other_book = next(b for b in book_ids if b != book_id)
         for entry in pb_repo.list_cash_ledger_entries(conn, book_id):
-            if entry["event_timestamp"] > as_of_iso or entry.get("reference_id") is None:
+            if entry["event_timestamp"] > as_of_iso:
                 continue
             ref = entry["reference_id"]
-            belongs_to_own_book = ref in fills_by_book[book_id] or ref in orders_by_book[book_id]
-            belongs_to_other_book = ref in fills_by_book[other_book] or ref in orders_by_book[other_book]
-            if belongs_to_other_book and not belongs_to_own_book:
+            event_type = entry["event_type"]
+            if event_type in {"BUY_RESERVATION", "ORDER_RELEASE"}:
+                valid = ref is not None and ref in orders_by_book[book_id]
+            elif event_type in {"BUY_SETTLEMENT", "SELL_SETTLEMENT", "FEE", "SLIPPAGE"}:
+                valid = ref is not None and ref in fills_by_book[book_id]
+            elif event_type == "DIVIDEND":
+                valid = ref is not None and ref in actions_by_book[book_id]
+            elif event_type == "INITIAL_CAPITAL":
+                valid = ref is None
+            elif event_type == "CASH_ADJUSTMENT":
+                valid = ref is None and bool(entry.get("operator")) and bool(entry.get("reason"))
+            else:
+                valid = False
+            if not valid:
                 total += 1
-                violations.append(f"{book_id}/{entry['ledger_entry_id']} reference_id={ref!r} belongs to {other_book}")
+                foreign = ref in fills_by_book[other_book] or ref in orders_by_book[other_book] or ref in actions_by_book[other_book]
+                detail = f" belongs to {other_book}" if foreign else " does not resolve under the event reference policy"
+                violations.append(f"{book_id}/{entry['ledger_entry_id']} reference_id={ref!r}{detail}")
     checked = sum(len(pb_repo.list_cash_ledger_entries(conn, b)) for b in book_ids)
     if checked == 0:
         return CrossBookCheck(
@@ -180,7 +265,64 @@ def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_
     status = CHECK_STATUS_FAILED if violations else CHECK_STATUS_PASSED
     return CrossBookCheck(
         "cash_ledger_foreign_reference", status, str(total), "0 violations", "paper_book_cash_ledger",
-        "; ".join(violations) if violations else "every cash-ledger reference_id resolves within its own book (or matches nothing at all)",
+        "; ".join(violations) if violations else "every cash-ledger reference follows its event-specific same-book policy",
+    )
+
+
+def _check_position_lot_consistency(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    del as_of_iso
+    violations = []
+    total = 0
+    for book in pb_repo.list_books(conn):
+        positions = {p["symbol"]: Decimal(p["quantity"]) for p in pb_repo.list_positions(conn, book.book_id, open_only=False)}
+        lot_quantities: dict[str, Decimal] = {}
+        for lot in pb_repo.list_all_lots(conn, book.book_id):
+            lot_quantities[lot["symbol"]] = lot_quantities.get(lot["symbol"], Decimal("0")) + Decimal(lot["remaining_quantity"])
+        for symbol in sorted(set(positions) | set(lot_quantities)):
+            total += 1
+            position_qty = positions.get(symbol, Decimal("0"))
+            lot_qty = lot_quantities.get(symbol, Decimal("0"))
+            if position_qty != lot_qty:
+                violations.append(f"{book.book_id}/{symbol} position quantity={position_qty} but open lots={lot_qty}")
+    if total == 0:
+        return CrossBookCheck(
+            "position_lot_consistency", CHECK_STATUS_NOT_APPLICABLE, None, "0 violations",
+            "paper_book_positions, paper_book_position_lots", "no positions or lots persisted",
+        )
+    return CrossBookCheck(
+        "position_lot_consistency", CHECK_STATUS_FAILED if violations else CHECK_STATUS_PASSED,
+        str(len(violations)), "0 violations", "paper_book_positions, paper_book_position_lots",
+        "; ".join(violations) if violations else f"{total} book/symbol quantity pair(s) reconcile to open lots",
+    )
+
+
+def _check_unexpected_book_namespaces(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    del as_of_iso
+    expected = {cfg.baseline.book_id, cfg.enhanced.book_id}
+    tables = (
+        "paper_books", "paper_book_cash_ledger", "paper_book_risk_decisions", "paper_book_orders",
+        "paper_book_fills", "paper_book_positions", "paper_book_position_lots", "paper_book_snapshots",
+        "paper_book_snapshot_positions", "paper_book_reconciliations", "paper_book_daily_metrics",
+        "paper_book_corporate_actions_applied", "paper_book_exit_decisions",
+        "paper_book_manual_exit_requests", "paper_book_lifecycle_symbol_results",
+    )
+    violations = []
+    observed_rows = 0
+    for table in tables:
+        rows = conn.execute(f"SELECT DISTINCT book_id FROM {table} ORDER BY book_id").fetchall()
+        observed_rows += len(rows)
+        for row in rows:
+            if row["book_id"] not in expected:
+                violations.append(f"{table} contains unconfigured book_id {row['book_id']!r}")
+    if observed_rows == 0:
+        return CrossBookCheck(
+            "unexpected_book_namespaces", CHECK_STATUS_NOT_APPLICABLE, None, "0 violations",
+            ", ".join(tables), "no book-scoped rows persisted",
+        )
+    return CrossBookCheck(
+        "unexpected_book_namespaces", CHECK_STATUS_FAILED if violations else CHECK_STATUS_PASSED,
+        str(len(violations)), "0 violations", ", ".join(tables),
+        "; ".join(violations) if violations else "every book-scoped row belongs to a configured book",
     )
 
 
@@ -272,6 +414,8 @@ _CHECK_FUNCTIONS = (
     _check_fills_reference_own_book_order,
     _check_cash_ledger_foreign_reference,
     _check_lots_reference_own_book_fill,
+    _check_position_lot_consistency,
+    _check_unexpected_book_namespaces,
     _check_lifecycle_symbol_results_scope,
     _check_reconciliations_own_book,
 )
@@ -290,6 +434,8 @@ def verify_cross_book_integrity(
     not become PASSED")."""
     as_of_iso = as_of.isoformat()
     checks = tuple(fn(conn, paper_books_config, as_of_iso) for fn in _CHECK_FUNCTIONS)
+    state_hash = source_state_hash(conn, as_of)
+    scope_id = _verification_scope_id(as_of, operator_run_id, lifecycle_run_id)
 
     violation_count = sum(int(c.observed) for c in checks if c.status == CHECK_STATUS_FAILED and c.observed is not None)
     if any(c.status == CHECK_STATUS_FAILED for c in checks):
@@ -300,8 +446,9 @@ def verify_cross_book_integrity(
         status = STATUS_INSUFFICIENT_DATA
 
     return CrossBookVerificationResult(
-        verification_id=_verification_id(as_of, operator_run_id, lifecycle_run_id), as_of=as_of, status=status,
+        verification_id=_verification_id(scope_id, state_hash, checks), as_of=as_of, status=status,
         checks=checks, violation_count=violation_count, policy_version=POLICY_VERSION,
+        verification_scope_id=scope_id, source_state_hash=state_hash,
     )
 
 
@@ -311,10 +458,16 @@ def persist_verification(
 ) -> bool:
     """Insert-or-ignore on `result.verification_id` (Section 7: idempotent,
     no duplicate rows for identical frozen inputs)."""
+    persisted_state_hash = result.source_state_hash or source_state_hash(conn, result.as_of)
+    persisted_scope_id = result.verification_scope_id or _verification_scope_id(
+        result.as_of, operator_run_id, lifecycle_run_id,
+    )
     record = {
         "verification_id": result.verification_id, "as_of": result.as_of, "operator_run_id": operator_run_id,
         "lifecycle_run_id": lifecycle_run_id, "status": result.status, "violation_count": result.violation_count,
         "policy_version": result.policy_version, "created_at": created_at,
+        "verification_scope_id": persisted_scope_id,
+        "source_state_hash": persisted_state_hash,
     }
     check_rows = [
         {

@@ -99,7 +99,7 @@ def select_valuation_price(
 
 def build_portfolio_snapshot(
     conn, book_id: str, as_of: datetime, *, evidence_snapshots_by_symbol: dict | None = None,
-    price_provider=None, maximum_price_age_seconds: int,
+    price_provider=None, maximum_price_age_seconds: int, persist: bool = True,
 ) -> PaperPortfolioSnapshot:
     from . import cash_ledger
 
@@ -188,5 +188,6 @@ def build_portfolio_snapshot(
         position_count=len(positions), unvalued_position_count=unvalued_count, stale_position_count=stale_count,
         valuation_status=overall_status, source_hash=source_hash,
     )
-    repo.save_snapshot(conn, snapshot, position_rows)
+    if persist:
+        repo.save_snapshot(conn, snapshot, position_rows)
     return snapshot
