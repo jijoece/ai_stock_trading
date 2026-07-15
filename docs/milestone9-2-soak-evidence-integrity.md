@@ -19,6 +19,21 @@ signal, no alert-resolution CLI, and a readiness result that hides simultaneous
 failures. It does **not** activate recurring execution, add an external paper
 broker, or touch live trading anywhere.
 
+## Milestone 9.3 corrections
+
+Milestone 9.3 supersedes the original provider-history and verification details in this document.
+Controlled readiness now qualifies history only from explicit `SUCCEEDED` real-provider provenance;
+failed, unavailable, partial, attempted, and unknown outcomes do not satisfy the floor. Cost remains
+only a budget/pricing/reporting signal. Completed cycles missing provenance are counted as `UNKNOWN`,
+and category totals reconcile to completed history. Evidence facts are linked append-only to the
+resulting research run rather than rewritten.
+
+Readiness evaluates all safe checks and returns every failed or missing check while retaining a fixed
+primary-status priority. Cross-book verification IDs now incorporate deterministic source state and
+check results; repaired state creates a later immutable event, and stale verification cannot satisfy
+recurring-review readiness. Settlement references, unexpected book namespaces, and position/lot
+quantities receive explicit checks. See `docs/milestone9-3-evidence-integrity-and-soak-campaign.md`.
+
 ## 1. Authoritative provider-provenance classification
 
 Cost was never provider identity — `shadow_run_summaries.cost_usd > 0` proved

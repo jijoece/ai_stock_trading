@@ -531,29 +531,27 @@ def evaluate_paper_soak_readiness(conn, as_of: datetime, cfg) -> dict:
     completed_cycles = len(lifecycle_runs)
     both_enabled = cfg.is_book_enabled(cfg.baseline.book_id) and cfg.is_book_enabled(cfg.enhanced.book_id)
 
-    def outcome(result: str, reasons: list[str]) -> dict:
-        return {
-            "result": result, "reasons": reasons, "as_of": as_of.isoformat(),
-            "completed_cycles": completed_cycles, "market_days_covered": market_days_covered,
-            "both_books_enabled": both_enabled,
-        }
+    failed_checks: list[dict] = []
+
+    def fail(name: str, result: str, reasons: list[str]) -> None:
+        failed_checks.append({"name": name, "result": result, "reasons": reasons})
 
     if not both_enabled:
-        return outcome("NOT_READY_INSUFFICIENT_CYCLES", ["both baseline and enhanced books must be enabled for a comparable soak"])
+        fail("both_books_enabled", "NOT_READY_INSUFFICIENT_CYCLES", ["both baseline and enhanced books must be enabled for a comparable soak"])
     if completed_cycles < cfg.lifecycle.soak.minimum_completed_cycles:
-        return outcome(
-            "NOT_READY_INSUFFICIENT_CYCLES",
+        fail(
+            "minimum_completed_cycles", "NOT_READY_INSUFFICIENT_CYCLES",
             [f"completed_cycles {completed_cycles} < minimum_completed_cycles {cfg.lifecycle.soak.minimum_completed_cycles}"],
         )
     if market_days_covered < cfg.lifecycle.soak.minimum_market_days:
-        return outcome(
-            "NOT_READY_INSUFFICIENT_MARKET_DAYS",
+        fail(
+            "minimum_market_days", "NOT_READY_INSUFFICIENT_MARKET_DAYS",
             [f"market_days_covered {market_days_covered} < minimum_market_days {cfg.lifecycle.soak.minimum_market_days}"],
         )
 
     lifecycle_failures = [reason for run in lifecycle_runs for reason in run["failure_reasons"]]
     if lifecycle_failures:
-        return outcome("NOT_READY_LIFECYCLE_FAILURES", lifecycle_failures[:10])
+        fail("lifecycle_failures", "NOT_READY_LIFECYCLE_FAILURES", lifecycle_failures[:10])
 
     recon_bad = []
     valuation_bad = []
@@ -564,13 +562,31 @@ def evaluate_paper_soak_readiness(conn, as_of: datetime, cfg) -> dict:
             recon_bad.append(f"{book_id}: {recon_upto[-1]['status']}")
         snap = valuation.build_portfolio_snapshot(
             conn, book_id, as_of, price_provider=None, maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
+            persist=False,
         )
         if snap.valuation_status != VALUATION_COMPLETE:
             valuation_bad.append(f"{book_id}: {snap.valuation_status}")
     if recon_bad:
-        return outcome("NOT_READY_RECONCILIATION", recon_bad)
+        fail("paper_reconciliation", "NOT_READY_RECONCILIATION", recon_bad)
     if valuation_bad:
-        return outcome("NOT_READY_VALUATION", valuation_bad)
+        fail("paper_valuation", "NOT_READY_VALUATION", valuation_bad)
+
+    # Preserve the original deterministic primary order while returning all
+    # failures to controlled readiness.
+    primary_order = (
+        "both_books_enabled", "minimum_completed_cycles", "minimum_market_days", "lifecycle_failures",
+        "paper_reconciliation", "paper_valuation",
+    )
+    primary = next((f for name in primary_order for f in failed_checks if f["name"] == name), None)
+
+    def outcome(result: str, reasons: list[str]) -> dict:
+        return {
+            "result": result, "reasons": reasons, "as_of": as_of.isoformat(),
+            "completed_cycles": completed_cycles, "market_days_covered": market_days_covered,
+            "both_books_enabled": both_enabled, "failed_checks": failed_checks,
+        }
+    if primary:
+        return outcome(primary["result"], primary["reasons"])
 
     result = (
         "READY_FOR_RECURRING_ACTIVATION_REVIEW"
@@ -597,10 +613,8 @@ def _operator_run_id(as_of: datetime, cycle_ids: tuple[str, ...]) -> str:
     — mirrors `lifecycle.py::_lifecycle_run_id`'s own hashing convention, so
     replaying `paper-soak-run` for the identical date/cycle set always
     resolves to the same operator-run row."""
-    digest = hashlib.sha256(
-        f"{as_of.isoformat()}|{','.join(sorted(cycle_ids))}|paper-soak-operator-run-v1".encode()
-    ).hexdigest()[:32]
-    return f"pb-soak-op-{digest}"
+    from .soak_campaign import operator_run_id
+    return operator_run_id(as_of, cycle_ids)
 
 
 def _operator_run_to_json(run: dict) -> dict:
@@ -640,8 +654,7 @@ def paper_soak_run_cli(
     but the returned JSON always reflects the current, freshly recomputed
     state (matching `paper_book_lifecycle_run_cli`'s own convention)."""
     from ..shadow.config import load_shadow_operations_config
-    from .controlled_soak_readiness import evaluate_controlled_soak_readiness
-    from .cross_book_verification import persist_verification, verify_cross_book_integrity
+    from .soak_campaign import run_controlled_soak_day
 
     cfg, error = _load_config_or_error()
     if error:
@@ -652,61 +665,23 @@ def paper_soak_run_cli(
         return {"error": "paper_books.lifecycle.enabled is false — paper-soak-run fails closed"}
 
     integrate_cycle_ids = tuple(integrate_cycle_ids)
-    operator_run_id = _operator_run_id(as_of, integrate_cycle_ids)
-
     with session(db_path) as conn:
-        pause_state = pause_mod.current_state(conn)
-        if pause_state.is_killed:
-            return {"error": f"shadow kill switch is active ({pause_state.reason}) — paper-soak-run fails closed"}
-        if pause_state.is_blocking:
-            return {"error": f"shadow pause state is {pause_state.state} ({pause_state.reason}) — paper-soak-run fails closed"}
-
-        try:
-            lifecycle_result = lifecycle.run_paper_book_lifecycle(
-                conn, as_of=as_of, paper_books_config=cfg, integrate_cycle_ids=integrate_cycle_ids,
-                clock=_utc_now if audit_time_now else None,
-            )
-        except lifecycle.LifecycleError as exc:
-            return {"error": str(exc)}
-
-        # Milestone 9.2 Section 12: cross-book verification runs after
-        # lifecycle/reconciliation and is persisted BEFORE readiness is
-        # evaluated, so `evaluate_controlled_soak_readiness`'s own lookup of
-        # "the latest persisted verification at-or-before as_of" always sees
-        # this run's own result. One verification failure never erases the
-        # lifecycle evidence already persisted above.
-        verification = verify_cross_book_integrity(
-            conn, as_of=as_of, paper_books_config=cfg, operator_run_id=operator_run_id,
-            lifecycle_run_id=lifecycle_result.lifecycle_run_id,
-        )
-        persist_verification(
-            conn, verification, operator_run_id=operator_run_id, lifecycle_run_id=lifecycle_result.lifecycle_run_id,
-            created_at=_utc_now(),
-        )
-
-        soak_report = _build_soak_report(conn, as_of, cfg)
         shadow_cfg = load_shadow_operations_config()
-        combined = evaluate_controlled_soak_readiness(conn, as_of, cfg, shadow_cfg)
-
-        record = {
-            "operator_run_id": operator_run_id, "as_of": as_of, "requested_cycle_ids": list(integrate_cycle_ids),
-            "lifecycle_run_id": lifecycle_result.lifecycle_run_id,
-            "baseline_reconciliation_status": lifecycle_result.reconciliation_statuses.get(cfg.baseline.book_id),
-            "enhanced_reconciliation_status": lifecycle_result.reconciliation_statuses.get(cfg.enhanced.book_id),
-            "soak_report_status": soak_report["status"], "controlled_readiness_status": combined.status,
-            "failure_reasons": list(lifecycle_result.failure_reasons), "policy_version": combined.policy_version,
-            "created_at": _utc_now(),
-            "cross_book_verification_id": verification.verification_id,
-            "cross_book_verification_status": verification.status,
-        }
-        pb_repo.save_operator_run(conn, record)
-        stored = pb_repo.load_operator_run(conn, operator_run_id)
-
-        result = _operator_run_to_json(stored)
-        result["lifecycle_result"] = _lifecycle_result_to_json(lifecycle_result)
-        result["cross_book_verification"] = _cross_book_result_to_json(verification)
-        result["soak_report"] = soak_report
-        result["controlled_readiness"] = _controlled_readiness_to_json(combined)
+        try:
+            day = run_controlled_soak_day(
+                conn, as_of=as_of, cycle_ids=integrate_cycle_ids, paper_books_config=cfg,
+                shadow_config=shadow_cfg, audit_clock=_utc_now if audit_time_now else (lambda: as_of),
+            )
+        except (lifecycle.LifecycleError, RuntimeError) as exc:
+            return {"error": str(exc)}
+        if day["blocked_before_lifecycle"]:
+            state = pause_mod.current_state(conn)
+            return {"error": f"shadow pause state is {state.state} ({state.reason}) — paper-soak-run fails closed"}
+        result = _operator_run_to_json(day["operator_run"])
+        result["lifecycle_result"] = _lifecycle_result_to_json(day["lifecycle_result"])
+        result["cross_book_verification"] = _cross_book_result_to_json(day["verification"])
+        result["soak_report"] = day["soak_report"]
+        result["controlled_readiness"] = _controlled_readiness_to_json(day["controlled_readiness"])
         return result
 
 
@@ -792,3 +767,59 @@ def paper_book_cross_check_cli(
             conn, result, operator_run_id=operator_run_id, lifecycle_run_id=lifecycle_run_id, created_at=_utc_now(),
         )
         return _cross_book_result_to_json(result)
+
+
+def paper_soak_campaign_validate_cli(manifest_path: Path) -> dict:
+    from .soak_campaign import SoakCampaignError, load_campaign_manifest
+    try:
+        manifest = load_campaign_manifest(manifest_path)
+    except SoakCampaignError as exc:
+        return {"error": str(exc), "valid": False}
+    return {
+        "valid": True, "campaign_id": manifest.campaign_id, "manifest_hash": manifest.manifest_hash,
+        "date_count": len(manifest.dates), "cycle_count": sum(len(day.cycle_ids) for day in manifest.dates),
+        "dates": [{"as_of": day.as_of.isoformat(), "cycle_ids": list(day.cycle_ids)} for day in manifest.dates],
+    }
+
+
+def paper_soak_campaign_run_cli(
+    db_path: Path, *, manifest_path: Path, continue_on_blocker: bool = False,
+) -> dict:
+    from ..shadow.config import load_shadow_operations_config
+    from .soak_campaign import SoakCampaignError, load_campaign_manifest, run_soak_campaign
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.soak_campaign.enabled:
+        return {"error": "paper_books.soak_campaign.enabled is false — campaign run fails closed"}
+    try:
+        manifest = load_campaign_manifest(manifest_path)
+        with session(db_path) as conn:
+            return run_soak_campaign(
+                conn, manifest=manifest, paper_books_config=cfg,
+                shadow_config=load_shadow_operations_config(),
+                stop_on_blocker=False if continue_on_blocker else cfg.soak_campaign.stop_on_blocker,
+                audit_clock=_utc_now,
+            )
+    except SoakCampaignError as exc:
+        return {"error": str(exc)}
+
+
+def paper_soak_campaign_show_cli(db_path: Path, *, campaign_id: str) -> dict:
+    from .soak_campaign import SoakCampaignError, show_soak_campaign
+    try:
+        with session(db_path) as conn:
+            return show_soak_campaign(conn, campaign_id)
+    except SoakCampaignError as exc:
+        return {"error": str(exc)}
+
+
+def paper_soak_activation_review_cli(db_path: Path, *, campaign_id: str) -> dict:
+    with session(db_path) as conn:
+        campaign = pb_repo.load_soak_campaign(conn, campaign_id)
+        if campaign is None:
+            return {"error": f"unknown campaign_id {campaign_id!r}"}
+        review = pb_repo.load_soak_activation_review_for_campaign(conn, campaign_id)
+        if review is None:
+            return {"error": f"campaign {campaign_id!r} has no persisted activation review"}
+        return review

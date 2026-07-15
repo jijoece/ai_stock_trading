@@ -2173,6 +2173,25 @@ def main(argv: list[str] | None = None) -> int:
     p_pb_cross_check.add_argument("--operator-run-id", default=None)
     p_pb_cross_check.add_argument("--lifecycle-run-id", default=None)
 
+    p_campaign_validate = sub.add_parser(
+        "paper-soak-campaign-validate", help="Validate a bounded explicit soak-campaign JSON manifest"
+    )
+    p_campaign_validate.add_argument("--manifest", required=True, type=Path)
+    p_campaign_run = sub.add_parser(
+        "paper-soak-campaign-run", help="Run a disabled-by-default manual multi-day paper-soak campaign"
+    )
+    p_campaign_run.add_argument("--manifest", required=True, type=Path)
+    p_campaign_run.add_argument(
+        "--continue-on-blocker", action="store_true",
+        help="Explicitly process later manifest dates after a hard blocker",
+    )
+    p_campaign_show = sub.add_parser("paper-soak-campaign-show", help="Show a persisted soak campaign")
+    p_campaign_show.add_argument("--campaign-id", required=True)
+    p_activation_review = sub.add_parser(
+        "paper-soak-activation-review", help="Show the persisted advisory-only activation review"
+    )
+    p_activation_review.add_argument("--campaign-id", required=True)
+
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
@@ -2585,6 +2604,36 @@ def main(argv: list[str] | None = None) -> int:
             cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
             operator_run_id=args.operator_run_id, lifecycle_run_id=args.lifecycle_run_id,
         )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-campaign-validate":
+        from .paper_books.cli_support import paper_soak_campaign_validate_cli
+        outcome = paper_soak_campaign_validate_cli(args.manifest)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-campaign-run":
+        from .paper_books.cli_support import paper_soak_campaign_run_cli
+        cfg = load_config()
+        outcome = paper_soak_campaign_run_cli(
+            cfg.research_database_path, manifest_path=args.manifest,
+            continue_on_blocker=args.continue_on_blocker,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-campaign-show":
+        from .paper_books.cli_support import paper_soak_campaign_show_cli
+        cfg = load_config()
+        outcome = paper_soak_campaign_show_cli(cfg.research_database_path, campaign_id=args.campaign_id)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-activation-review":
+        from .paper_books.cli_support import paper_soak_activation_review_cli
+        cfg = load_config()
+        outcome = paper_soak_activation_review_cli(cfg.research_database_path, campaign_id=args.campaign_id)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 

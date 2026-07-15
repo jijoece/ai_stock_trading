@@ -209,3 +209,69 @@ def test_never_fabricates_passed_from_zero_violations_and_insufficient_data(conn
     result = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
     assert result.violation_count == 0
     assert result.status == cbv.STATUS_INSUFFICIENT_DATA
+
+
+def test_verified_state_change_generates_new_id_and_stale_signal(conn, cfg):
+    _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
+    first = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    cbv.persist_verification(conn, first, operator_run_id=None, lifecycle_run_id=None, created_at=DAY1)
+    cash_ledger.cash_adjustment(
+        conn, "BASELINE", Decimal("1"), operator="auditor", reason="verified correction",
+        idempotency_key="audit-adjustment", now=DAY1,
+    )
+    second = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert second.verification_id != first.verification_id
+    assert cbv.verification_is_stale(conn, pb_repo.load_cross_book_verification(conn, first.verification_id), DAY1)
+
+
+def test_failed_then_repaired_state_preserves_both_events(conn, cfg):
+    _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
+    conn.execute("UPDATE paper_book_positions SET quantity = '999' WHERE book_id = 'BASELINE' AND symbol = 'AAPL'")
+    conn.commit()
+    failed = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert failed.status == cbv.STATUS_FAILED
+    cbv.persist_verification(conn, failed, operator_run_id="op", lifecycle_run_id="lc", created_at=DAY1)
+    lot_quantity = sum(Decimal(l["remaining_quantity"]) for l in pb_repo.list_all_lots(conn, "BASELINE", "AAPL"))
+    conn.execute(
+        "UPDATE paper_book_positions SET quantity = ? WHERE book_id = 'BASELINE' AND symbol = 'AAPL'",
+        (str(lot_quantity),),
+    )
+    conn.commit()
+    repaired = cbv.verify_cross_book_integrity(
+        conn, as_of=DAY1, paper_books_config=cfg, operator_run_id="op", lifecycle_run_id="lc"
+    )
+    assert repaired.status == cbv.STATUS_PASSED
+    cbv.persist_verification(conn, repaired, operator_run_id="op", lifecycle_run_id="lc", created_at=DAY1)
+    assert pb_repo.load_cross_book_verification(conn, failed.verification_id)["status"] == cbv.STATUS_FAILED
+    assert pb_repo.load_cross_book_verification(conn, repaired.verification_id)["status"] == cbv.STATUS_PASSED
+    assert pb_repo.latest_cross_book_verification_upto(conn, DAY1.isoformat())["verification_id"] == repaired.verification_id
+
+
+def test_unmatched_settlement_reference_fails(conn, cfg):
+    _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
+    conn.execute(
+        "INSERT INTO paper_book_cash_ledger (book_id, ledger_entry_id, event_type, amount_usd, event_timestamp, "
+        "idempotency_key, reference_id, created_at) VALUES ('BASELINE', 'bad-settle', 'BUY_SETTLEMENT', '-1', ?, "
+        "'bad-settle', 'missing-fill', ?)", (DAY1.isoformat(), DAY1.isoformat()),
+    )
+    conn.commit()
+    result = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert "cash_ledger_foreign_reference" in {c.name for c in result.checks if c.status == cbv.CHECK_STATUS_FAILED}
+
+
+def test_unexpected_book_namespace_fails(conn, cfg):
+    conn.execute(
+        "INSERT INTO paper_books (book_id, experiment_arm, starting_cash_usd, created_at, config_hash) "
+        "VALUES ('EXTRA', 'BASELINE', '1', ?, 'h')", (DAY1.isoformat(),),
+    )
+    conn.commit()
+    result = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert "unexpected_book_namespaces" in {c.name for c in result.checks if c.status == cbv.CHECK_STATUS_FAILED}
+
+
+def test_position_lot_quantity_inconsistency_fails(conn, cfg):
+    _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
+    conn.execute("UPDATE paper_book_positions SET quantity = '2' WHERE book_id = 'BASELINE' AND symbol = 'AAPL'")
+    conn.commit()
+    result = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert "position_lot_consistency" in {c.name for c in result.checks if c.status == cbv.CHECK_STATUS_FAILED}

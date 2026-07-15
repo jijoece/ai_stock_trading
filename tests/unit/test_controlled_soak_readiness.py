@@ -317,3 +317,110 @@ def test_result_status_always_in_documented_vocabulary(conn, paper_cfg, shadow_c
     assert result.status in csr.CONTROLLED_SOAK_STATUSES
     for check in result.checks:
         assert check.classification in csr.CHECK_CLASSIFICATIONS
+
+
+def _persist_completed_cycle_with_provider(conn, *, cycle_id: str, provider_mode: str, real: bool) -> None:
+    from trading_research.research.provider_provenance import evidence_provider_row, record_cycle_provider_provenance
+    conn.execute(
+        "INSERT INTO research_cycles (cycle_id, universe_id, as_of, configuration_hash, experiment_policy, "
+        "provider_mode, status, started_at, completed_at) VALUES (?, 'u', ?, 'h', 'OBSERVE_ONLY', ?, 'COMPLETED', ?, ?)",
+        (cycle_id, BASE_TIME.isoformat(), provider_mode, BASE_TIME.isoformat(), BASE_TIME.isoformat()),
+    )
+    conn.commit()
+    record_cycle_provider_provenance(conn, [evidence_provider_row(
+        cycle_id=cycle_id, research_run_id=None, symbol="AAPL", provider_category="market",
+        provider_name="real-market" if real else "fixture-market", request_or_source_id="s", status="ok",
+        cycle_provider_mode="real" if real else "fixture", observed_at=BASE_TIME,
+    )])
+
+
+def test_zero_cost_successful_real_provider_satisfies_controlled_gate(conn, paper_cfg, shadow_cfg, monkeypatch):
+    from trading_research.shadow.readiness import ReadinessThresholds
+    _persist_completed_cycle_with_provider(conn, cycle_id="real-zero-cost", provider_mode="real", real=True)
+    monkeypatch.setattr(csr, "evaluate_paper_soak_readiness", lambda c, a, cfg: _ready_paper_soak())
+    monkeypatch.setattr(
+        "trading_research.shadow.readiness.evaluate_activation_readiness",
+        lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
+    )
+    result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg,
+        shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=1),
+    )
+    check = next(c for c in result.checks if c.name == "real_provider_success_cycle_count")
+    assert check.passed is True
+    assert result.status != csr.STATUS_NOT_READY_PROVIDER_HISTORY
+
+
+def test_positive_cost_fixture_does_not_satisfy_controlled_gate(conn, paper_cfg, shadow_cfg, monkeypatch):
+    from trading_research.shadow.readiness import ReadinessThresholds
+    from trading_research.storage.shadow_alerts_repositories import save_run_summary
+    _persist_completed_cycle_with_provider(conn, cycle_id="fixture-with-cost", provider_mode="fixture", real=False)
+    save_run_summary(conn, {
+        "scheduler_run_id": "fixture-cost-run", "intended_schedule_id": "fixture-cost", "policy_version": "health/v2",
+        "health_status": "HEALTHY", "health_reasons_json": "[]", "provider_success_rate": 1.0,
+        "evidence_completeness_rate": 1.0, "claude_role_success_rate": 1.0, "retry_rate": 0.0,
+        "retry_exhaustion_rate": 0.0, "unsupported_claim_rate": 0.0, "output_truncation_rate": 0.0,
+        "latency_seconds": 1.0, "input_tokens": 1, "output_tokens": 1, "cost_usd": "99.00",
+        "paper_reconciliation_mismatch": 0, "duplicate_prevention_violation": 0,
+        "cycle_duration_seconds": 1.0, "created_at": BASE_TIME.isoformat(),
+    })
+    monkeypatch.setattr(csr, "evaluate_paper_soak_readiness", lambda c, a, cfg: _ready_paper_soak())
+    monkeypatch.setattr(
+        "trading_research.shadow.readiness.evaluate_activation_readiness",
+        lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
+    )
+    result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg,
+        shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=1),
+    )
+    assert result.status == csr.STATUS_NOT_READY_PROVIDER_HISTORY
+    assert next(c for c in result.checks if c.name == "real_provider_success_cycle_count").observed_value == "0"
+
+
+def test_all_simultaneous_failures_visible_with_deterministic_primary(conn, paper_cfg, shadow_cfg, monkeypatch):
+    pause_mod.kill(conn, "operator emergency stop", "alice", clock=lambda: BASE_TIME)
+    raise_alert(conn, OperationalAlert(
+        severity=SEVERITY_CRITICAL, alert_type="PROVIDER_UNAVAILABLE", message="provider down",
+        context={}, created_at=BASE_TIME,
+    ), (), clock=lambda: BASE_TIME)
+    monkeypatch.setattr(csr, "evaluate_paper_soak_readiness", lambda c, a, cfg: _ready_paper_soak(
+        result="NOT_READY_LIFECYCLE_FAILURES", reasons=["lifecycle failed"], failed_checks=[
+            {"name": "lifecycle_failures", "result": "NOT_READY_LIFECYCLE_FAILURES", "reasons": ["failed"]},
+            {"name": "paper_reconciliation", "result": "NOT_READY_RECONCILIATION", "reasons": ["mismatch"]},
+            {"name": "paper_valuation", "result": "NOT_READY_VALUATION", "reasons": ["unsafe"]},
+        ],
+    ))
+    result = csr.evaluate_controlled_soak_readiness(conn, BASE_TIME, paper_cfg, shadow_cfg)
+    failed = {c.name for c in result.checks if c.passed is False}
+    assert result.status == csr.STATUS_NOT_READY_SHADOW_KILLED
+    assert {"shadow_kill_state", "unresolved_critical_alerts", "lifecycle_failures",
+            "paper_reconciliation", "paper_valuation"} <= failed
+
+
+def test_stale_verification_cannot_satisfy_recurring_review(conn, paper_cfg, shadow_cfg, monkeypatch):
+    from trading_research.paper_books import cash_ledger
+    from trading_research.paper_books.cross_book_verification import CrossBookVerificationResult, persist_verification
+    from trading_research.shadow.readiness import ReadinessThresholds
+    persisted = CrossBookVerificationResult(
+        verification_id="cbv-before-change", as_of=BASE_TIME, status="PASSED", checks=(),
+        violation_count=0, policy_version="cross-book-verification/v2",
+    )
+    persist_verification(conn, persisted, operator_run_id=None, lifecycle_run_id=None, created_at=BASE_TIME)
+    cash_ledger.open_book(
+        conn, book_id="BASELINE", starting_cash_usd=Decimal("100000"), config_hash="h", clock=lambda: BASE_TIME,
+    )
+    monkeypatch.setattr(csr, "evaluate_paper_soak_readiness", lambda c, a, cfg: _ready_paper_soak(
+        result="READY_FOR_RECURRING_ACTIVATION_REVIEW", market_days_covered=100,
+    ))
+    monkeypatch.setattr(
+        "trading_research.shadow.readiness.evaluate_activation_readiness",
+        lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
+    )
+    result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg,
+        shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=0),
+    )
+    cross = next(c for c in result.checks if c.name == "cross_book_violation_signal")
+    assert cross.observed_value == "STALE"
+    assert cross.classification == csr.CLASSIFICATION_MISSING
+    assert result.status != csr.STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW

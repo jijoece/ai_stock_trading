@@ -128,9 +128,10 @@ def save_provider_provenance(conn: sqlite3.Connection, record: dict) -> bool:
     conn.execute(
         "INSERT INTO research_cycle_provider_provenance "
         "(cycle_id, research_run_id, symbol, provider_category, provider_name, provider_mode, is_fixture, "
-        "is_real, request_or_source_id, status, observed_at, classification_version, created_at) "
+        "is_real, request_or_source_id, status, normalized_outcome, observed_at, classification_version, created_at) "
         "VALUES (:cycle_id, :research_run_id, :symbol, :provider_category, :provider_name, :provider_mode, "
-        ":is_fixture, :is_real, :request_or_source_id, :status, :observed_at, :classification_version, :created_at)",
+        ":is_fixture, :is_real, :request_or_source_id, :status, :normalized_outcome, :observed_at, "
+        ":classification_version, :created_at)",
         record,
     )
     conn.commit()
@@ -154,5 +155,44 @@ def list_provider_provenance_upto(conn: sqlite3.Connection, upto_as_of: str) -> 
         "JOIN research_cycles c ON c.cycle_id = p.cycle_id "
         "WHERE c.as_of <= ? ORDER BY p.cycle_id, p.symbol, p.provider_category",
         (upto_as_of,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_cycle_headers_upto(conn: sqlite3.Connection, upto_as_of: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT cycle_id, as_of, status, completed_at FROM research_cycles "
+        "WHERE as_of <= ? ORDER BY as_of, cycle_id",
+        (upto_as_of,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def link_provider_provenance_to_research_run(
+    conn: sqlite3.Connection, *, cycle_id: str, symbol: str, provider_category: str,
+    research_run_id: str, created_at: str,
+) -> bool:
+    """Append-only evidence-fact to research-run association."""
+    existing = conn.execute(
+        "SELECT 1 FROM research_cycle_provider_provenance_links "
+        "WHERE cycle_id = ? AND symbol = ? AND provider_category = ? AND research_run_id = ?",
+        (cycle_id, symbol, provider_category, research_run_id),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        "INSERT INTO research_cycle_provider_provenance_links "
+        "(cycle_id, symbol, provider_category, research_run_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (cycle_id, symbol, provider_category, research_run_id, created_at),
+    )
+    conn.commit()
+    return True
+
+
+def list_provider_provenance_links_for_run(conn: sqlite3.Connection, research_run_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM research_cycle_provider_provenance_links WHERE research_run_id = ? "
+        "ORDER BY cycle_id, symbol, provider_category",
+        (research_run_id,),
     ).fetchall()
     return [dict(r) for r in rows]

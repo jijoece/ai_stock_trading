@@ -926,10 +926,11 @@ def save_cross_book_verification(
         return False
     conn.execute(
         "INSERT INTO paper_book_cross_book_verifications "
-        "(verification_id, as_of, operator_run_id, lifecycle_run_id, status, violation_count, "
-        "policy_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "(verification_id, verification_scope_id, source_state_hash, as_of, operator_run_id, lifecycle_run_id, "
+        "status, violation_count, policy_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            verification["verification_id"], _ts(verification["as_of"]), verification.get("operator_run_id"),
+            verification["verification_id"], verification.get("verification_scope_id"),
+            verification.get("source_state_hash"), _ts(verification["as_of"]), verification.get("operator_run_id"),
             verification.get("lifecycle_run_id"), verification["status"], verification["violation_count"],
             verification["policy_version"], _ts(verification["created_at"]),
         ),
@@ -973,9 +974,130 @@ def latest_cross_book_verification_upto(conn: sqlite3.Connection, upto_as_of: st
     "the latest applicable persisted verification at or before `as_of`")."""
     row = conn.execute(
         "SELECT verification_id FROM paper_book_cross_book_verifications WHERE as_of <= ? "
-        "ORDER BY as_of DESC, created_at DESC LIMIT 1",
+        "ORDER BY as_of DESC, created_at DESC, rowid DESC LIMIT 1",
         (upto_as_of,),
     ).fetchone()
     if row is None:
         return None
     return load_cross_book_verification(conn, row["verification_id"])
+
+
+def list_cross_book_verifications_upto(conn: sqlite3.Connection, upto_as_of: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT verification_id FROM paper_book_cross_book_verifications WHERE as_of <= ? "
+        "ORDER BY as_of, created_at, verification_id", (upto_as_of,),
+    ).fetchall()
+    return [load_cross_book_verification(conn, row["verification_id"]) for row in rows]
+
+
+# -- controlled soak campaigns (Milestone 9.3) -------------------------------
+
+
+def save_soak_campaign(conn: sqlite3.Connection, record: dict) -> bool:
+    if load_soak_campaign(conn, record["campaign_id"]) is not None:
+        return False
+    conn.execute(
+        "INSERT INTO paper_soak_campaigns (campaign_id, manifest_hash, config_hash, start_as_of, end_as_of, "
+        "requested_date_count, requested_cycle_count, status, first_blocking_date, first_blocking_status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (record["campaign_id"], record["manifest_hash"], record["config_hash"], _ts(record["start_as_of"]),
+         _ts(record["end_as_of"]), record["requested_date_count"], record["requested_cycle_count"],
+         record["status"], record.get("first_blocking_date"), record.get("first_blocking_status"),
+         _ts(record["created_at"])),
+    )
+    conn.commit()
+    return True
+
+
+def load_soak_campaign(conn: sqlite3.Connection, campaign_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM paper_soak_campaigns WHERE campaign_id = ?", (campaign_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_soak_campaign_day(conn: sqlite3.Connection, record: dict) -> bool:
+    existing = conn.execute(
+        "SELECT 1 FROM paper_soak_campaign_days WHERE campaign_id = ? AND as_of = ?",
+        (record["campaign_id"], _ts(record["as_of"])),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        "INSERT INTO paper_soak_campaign_days (campaign_id, as_of, requested_cycle_ids_json, operator_run_id, "
+        "lifecycle_run_id, cross_book_verification_id, cross_book_verification_status, controlled_readiness_status, "
+        "all_failed_checks_json, failure_reasons_json, day_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (record["campaign_id"], _ts(record["as_of"]), json.dumps(list(record["requested_cycle_ids"])),
+         record.get("operator_run_id"), record.get("lifecycle_run_id"), record.get("cross_book_verification_id"),
+         record.get("cross_book_verification_status"), record["controlled_readiness_status"],
+         json.dumps(list(record["all_failed_checks"])), json.dumps(list(record["failure_reasons"])),
+         record["day_status"], _ts(record["created_at"])),
+    )
+    conn.commit()
+    return True
+
+
+def list_soak_campaign_days(conn: sqlite3.Connection, campaign_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_soak_campaign_days WHERE campaign_id = ? ORDER BY as_of", (campaign_id,)
+    ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["requested_cycle_ids"] = json.loads(item["requested_cycle_ids_json"])
+        item["all_failed_checks"] = json.loads(item["all_failed_checks_json"])
+        item["failure_reasons"] = json.loads(item["failure_reasons_json"])
+        result.append(item)
+    return result
+
+
+_ACTIVATION_JSON_FIELDS = (
+    "provider_provenance_counts", "provider_success_counts", "cross_book_verification_history",
+    "reconciliation_history", "valuation_history", "alert_summary", "pause_and_kill_summary",
+    "performance_metrics", "controlled_readiness_history", "reasons",
+)
+
+
+def save_soak_activation_review(conn: sqlite3.Connection, record: dict) -> bool:
+    if load_soak_activation_review(conn, record["activation_review_id"]) is not None:
+        return False
+    conn.execute(
+        "INSERT INTO paper_soak_activation_reviews (activation_review_id, campaign_id, campaign_manifest_hash, "
+        "completed_market_days, completed_cycles, provider_provenance_counts_json, provider_success_counts_json, "
+        "cross_book_verification_history_json, reconciliation_history_json, valuation_history_json, alert_summary_json, "
+        "pause_and_kill_summary_json, performance_metrics_json, comparison_id, promotion_evidence_status, "
+        "controlled_readiness_history_json, final_recommendation, reasons_json, policy_version, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (record["activation_review_id"], record["campaign_id"], record["campaign_manifest_hash"],
+         record["completed_market_days"], record["completed_cycles"],
+         json.dumps(record["provider_provenance_counts"], sort_keys=True),
+         json.dumps(record["provider_success_counts"], sort_keys=True),
+         json.dumps(record["cross_book_verification_history"], sort_keys=True),
+         json.dumps(record["reconciliation_history"], sort_keys=True),
+         json.dumps(record["valuation_history"], sort_keys=True), json.dumps(record["alert_summary"], sort_keys=True),
+         json.dumps(record["pause_and_kill_summary"], sort_keys=True),
+         json.dumps(record["performance_metrics"], sort_keys=True), record.get("comparison_id"),
+         record["promotion_evidence_status"], json.dumps(record["controlled_readiness_history"], sort_keys=True),
+         record["final_recommendation"], json.dumps(list(record["reasons"])), record["policy_version"],
+         _ts(record["created_at"])),
+    )
+    conn.commit()
+    return True
+
+
+def load_soak_activation_review(conn: sqlite3.Connection, activation_review_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_soak_activation_reviews WHERE activation_review_id = ?", (activation_review_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    for name in _ACTIVATION_JSON_FIELDS:
+        result[name] = json.loads(result[f"{name}_json"])
+    return result
+
+
+def load_soak_activation_review_for_campaign(conn: sqlite3.Connection, campaign_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT activation_review_id FROM paper_soak_activation_reviews WHERE campaign_id = ? "
+        "ORDER BY created_at DESC LIMIT 1", (campaign_id,),
+    ).fetchone()
+    return None if row is None else load_soak_activation_review(conn, row["activation_review_id"])

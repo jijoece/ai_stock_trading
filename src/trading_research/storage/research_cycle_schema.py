@@ -87,11 +87,34 @@ CREATE TABLE IF NOT EXISTS research_cycle_provider_provenance (
     is_real INTEGER NOT NULL,
     request_or_source_id TEXT,
     status TEXT NOT NULL,
+    normalized_outcome TEXT NOT NULL DEFAULT 'UNKNOWN',
     observed_at TEXT NOT NULL,
     classification_version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (cycle_id, symbol, provider_category)
 );
+
+-- Milestone 9.3: immutable association added after a research run exists.
+-- Provider facts remain immutable; this table links the already-persisted
+-- evidence facts to the resulting research run without rewriting them.
+CREATE TABLE IF NOT EXISTS research_cycle_provider_provenance_links (
+    cycle_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    provider_category TEXT NOT NULL,
+    research_run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (cycle_id, symbol, provider_category, research_run_id),
+    FOREIGN KEY (cycle_id, symbol, provider_category)
+        REFERENCES research_cycle_provider_provenance(cycle_id, symbol, provider_category)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_research_cycle_provider_links_no_update
+BEFORE UPDATE ON research_cycle_provider_provenance_links
+BEGIN SELECT RAISE(ABORT, 'research_cycle_provider_provenance_links are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_research_cycle_provider_links_no_delete
+BEFORE DELETE ON research_cycle_provider_provenance_links
+BEGIN SELECT RAISE(ABORT, 'research_cycle_provider_provenance_links are append-only'); END;
 """
 
 RESEARCH_CYCLE_INDEXES = """
@@ -99,10 +122,22 @@ CREATE INDEX IF NOT EXISTS idx_research_cycles_universe ON research_cycles(unive
 CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_results_cycle ON research_cycle_symbol_results(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_evidence_status_cycle ON research_cycle_symbol_evidence_status(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_research_cycle_symbol_evidence_status_symbol ON research_cycle_symbol_evidence_status(symbol);
+CREATE INDEX IF NOT EXISTS idx_research_cycle_provider_links_run
+    ON research_cycle_provider_provenance_links(research_run_id);
 """
+
+
+def _ensure_columns(conn) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(research_cycle_provider_provenance)").fetchall()}
+    if columns and "normalized_outcome" not in columns:
+        conn.execute(
+            "ALTER TABLE research_cycle_provider_provenance "
+            "ADD COLUMN normalized_outcome TEXT NOT NULL DEFAULT 'UNKNOWN'"
+        )
 
 
 def apply_research_cycle_schema(conn) -> None:
     conn.executescript(RESEARCH_CYCLE_DDL)
+    _ensure_columns(conn)
     conn.executescript(RESEARCH_CYCLE_INDEXES)
     conn.commit()

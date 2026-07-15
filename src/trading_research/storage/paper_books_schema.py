@@ -372,6 +372,8 @@ CREATE TABLE IF NOT EXISTS paper_soak_operator_runs (
 -- authoritative "clean" signal.
 CREATE TABLE IF NOT EXISTS paper_book_cross_book_verifications (
     verification_id TEXT PRIMARY KEY,
+    verification_scope_id TEXT,
+    source_state_hash TEXT,
     as_of TEXT NOT NULL,
     operator_run_id TEXT,
     lifecycle_run_id TEXT,
@@ -395,6 +397,62 @@ CREATE TABLE IF NOT EXISTS paper_book_cross_book_verification_checks (
     policy_version TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (verification_id, check_name)
+);
+
+-- Milestone 9.3: immutable controlled-soak campaign evidence. Campaign
+-- headers are written only when a manual run reaches a terminal result;
+-- individual requested dates (including post-blocker skips) remain visible.
+CREATE TABLE IF NOT EXISTS paper_soak_campaigns (
+    campaign_id TEXT PRIMARY KEY,
+    manifest_hash TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    start_as_of TEXT NOT NULL,
+    end_as_of TEXT NOT NULL,
+    requested_date_count INTEGER NOT NULL,
+    requested_cycle_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    first_blocking_date TEXT,
+    first_blocking_status TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_soak_campaign_days (
+    campaign_id TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    requested_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    operator_run_id TEXT,
+    lifecycle_run_id TEXT,
+    cross_book_verification_id TEXT,
+    cross_book_verification_status TEXT,
+    controlled_readiness_status TEXT NOT NULL,
+    all_failed_checks_json TEXT NOT NULL DEFAULT '[]',
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    day_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, as_of)
+);
+
+CREATE TABLE IF NOT EXISTS paper_soak_activation_reviews (
+    activation_review_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    campaign_manifest_hash TEXT NOT NULL,
+    completed_market_days INTEGER NOT NULL,
+    completed_cycles INTEGER NOT NULL,
+    provider_provenance_counts_json TEXT NOT NULL,
+    provider_success_counts_json TEXT NOT NULL,
+    cross_book_verification_history_json TEXT NOT NULL,
+    reconciliation_history_json TEXT NOT NULL,
+    valuation_history_json TEXT NOT NULL,
+    alert_summary_json TEXT NOT NULL,
+    pause_and_kill_summary_json TEXT NOT NULL,
+    performance_metrics_json TEXT NOT NULL,
+    comparison_id TEXT,
+    promotion_evidence_status TEXT NOT NULL,
+    controlled_readiness_history_json TEXT NOT NULL,
+    final_recommendation TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -423,6 +481,10 @@ CREATE INDEX IF NOT EXISTS idx_paper_book_lifecycle_symbol_results_run
     ON paper_book_lifecycle_symbol_results(lifecycle_run_id, book_id);
 CREATE INDEX IF NOT EXISTS idx_paper_soak_operator_runs_asof
     ON paper_soak_operator_runs(as_of);
+CREATE INDEX IF NOT EXISTS idx_paper_book_cross_book_verifications_scope
+    ON paper_book_cross_book_verifications(verification_scope_id, as_of, created_at);
+CREATE INDEX IF NOT EXISTS idx_paper_soak_campaign_days_campaign
+    ON paper_soak_campaign_days(campaign_id, as_of);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -572,6 +634,30 @@ BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verification_checks are immutab
 CREATE TRIGGER IF NOT EXISTS trg_paper_book_cross_book_verification_checks_no_delete
 BEFORE DELETE ON paper_book_cross_book_verification_checks
 BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verification_checks are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaigns_no_update
+BEFORE UPDATE ON paper_soak_campaigns
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaigns are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaigns_no_delete
+BEFORE DELETE ON paper_soak_campaigns
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaigns are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_days_no_update
+BEFORE UPDATE ON paper_soak_campaign_days
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_days are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_days_no_delete
+BEFORE DELETE ON paper_soak_campaign_days
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_days are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_activation_reviews_no_update
+BEFORE UPDATE ON paper_soak_activation_reviews
+BEGIN SELECT RAISE(ABORT, 'paper_soak_activation_reviews are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_activation_reviews_no_delete
+BEFORE DELETE ON paper_soak_activation_reviews
+BEGIN SELECT RAISE(ABORT, 'paper_soak_activation_reviews are immutable once persisted'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing
@@ -583,6 +669,10 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     "paper_soak_operator_runs": {
         "cross_book_verification_id": "TEXT",
         "cross_book_verification_status": "TEXT",
+    },
+    "paper_book_cross_book_verifications": {
+        "verification_scope_id": "TEXT",
+        "source_state_hash": "TEXT",
     },
 }
 

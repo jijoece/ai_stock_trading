@@ -124,8 +124,71 @@ def test_missing_metadata_is_unknown(conn):
     _make_cycle(conn, "c1", provider_mode="real")
     # No provenance rows ever persisted for this cycle.
     summary = compute_real_provider_history(conn, BASE_TIME)
-    assert summary.total_classified_cycles == 0
+    assert summary.total_classified_cycles == 1
+    assert summary.completed_cycle_count == 1
+    assert summary.unknown_cycle_count == 1
     assert summary.real_provider_cycle_count == 0
+
+
+def test_failed_real_evidence_is_attempt_and_failure_not_success(conn):
+    _make_cycle(conn, "failed-real", provider_mode="real")
+    record_cycle_provider_provenance(conn, [evidence_provider_row(
+        cycle_id="failed-real", research_run_id=None, symbol="AAPL", provider_category="market",
+        provider_name="real-market", request_or_source_id="req", status="timeout",
+        cycle_provider_mode="real", observed_at=BASE_TIME,
+    )])
+    summary = compute_real_provider_history(conn, BASE_TIME)
+    assert summary.real_provider_attempt_cycle_count == 1
+    assert summary.real_provider_failure_cycle_count == 1
+    assert summary.real_provider_success_cycle_count == 0
+    assert summary.unknown_cycle_count == 1
+
+
+def test_incomplete_real_claude_is_partial_not_success(conn):
+    _make_cycle(conn, "partial-claude", provider_mode="fixture")
+    record_cycle_provider_provenance(conn, [claude_provider_row(
+        cycle_id="partial-claude", research_run_id="rr-partial", symbol="AAPL",
+        provider_name="anthropic", status="ANALYSIS_INCOMPLETE", observed_at=BASE_TIME,
+    )])
+    summary = compute_real_provider_history(conn, BASE_TIME)
+    assert summary.partial_provider_cycle_count == 1
+    assert summary.real_provider_success_cycle_count == 0
+
+
+def test_category_totals_reconcile_to_completed_cycles(conn):
+    _make_cycle(conn, "known", provider_mode="fixture")
+    _make_cycle(conn, "unknown", provider_mode="real")
+    record_cycle_provider_provenance(conn, [evidence_provider_row(
+        cycle_id="known", research_run_id=None, symbol="AAPL", provider_category="market",
+        provider_name="fixture", request_or_source_id="s", status="ok",
+        cycle_provider_mode="fixture", observed_at=BASE_TIME,
+    )])
+    summary = compute_real_provider_history(conn, BASE_TIME)
+    total = (
+        summary.fixture_only_cycle_count + summary.real_evidence_only_cycle_count
+        + summary.real_claude_only_cycle_count + summary.real_evidence_and_claude_cycle_count
+        + summary.mixed_cycle_count + summary.unknown_cycle_count
+    )
+    assert total == summary.completed_cycle_count == 2
+
+
+def test_evidence_fact_links_append_only_to_research_run(conn):
+    from trading_research.storage import research_cycle_repositories as repo
+    _make_cycle(conn, "linked", provider_mode="real")
+    record_cycle_provider_provenance(conn, [evidence_provider_row(
+        cycle_id="linked", research_run_id=None, symbol="AAPL", provider_category="market",
+        provider_name="real-market", request_or_source_id="s", status="ok",
+        cycle_provider_mode="real", observed_at=BASE_TIME,
+    )])
+    assert repo.link_provider_provenance_to_research_run(
+        conn, cycle_id="linked", symbol="AAPL", provider_category="market",
+        research_run_id="rr-linked", created_at=BASE_TIME.isoformat(),
+    )
+    assert not repo.link_provider_provenance_to_research_run(
+        conn, cycle_id="linked", symbol="AAPL", provider_category="market",
+        research_run_id="rr-linked", created_at=BASE_TIME.isoformat(),
+    )
+    assert repo.list_provider_provenance_links_for_run(conn, "rr-linked")[0]["provider_category"] == "market"
 
 
 def test_positive_cost_does_not_imply_real_and_zero_cost_does_not_imply_fixture(conn):
