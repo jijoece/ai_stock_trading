@@ -50,6 +50,7 @@ def test_shipped_config_loads_and_is_disabled_by_default():
     assert cfg.execution.allow_live_broker is False
     assert cfg.execution.allow_external_paper_broker is False
     assert cfg.soak_campaign.enabled is False
+    assert cfg.recurring.enabled is False
 
 
 def test_valid_config_round_trips(tmp_path):
@@ -175,6 +176,57 @@ def test_soak_campaign_booleans_are_strict(tmp_path):
     data = _valid_config()
     data["paper_books"]["soak_campaign"] = {"enabled": "false"}
     with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_recurring_absent_is_disabled_and_section_changes_hash(tmp_path):
+    data = _valid_config()
+    absent = load_paper_books_config(_write(tmp_path, data))
+    assert absent.recurring.enabled is False
+    data["paper_books"]["recurring"] = {
+        "enabled": False,
+        "schedule": {"timezone": "UTC", "market_days_only": True, "hour": 13, "minute": 30},
+        "maximum_cycles_per_run": 2, "maximum_runtime_seconds": 60, "lease_ttl_seconds": 120,
+        "activation_review_max_age_market_days": 10, "pause_on_safety_block": True,
+    }
+    explicit = load_paper_books_config(_write(tmp_path, data))
+    assert explicit.recurring.enabled is False
+    assert explicit.config_hash != absent.config_hash
+
+
+@pytest.mark.parametrize("path,value", [
+    (("schedule", "timezone"), "Not/A_Real_Zone"),
+    (("schedule", "hour"), 24),
+    (("schedule", "minute"), 60),
+    (("maximum_cycles_per_run",), 0),
+    (("maximum_runtime_seconds",), 100000),
+    (("lease_ttl_seconds",), -1),
+    (("activation_review_max_age_market_days",), 367),
+])
+def test_recurring_invalid_values_fail_closed(tmp_path, path, value):
+    data = _valid_config()
+    recurring = {
+        "enabled": False,
+        "schedule": {"timezone": "UTC", "market_days_only": True, "hour": 13, "minute": 30},
+    }
+    data["paper_books"]["recurring"] = recurring
+    target = recurring
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(PaperBooksConfigError):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_recurring_unknown_key_fails_closed(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["recurring"] = {"enabled": False, "enabledd": True}
+    with pytest.raises(PaperBooksConfigError, match="unknown keys"):
+        load_paper_books_config(_write(tmp_path, data))
+
+    data = _valid_config()
+    data["paper_books"]["recurring"] = {"schedule": {"timezone": "UTC", "typo": 1}}
+    with pytest.raises(PaperBooksConfigError, match="unknown keys"):
         load_paper_books_config(_write(tmp_path, data))
 
 

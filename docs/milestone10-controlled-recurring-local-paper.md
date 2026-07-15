@@ -1,5 +1,7 @@
 # Milestone 10 — Controlled recurring local paper-trading scheduler
 
+> Implementation status: implemented by `paper_books/recurring_scheduler.py`, the additive `paper_recurring_*` SQLite tables, the `paper-recurring-*` operator commands, and [the recurring local paper runbook](runbooks/recurring-local-paper-trading.md). The shipped configuration and example scheduling artifact remain disabled.
+
 Work directly in the existing `ai_stock_trading` repository.
 
 Milestones through 9.3 should already provide:

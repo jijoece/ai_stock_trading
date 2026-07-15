@@ -162,7 +162,7 @@ def operator_run_id(as_of: datetime, cycle_ids: tuple[str, ...]) -> str:
 
 def run_controlled_soak_day(
     conn, *, as_of: datetime, cycle_ids: tuple[str, ...], paper_books_config: PaperBooksConfiguration,
-    shadow_config, audit_clock: Callable[[], datetime] | None = None,
+    shadow_config, audit_clock: Callable[[], datetime] | None = None, price_provider=None,
 ) -> dict:
     """Shared service for one ``paper-soak-run`` day and campaign days."""
     if as_of.tzinfo is None or as_of.utcoffset() is None:
@@ -183,7 +183,7 @@ def run_controlled_soak_day(
     op_id = operator_run_id(as_of, cycle_ids)
     lifecycle_result = lifecycle.run_paper_book_lifecycle(
         conn, as_of=as_of, paper_books_config=paper_books_config,
-        integrate_cycle_ids=cycle_ids, clock=None,
+        integrate_cycle_ids=cycle_ids, clock=None, price_provider=price_provider,
     )
     verification = verify_cross_book_integrity(
         conn, as_of=as_of, paper_books_config=paper_books_config, operator_run_id=op_id,

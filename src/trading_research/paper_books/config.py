@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
@@ -57,9 +58,11 @@ def _strict_bool(value: object, field_name: str) -> bool:
     return value
 
 
-def _strict_int(value: object, field_name: str, *, minimum: int) -> int:
-    if type(value) is not int or value < minimum:
+def _strict_int(value: object, field_name: str, *, minimum: int, maximum: int | None = None) -> int:
+    if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
         comparison = ">= 0" if minimum == 0 else "> 0"
+        if maximum is not None:
+            comparison += f" and <= {maximum}"
         raise PaperBooksConfigError(f"{field_name} must be an integer {comparison} — got {value!r}")
     return value
 
@@ -230,6 +233,51 @@ class SoakCampaignSection:
             raise PaperBooksConfigError("soak_campaign.maximum_unresolved_warnings must be >= 0")
 
 
+@dataclass(frozen=True)
+class RecurringScheduleSection:
+    timezone: str
+    market_days_only: bool
+    hour: int
+    minute: int
+
+    def __post_init__(self) -> None:
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise PaperBooksConfigError(f"recurring.schedule.timezone is not a valid IANA timezone: {self.timezone!r}") from exc
+        if not 0 <= self.hour <= 23:
+            raise PaperBooksConfigError("recurring.schedule.hour must be in [0,23]")
+        if not 0 <= self.minute <= 59:
+            raise PaperBooksConfigError("recurring.schedule.minute must be in [0,59]")
+
+
+@dataclass(frozen=True)
+class RecurringSection:
+    enabled: bool
+    schedule: RecurringScheduleSection
+    maximum_cycles_per_run: int
+    maximum_runtime_seconds: int
+    lease_ttl_seconds: int
+    activation_review_max_age_market_days: int
+    pause_on_safety_block: bool
+
+    def __post_init__(self) -> None:
+        bounds = {
+            "maximum_cycles_per_run": 100,
+            "maximum_runtime_seconds": 86_400,
+            "lease_ttl_seconds": 86_400,
+            "activation_review_max_age_market_days": 366,
+        }
+        for name, maximum in bounds.items():
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise PaperBooksConfigError(f"recurring.{name} must be an integer in [1,{maximum}]")
+        if self.lease_ttl_seconds < self.maximum_runtime_seconds:
+            raise PaperBooksConfigError(
+                "recurring.lease_ttl_seconds must be >= recurring.maximum_runtime_seconds"
+            )
+
+
 _DISABLED_LIFECYCLE_SECTION = LifecycleSection(
     enabled=False, pending_orders=PendingOrdersSection(expire_after_market_days=1),
     exits=ExitsSection(
@@ -242,6 +290,15 @@ _DISABLED_LIFECYCLE_SECTION = LifecycleSection(
 _DISABLED_SOAK_CAMPAIGN_SECTION = SoakCampaignSection(
     enabled=False, minimum_market_days=5, minimum_completed_cycles=10,
     minimum_successful_real_provider_cycles=5, maximum_unresolved_warnings=0, stop_on_blocker=True,
+)
+
+_DISABLED_RECURRING_SECTION = RecurringSection(
+    enabled=False,
+    schedule=RecurringScheduleSection(
+        timezone="America/Los_Angeles", market_days_only=True, hour=13, minute=30,
+    ),
+    maximum_cycles_per_run=5, maximum_runtime_seconds=900, lease_ttl_seconds=1200,
+    activation_review_max_age_market_days=10, pause_on_safety_block=True,
 )
 
 
@@ -263,6 +320,7 @@ class PaperBooksConfiguration:
     # every other Milestone 9 gate's "absent = closed" convention.
     lifecycle: LifecycleSection = _DISABLED_LIFECYCLE_SECTION
     soak_campaign: SoakCampaignSection = _DISABLED_SOAK_CAMPAIGN_SECTION
+    recurring: RecurringSection = _DISABLED_RECURRING_SECTION
 
     def __post_init__(self) -> None:
         if self.baseline.book_id == self.enhanced.book_id:
@@ -295,7 +353,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         raise PaperBooksConfigError("paper-books config missing top-level 'paper_books' section")
 
     _require_no_unknown_keys(
-        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle", "soak_campaign"}, "paper_books"
+        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle", "soak_campaign", "recurring"}, "paper_books"
     )
 
     books = pb.get("books")
@@ -448,6 +506,50 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             ),
             stop_on_blocker=_strict_bool(campaign_raw.get("stop_on_blocker", True), "soak_campaign.stop_on_blocker"),
         )
+
+        recurring_raw = pb.get("recurring", {})
+        if not isinstance(recurring_raw, dict):
+            raise PaperBooksConfigError("paper_books.recurring must be a mapping")
+        _require_no_unknown_keys(
+            recurring_raw,
+            {"enabled", "schedule", "maximum_cycles_per_run", "maximum_runtime_seconds", "lease_ttl_seconds",
+             "activation_review_max_age_market_days", "pause_on_safety_block"},
+            "recurring",
+        )
+        schedule_raw = recurring_raw.get("schedule", {})
+        if not isinstance(schedule_raw, dict):
+            raise PaperBooksConfigError("paper_books.recurring.schedule must be a mapping")
+        _require_no_unknown_keys(schedule_raw, {"timezone", "market_days_only", "hour", "minute"}, "recurring.schedule")
+        recurring_section = RecurringSection(
+            enabled=_strict_bool(recurring_raw.get("enabled", False), "recurring.enabled"),
+            schedule=RecurringScheduleSection(
+                timezone=str(schedule_raw.get("timezone", "America/Los_Angeles")),
+                market_days_only=_strict_bool(
+                    schedule_raw.get("market_days_only", True), "recurring.schedule.market_days_only"
+                ),
+                hour=_strict_int(schedule_raw.get("hour", 13), "recurring.schedule.hour", minimum=0, maximum=23),
+                minute=_strict_int(schedule_raw.get("minute", 30), "recurring.schedule.minute", minimum=0, maximum=59),
+            ),
+            maximum_cycles_per_run=_strict_int(
+                recurring_raw.get("maximum_cycles_per_run", 5), "recurring.maximum_cycles_per_run",
+                minimum=1, maximum=100,
+            ),
+            maximum_runtime_seconds=_strict_int(
+                recurring_raw.get("maximum_runtime_seconds", 900), "recurring.maximum_runtime_seconds",
+                minimum=1, maximum=86_400,
+            ),
+            lease_ttl_seconds=_strict_int(
+                recurring_raw.get("lease_ttl_seconds", 1200), "recurring.lease_ttl_seconds",
+                minimum=1, maximum=86_400,
+            ),
+            activation_review_max_age_market_days=_strict_int(
+                recurring_raw.get("activation_review_max_age_market_days", 10),
+                "recurring.activation_review_max_age_market_days", minimum=1, maximum=366,
+            ),
+            pause_on_safety_block=_strict_bool(
+                recurring_raw.get("pause_on_safety_block", True), "recurring.pause_on_safety_block"
+            ),
+        )
     except PaperBooksConfigError:
         raise
     except Exception as exc:
@@ -457,5 +559,6 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
         scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section, soak_campaign=campaign_section,
+        recurring=recurring_section,
         config_hash=hash_config(raw), raw=raw,
     )

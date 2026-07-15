@@ -2192,6 +2192,47 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_activation_review.add_argument("--campaign-id", required=True)
 
+    p_recurring_request = sub.add_parser(
+        "paper-recurring-request-activation", help="Request audited local recurring-paper activation"
+    )
+    p_recurring_request.add_argument("--activation-review-id", required=True)
+    p_recurring_request.add_argument("--operator", required=True)
+    p_recurring_request.add_argument("--reason", required=True)
+
+    p_recurring_activate = sub.add_parser(
+        "paper-recurring-activate", help="Explicitly approve a current recurring-paper activation request"
+    )
+    p_recurring_activate.add_argument("--request-event-id", required=True)
+    p_recurring_activate.add_argument("--operator", required=True)
+
+    p_recurring_deactivate = sub.add_parser("paper-recurring-deactivate", help="Deactivate recurring local paper execution")
+    p_recurring_deactivate.add_argument("--operator", required=True)
+    p_recurring_deactivate.add_argument("--reason", required=True)
+
+    p_recurring_enqueue = sub.add_parser(
+        "paper-recurring-enqueue-cycle", help="Explicitly enqueue one completed frozen research cycle"
+    )
+    p_recurring_enqueue.add_argument("--cycle-id", required=True)
+    p_recurring_enqueue.add_argument("--operator", required=True)
+    p_recurring_enqueue.add_argument("--reason", required=True)
+
+    p_recurring_cancel = sub.add_parser("paper-recurring-cancel-cycle", help="Cancel one queued recurring-paper cycle")
+    p_recurring_cancel.add_argument("--queue-item-id", required=True)
+    p_recurring_cancel.add_argument("--operator", required=True)
+    p_recurring_cancel.add_argument("--reason", required=True)
+
+    p_recurring_run = sub.add_parser(
+        "paper-recurring-run-once", help="Invoke at most one due recurring local-paper slot"
+    )
+    p_recurring_run.add_argument("--now", required=True, help="timezone-aware ISO8601 timestamp")
+    p_recurring_run.add_argument("--owner-id", required=True)
+
+    sub.add_parser("paper-recurring-status", help="Show recurring configuration, activation, queue, lease, and runs")
+    p_recurring_queue = sub.add_parser("paper-recurring-queue-list", help="List explicit recurring cycle queue items")
+    p_recurring_queue.add_argument(
+        "--status", choices=("QUEUED", "CLAIMED", "PROCESSED", "FAILED", "CANCELLED"), default=None,
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
@@ -2634,6 +2675,76 @@ def main(argv: list[str] | None = None) -> int:
         from .paper_books.cli_support import paper_soak_activation_review_cli
         cfg = load_config()
         outcome = paper_soak_activation_review_cli(cfg.research_database_path, campaign_id=args.campaign_id)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-request-activation":
+        from .paper_books.cli_support import paper_recurring_request_activation_cli
+        cfg = load_config()
+        outcome = paper_recurring_request_activation_cli(
+            cfg.research_database_path, activation_review_id=args.activation_review_id,
+            operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-activate":
+        from .paper_books.cli_support import paper_recurring_activate_cli
+        cfg = load_config()
+        outcome = paper_recurring_activate_cli(
+            cfg.research_database_path, request_event_id=args.request_event_id, operator=args.operator,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-deactivate":
+        from .paper_books.cli_support import paper_recurring_deactivate_cli
+        cfg = load_config()
+        outcome = paper_recurring_deactivate_cli(
+            cfg.research_database_path, operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-enqueue-cycle":
+        from .paper_books.cli_support import paper_recurring_enqueue_cycle_cli
+        cfg = load_config()
+        outcome = paper_recurring_enqueue_cycle_cli(
+            cfg.research_database_path, cycle_id=args.cycle_id, operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-cancel-cycle":
+        from .paper_books.cli_support import paper_recurring_cancel_cycle_cli
+        cfg = load_config()
+        outcome = paper_recurring_cancel_cycle_cli(
+            cfg.research_database_path, queue_item_id=args.queue_item_id,
+            operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-run-once":
+        from .paper_books.cli_support import paper_recurring_run_once_cli
+        cfg = load_config()
+        outcome = paper_recurring_run_once_cli(
+            cfg.research_database_path, now=_parse_iso_datetime(args.now), owner_id=args.owner_id,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-status":
+        from .paper_books.cli_support import paper_recurring_status_cli
+        cfg = load_config()
+        outcome = paper_recurring_status_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-recurring-queue-list":
+        from .paper_books.cli_support import paper_recurring_queue_list_cli
+        cfg = load_config()
+        outcome = paper_recurring_queue_list_cli(cfg.research_database_path, status=args.status)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 

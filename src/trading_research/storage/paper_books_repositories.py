@@ -1101,3 +1101,150 @@ def load_soak_activation_review_for_campaign(conn: sqlite3.Connection, campaign_
         "ORDER BY created_at DESC LIMIT 1", (campaign_id,),
     ).fetchone()
     return None if row is None else load_soak_activation_review(conn, row["activation_review_id"])
+
+
+# -- controlled recurring local paper (Milestone 10) -------------------------
+
+
+def save_recurring_activation_event(conn: sqlite3.Connection, event: dict) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_recurring_activation_events "
+        "(activation_event_id, event_type, previous_state, new_state, activation_review_id, campaign_id, "
+        "request_event_id, operator, reason, requested_schedule_json, created_at, policy_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (event["activation_event_id"], event["event_type"], event["previous_state"], event["new_state"],
+         event.get("activation_review_id"), event.get("campaign_id"), event.get("request_event_id"),
+         event["operator"], event["reason"], json.dumps(event.get("requested_schedule", {}), sort_keys=True),
+         _ts(event["created_at"]), event["policy_version"]),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def _recurring_activation_row(row) -> dict:
+    result = dict(row)
+    result["requested_schedule"] = json.loads(result["requested_schedule_json"])
+    return result
+
+
+def load_recurring_activation_event(conn: sqlite3.Connection, activation_event_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_activation_events WHERE activation_event_id = ?", (activation_event_id,)
+    ).fetchone()
+    return None if row is None else _recurring_activation_row(row)
+
+
+def latest_recurring_activation_event(conn: sqlite3.Connection) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_activation_events ORDER BY created_at DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    return None if row is None else _recurring_activation_row(row)
+
+
+def list_recurring_activation_events(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_recurring_activation_events ORDER BY created_at, rowid"
+    ).fetchall()
+    return [_recurring_activation_row(row) for row in rows]
+
+
+def save_recurring_queue_item(conn: sqlite3.Connection, item: dict) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_recurring_cycle_queue "
+        "(queue_item_id, cycle_id, status, frozen_state_hash, retry_of_queue_item_id, enqueued_by, enqueue_reason, "
+        "enqueued_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item["queue_item_id"], item["cycle_id"], item["status"], item["frozen_state_hash"],
+         item.get("retry_of_queue_item_id"), item["enqueued_by"], item["enqueue_reason"],
+         _ts(item["enqueued_at"]), _ts(item["created_at"])),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def load_recurring_queue_item(conn: sqlite3.Connection, queue_item_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_cycle_queue WHERE queue_item_id = ?", (queue_item_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def active_recurring_queue_item_for_cycle(conn: sqlite3.Connection, cycle_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_cycle_queue WHERE cycle_id = ? AND status IN ('QUEUED','CLAIMED') "
+        "ORDER BY enqueued_at, queue_item_id LIMIT 1", (cycle_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_recurring_queue_items(conn: sqlite3.Connection, status: str | None = None) -> list[dict]:
+    if status is None:
+        rows = conn.execute(
+            "SELECT * FROM paper_recurring_cycle_queue ORDER BY enqueued_at, queue_item_id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM paper_recurring_cycle_queue WHERE status = ? ORDER BY enqueued_at, queue_item_id",
+            (status,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_recurring_scheduler_run_started(conn: sqlite3.Connection, run: dict) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_recurring_scheduler_runs "
+        "(scheduler_run_id, intended_schedule_id, intended_at, started_at, owner_id, lease_name, "
+        "activation_event_id, activation_review_id, status, config_hash, policy_version, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', ?, ?, ?)",
+        (run["scheduler_run_id"], run["intended_schedule_id"], _ts(run["intended_at"]), _ts(run["started_at"]),
+         run["owner_id"], run["lease_name"], run.get("activation_event_id"), run.get("activation_review_id"),
+         run["config_hash"], run["policy_version"], _ts(run["created_at"])),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def finalize_recurring_scheduler_run(conn: sqlite3.Connection, scheduler_run_id: str, values: dict) -> bool:
+    cursor = conn.execute(
+        "UPDATE paper_recurring_scheduler_runs SET ended_at = ?, queue_item_ids_json = ?, "
+        "requested_cycle_ids_json = ?, processed_cycle_ids_json = ?, operator_run_id = ?, lifecycle_run_id = ?, "
+        "cross_book_verification_id = ?, cross_book_verification_status = ?, controlled_readiness_status = ?, "
+        "all_failed_checks_json = ?, lifecycle_only = ?, status = ?, failure_reasons_json = ? "
+        "WHERE scheduler_run_id = ? AND status = 'RUNNING'",
+        (_ts(values["ended_at"]), json.dumps(list(values.get("queue_item_ids", []))),
+         json.dumps(list(values.get("requested_cycle_ids", []))), json.dumps(list(values.get("processed_cycle_ids", []))),
+         values.get("operator_run_id"), values.get("lifecycle_run_id"), values.get("cross_book_verification_id"),
+         values.get("cross_book_verification_status"), values.get("controlled_readiness_status"),
+         json.dumps(list(values.get("all_failed_checks", []))), int(bool(values.get("lifecycle_only"))),
+         values["status"], json.dumps(list(values.get("failure_reasons", []))), scheduler_run_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def _recurring_run_row(row) -> dict:
+    result = dict(row)
+    for name in ("queue_item_ids", "requested_cycle_ids", "processed_cycle_ids", "all_failed_checks", "failure_reasons"):
+        result[name] = json.loads(result[f"{name}_json"])
+    result["lifecycle_only"] = bool(result["lifecycle_only"])
+    return result
+
+
+def load_recurring_scheduler_run(conn: sqlite3.Connection, scheduler_run_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_scheduler_runs WHERE scheduler_run_id = ?", (scheduler_run_id,)
+    ).fetchone()
+    return None if row is None else _recurring_run_row(row)
+
+
+def load_recurring_scheduler_run_for_schedule(conn: sqlite3.Connection, intended_schedule_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_recurring_scheduler_runs WHERE intended_schedule_id = ?", (intended_schedule_id,)
+    ).fetchone()
+    return None if row is None else _recurring_run_row(row)
+
+
+def list_recurring_scheduler_runs(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_recurring_scheduler_runs ORDER BY intended_at DESC LIMIT ?", (max(1, min(limit, 200)),)
+    ).fetchall()
+    return [_recurring_run_row(row) for row in rows]
