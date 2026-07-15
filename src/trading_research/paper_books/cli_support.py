@@ -16,6 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ..research import experiment_policy as ep
+from ..shadow import pause as pause_mod
 from ..storage import paper_books_repositories as pb_repo
 from ..storage.database import session
 from . import cash_ledger, comparison as comparison_module, execution, lifecycle, order_intent, promotion_evidence, reconciliation, risk as risk_module, valuation
@@ -304,11 +305,29 @@ def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_p
         }
 
 
-def paper_book_lifecycle_run_cli(db_path: Path, *, as_of: datetime, integrate_cycle_ids: tuple[str, ...] = ()) -> dict:
-    """`paper-book-lifecycle-run` (docs/milestone-9.md Section 11). Fails
-    closed with an `"error"` key + non-zero exit whenever `paper_books.enabled`
-    or `paper_books.lifecycle.enabled` is false. Returns sanitized,
-    deterministic JSON only."""
+def paper_book_lifecycle_run_cli(
+    db_path: Path, *, as_of: datetime, integrate_cycle_ids: tuple[str, ...] = (), audit_time_now: bool = False,
+) -> dict:
+    """`paper-book-lifecycle-run` (docs/milestone-9.md Section 11; clock
+    semantics corrected in Milestone 9.1 Section 5). Fails closed with an
+    `"error"` key + non-zero exit whenever `paper_books.enabled` or
+    `paper_books.lifecycle.enabled` is false. Returns sanitized,
+    deterministic JSON only.
+
+    By default (`audit_time_now=False`), no explicit `clock` is passed to
+    `run_paper_book_lifecycle` — its own default anchors every timestamp it
+    stamps (including order/decision `created_at`) to `as_of`, never
+    wall-clock `now()`. This CLI previously always injected wall-clock time,
+    which silently corrupts a LATER lifecycle run's own
+    `market_days_held(created_at, as_of)` calculation whenever `--as-of` is a
+    historical replay date (an order created "now" reads as created in the
+    future relative to a subsequent historical `as_of`). `--audit-time-now`
+    opts back into a real "actually invoked at" audit timestamp for a human
+    operator whose `--as-of` is close to today — it affects only
+    `created_at` audit metadata, never market-day calculations, order
+    eligibility, price selection, holding-period calculation, snapshot
+    `as_of`, or exit-decision effective date, all of which remain keyed to
+    `as_of` unconditionally inside `run_paper_book_lifecycle` itself."""
     cfg, error = _load_config_or_error()
     if error:
         return {"error": error}
@@ -321,21 +340,25 @@ def paper_book_lifecycle_run_cli(db_path: Path, *, as_of: datetime, integrate_cy
         try:
             result = lifecycle.run_paper_book_lifecycle(
                 conn, as_of=as_of, paper_books_config=cfg, integrate_cycle_ids=tuple(integrate_cycle_ids),
-                clock=_utc_now,
+                clock=_utc_now if audit_time_now else None,
             )
         except lifecycle.LifecycleError as exc:
             return {"error": str(exc)}
 
-        return {
-            "lifecycle_run_id": result.lifecycle_run_id, "as_of": result.as_of.isoformat(),
-            "processed_cycle_ids": list(result.processed_cycle_ids), "books_processed": list(result.books_processed),
-            "pending_orders_filled": result.pending_orders_filled,
-            "pending_orders_expired": result.pending_orders_expired,
-            "exit_decisions": list(result.exit_decisions), "exit_orders_created": result.exit_orders_created,
-            "exit_orders_filled": result.exit_orders_filled, "snapshot_ids": dict(result.snapshot_ids),
-            "reconciliation_statuses": dict(result.reconciliation_statuses), "metrics_ids": dict(result.metrics_ids),
-            "failure_reasons": list(result.failure_reasons),
-        }
+        return _lifecycle_result_to_json(result)
+
+
+def _lifecycle_result_to_json(result) -> dict:
+    return {
+        "lifecycle_run_id": result.lifecycle_run_id, "as_of": result.as_of.isoformat(),
+        "processed_cycle_ids": list(result.processed_cycle_ids), "books_processed": list(result.books_processed),
+        "pending_orders_filled": result.pending_orders_filled,
+        "pending_orders_expired": result.pending_orders_expired,
+        "exit_decisions": list(result.exit_decisions), "exit_orders_created": result.exit_orders_created,
+        "exit_orders_filled": result.exit_orders_filled, "snapshot_ids": dict(result.snapshot_ids),
+        "reconciliation_statuses": dict(result.reconciliation_statuses), "metrics_ids": dict(result.metrics_ids),
+        "failure_reasons": list(result.failure_reasons),
+    }
 
 
 def paper_book_exit_request_cli(
@@ -429,125 +452,282 @@ def _report_for_book(conn, book_id: str, as_of: datetime, cfg) -> dict:
     }
 
 
-def paper_book_soak_report_cli(db_path: Path, *, as_of: datetime) -> dict:
-    """`paper-book-soak-report` (docs/milestone-9.md Section 9): read-only.
+def _build_soak_report(conn, as_of: datetime, cfg) -> dict:
+    """Milestone 9's `paper-book-soak-report` body, extracted (Milestone 9.1)
+    so `paper_soak_run_cli` can call it against a connection it already
+    holds open, instead of opening a second, nested `session(db_path)`.
     Never declares a winner — `promotion_evidence_status` here is only a
     pointer to the existing, authoritative `paper-promotion-status` command
     (Milestone 8), never recomputed/duplicated here."""
+    lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
+    market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
+    completed_experiment_cycles = len(lifecycle_runs)
+
+    books = {}
+    for name, book_id in (("baseline", cfg.baseline.book_id), ("enhanced", cfg.enhanced.book_id)):
+        if not cfg.is_book_enabled(book_id) or pb_repo.load_book(conn, book_id) is None:
+            books[name] = {"book_id": book_id, "enabled": False}
+            continue
+        books[name] = _report_for_book(conn, book_id, as_of, cfg)
+
+    enabled_reports = [b for b in books.values() if b.get("enabled")]
+    if (
+        completed_experiment_cycles < cfg.lifecycle.soak.minimum_completed_cycles
+        or market_days_covered < cfg.lifecycle.soak.minimum_market_days
+    ):
+        status = "NOT_ENOUGH_HISTORY"
+    elif any(
+        b.get("reconciliation_status") not in (None, "MATCHED") or b.get("valuation_status") != VALUATION_COMPLETE
+        for b in enabled_reports
+    ):
+        status = "ATTENTION_REQUIRED"
+    else:
+        status = "READY_FOR_ACTIVATION_REVIEW"
+
+    comparison = None
+    if books["baseline"].get("enabled") and books["enhanced"].get("enabled"):
+        comparable_cycles = min(
+            books["baseline"]["completed_experiment_cycles"], books["enhanced"]["completed_experiment_cycles"]
+        )
+        deltas = {}
+        for key in ("net_liquidation_value_usd", "realized_pnl_usd", "unrealized_pnl_usd"):
+            b_val, e_val = books["baseline"].get(key), books["enhanced"].get(key)
+            deltas[key] = str(Decimal(e_val) - Decimal(b_val)) if b_val is not None and e_val is not None else None
+        comparison = {
+            "comparable_cycles": comparable_cycles, "metric_deltas": deltas,
+            "promotion_evidence_status": "run paper-promotion-status for an authoritative, evidence-only result",
+        }
+
+    return {
+        "as_of": as_of.isoformat(), "status": status,
+        "completed_experiment_cycles": completed_experiment_cycles, "market_days_covered": market_days_covered,
+        "books": books, "baseline_vs_enhanced": comparison,
+    }
+
+
+def paper_book_soak_report_cli(db_path: Path, *, as_of: datetime) -> dict:
+    """`paper-book-soak-report` (docs/milestone-9.md Section 9): read-only.
+    Thin config-load/error-wrap/session shell around `_build_soak_report`."""
     cfg, error = _load_config_or_error()
     if error:
         return {"error": error}
     if not cfg.enabled:
         return {"error": "paper_books.enabled is false — no books exist to report on"}
-
     with session(db_path) as conn:
-        lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
-        market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
-        completed_experiment_cycles = len(lifecycle_runs)
+        return _build_soak_report(conn, as_of, cfg)
 
-        books = {}
-        for name, book_id in (("baseline", cfg.baseline.book_id), ("enhanced", cfg.enhanced.book_id)):
-            if not cfg.is_book_enabled(book_id) or pb_repo.load_book(conn, book_id) is None:
-                books[name] = {"book_id": book_id, "enabled": False}
-                continue
-            books[name] = _report_for_book(conn, book_id, as_of, cfg)
 
-        enabled_reports = [b for b in books.values() if b.get("enabled")]
-        if (
-            completed_experiment_cycles < cfg.lifecycle.soak.minimum_completed_cycles
-            or market_days_covered < cfg.lifecycle.soak.minimum_market_days
-        ):
-            status = "NOT_ENOUGH_HISTORY"
-        elif any(
-            b.get("reconciliation_status") not in (None, "MATCHED") or b.get("valuation_status") != VALUATION_COMPLETE
-            for b in enabled_reports
-        ):
-            status = "ATTENTION_REQUIRED"
-        else:
-            status = "READY_FOR_ACTIVATION_REVIEW"
+def evaluate_paper_soak_readiness(conn, as_of: datetime, cfg) -> dict:
+    """Milestone 9's `paper-book-soak-readiness` body, extracted (Milestone
+    9.1) so `controlled_soak_readiness.py`/`paper_soak_run_cli` can reuse it
+    directly against an already-open connection instead of re-deriving the
+    same completed-cycle/market-day/lifecycle-failure/reconciliation/
+    valuation logic a second time. Deterministic, advisory-only. Never
+    enables recurring processing — `READY_FOR_RECURRING_ACTIVATION_REVIEW`
+    means "a human may now review activation," nothing here activates
+    anything."""
+    lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
+    market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
+    completed_cycles = len(lifecycle_runs)
+    both_enabled = cfg.is_book_enabled(cfg.baseline.book_id) and cfg.is_book_enabled(cfg.enhanced.book_id)
 
-        comparison = None
-        if books["baseline"].get("enabled") and books["enhanced"].get("enabled"):
-            comparable_cycles = min(
-                books["baseline"]["completed_experiment_cycles"], books["enhanced"]["completed_experiment_cycles"]
-            )
-            deltas = {}
-            for key in ("net_liquidation_value_usd", "realized_pnl_usd", "unrealized_pnl_usd"):
-                b_val, e_val = books["baseline"].get(key), books["enhanced"].get(key)
-                deltas[key] = str(Decimal(e_val) - Decimal(b_val)) if b_val is not None and e_val is not None else None
-            comparison = {
-                "comparable_cycles": comparable_cycles, "metric_deltas": deltas,
-                "promotion_evidence_status": "run paper-promotion-status for an authoritative, evidence-only result",
-            }
-
+    def outcome(result: str, reasons: list[str]) -> dict:
         return {
-            "as_of": as_of.isoformat(), "status": status,
-            "completed_experiment_cycles": completed_experiment_cycles, "market_days_covered": market_days_covered,
-            "books": books, "baseline_vs_enhanced": comparison,
+            "result": result, "reasons": reasons, "as_of": as_of.isoformat(),
+            "completed_cycles": completed_cycles, "market_days_covered": market_days_covered,
+            "both_books_enabled": both_enabled,
         }
+
+    if not both_enabled:
+        return outcome("NOT_READY_INSUFFICIENT_CYCLES", ["both baseline and enhanced books must be enabled for a comparable soak"])
+    if completed_cycles < cfg.lifecycle.soak.minimum_completed_cycles:
+        return outcome(
+            "NOT_READY_INSUFFICIENT_CYCLES",
+            [f"completed_cycles {completed_cycles} < minimum_completed_cycles {cfg.lifecycle.soak.minimum_completed_cycles}"],
+        )
+    if market_days_covered < cfg.lifecycle.soak.minimum_market_days:
+        return outcome(
+            "NOT_READY_INSUFFICIENT_MARKET_DAYS",
+            [f"market_days_covered {market_days_covered} < minimum_market_days {cfg.lifecycle.soak.minimum_market_days}"],
+        )
+
+    lifecycle_failures = [reason for run in lifecycle_runs for reason in run["failure_reasons"]]
+    if lifecycle_failures:
+        return outcome("NOT_READY_LIFECYCLE_FAILURES", lifecycle_failures[:10])
+
+    recon_bad = []
+    valuation_bad = []
+    for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
+        reconciliations = pb_repo.list_reconciliations(conn, book_id)
+        recon_upto = [r for r in reconciliations if r["as_of"] <= as_of.isoformat()]
+        if recon_upto and recon_upto[-1]["status"] != "MATCHED":
+            recon_bad.append(f"{book_id}: {recon_upto[-1]['status']}")
+        snap = valuation.build_portfolio_snapshot(
+            conn, book_id, as_of, price_provider=None, maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
+        )
+        if snap.valuation_status != VALUATION_COMPLETE:
+            valuation_bad.append(f"{book_id}: {snap.valuation_status}")
+    if recon_bad:
+        return outcome("NOT_READY_RECONCILIATION", recon_bad)
+    if valuation_bad:
+        return outcome("NOT_READY_VALUATION", valuation_bad)
+
+    result = (
+        "READY_FOR_RECURRING_ACTIVATION_REVIEW"
+        if market_days_covered >= cfg.lifecycle.soak.minimum_market_days * 2
+        else "READY_FOR_MORE_MANUAL_SOAK"
+    )
+    return outcome(result, [])
 
 
 def paper_book_soak_readiness_cli(db_path: Path, *, as_of: datetime) -> dict:
-    """`paper-book-soak-readiness` (docs/milestone-9.md Section 10):
-    deterministic, advisory-only. Never enables recurring processing —
-    `READY_FOR_RECURRING_ACTIVATION_REVIEW` means "a human may now review
-    activation," nothing here activates anything."""
+    """`paper-book-soak-readiness` (docs/milestone-9.md Section 10): thin
+    config-load/error-wrap/session shell around `evaluate_paper_soak_readiness`."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false"}
+    with session(db_path) as conn:
+        return evaluate_paper_soak_readiness(conn, as_of, cfg)
+
+
+def _operator_run_id(as_of: datetime, cycle_ids: tuple[str, ...]) -> str:
+    """Deterministic on `(as_of, sorted cycle_ids)` (Milestone 9.1 Section 7)
+    — mirrors `lifecycle.py::_lifecycle_run_id`'s own hashing convention, so
+    replaying `paper-soak-run` for the identical date/cycle set always
+    resolves to the same operator-run row."""
+    digest = hashlib.sha256(
+        f"{as_of.isoformat()}|{','.join(sorted(cycle_ids))}|paper-soak-operator-run-v1".encode()
+    ).hexdigest()[:32]
+    return f"pb-soak-op-{digest}"
+
+
+def _operator_run_to_json(run: dict) -> dict:
+    return {
+        "operator_run_id": run["operator_run_id"], "as_of": run["as_of"],
+        "requested_cycle_ids": list(run["requested_cycle_ids"]), "lifecycle_run_id": run["lifecycle_run_id"],
+        "baseline_reconciliation_status": run["baseline_reconciliation_status"],
+        "enhanced_reconciliation_status": run["enhanced_reconciliation_status"],
+        "soak_report_status": run["soak_report_status"], "controlled_readiness_status": run["controlled_readiness_status"],
+        "failure_reasons": list(run["failure_reasons"]), "policy_version": run["policy_version"],
+        "created_at": run["created_at"],
+    }
+
+
+def paper_soak_run_cli(
+    db_path: Path, *, as_of: datetime, integrate_cycle_ids: tuple[str, ...] = (), audit_time_now: bool = False,
+) -> dict:
+    """`paper-soak-run` (Milestone 9.1 Section 6): the single manual,
+    end-to-end operator command — validate config, validate shadow
+    pause/kill state, optionally integrate explicitly supplied cycle IDs,
+    run the lifecycle (which already reconciles every enabled book itself —
+    no second reconciliation pass here), build the soak report, evaluate
+    combined controlled-soak readiness, and persist a bounded operator-run
+    summary. Never runs research, never calls Claude, never discovers
+    cycles implicitly (the operator must supply `integrate_cycle_ids`
+    explicitly; an empty tuple is a valid "lifecycle-only day"), never
+    activates scheduling, never clears pause state, never hides a lifecycle
+    failure (`failure_reasons` is always returned verbatim). Fails closed
+    with an `"error"` key whenever `paper_books.enabled`/
+    `paper_books.lifecycle.enabled` is false, or the shadow system is
+    PAUSED/KILLED. Idempotent: every sub-step is independently idempotent
+    (see `lifecycle.py`), and this function always recomputes fresh —
+    `save_operator_run`'s insert-or-ignore on the deterministic
+    `operator_run_id` means a replay never creates a second summary row,
+    but the returned JSON always reflects the current, freshly recomputed
+    state (matching `paper_book_lifecycle_run_cli`'s own convention)."""
+    from ..shadow.config import load_shadow_operations_config
+    from .controlled_soak_readiness import evaluate_controlled_soak_readiness
+
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — paper-soak-run fails closed"}
+    if not cfg.lifecycle.enabled:
+        return {"error": "paper_books.lifecycle.enabled is false — paper-soak-run fails closed"}
+
+    integrate_cycle_ids = tuple(integrate_cycle_ids)
+    operator_run_id = _operator_run_id(as_of, integrate_cycle_ids)
+
+    with session(db_path) as conn:
+        pause_state = pause_mod.current_state(conn)
+        if pause_state.is_killed:
+            return {"error": f"shadow kill switch is active ({pause_state.reason}) — paper-soak-run fails closed"}
+        if pause_state.is_blocking:
+            return {"error": f"shadow pause state is {pause_state.state} ({pause_state.reason}) — paper-soak-run fails closed"}
+
+        try:
+            lifecycle_result = lifecycle.run_paper_book_lifecycle(
+                conn, as_of=as_of, paper_books_config=cfg, integrate_cycle_ids=integrate_cycle_ids,
+                clock=_utc_now if audit_time_now else None,
+            )
+        except lifecycle.LifecycleError as exc:
+            return {"error": str(exc)}
+
+        soak_report = _build_soak_report(conn, as_of, cfg)
+        shadow_cfg = load_shadow_operations_config()
+        combined = evaluate_controlled_soak_readiness(conn, as_of, cfg, shadow_cfg)
+
+        record = {
+            "operator_run_id": operator_run_id, "as_of": as_of, "requested_cycle_ids": list(integrate_cycle_ids),
+            "lifecycle_run_id": lifecycle_result.lifecycle_run_id,
+            "baseline_reconciliation_status": lifecycle_result.reconciliation_statuses.get(cfg.baseline.book_id),
+            "enhanced_reconciliation_status": lifecycle_result.reconciliation_statuses.get(cfg.enhanced.book_id),
+            "soak_report_status": soak_report["status"], "controlled_readiness_status": combined.status,
+            "failure_reasons": list(lifecycle_result.failure_reasons), "policy_version": combined.policy_version,
+            "created_at": _utc_now(),
+        }
+        pb_repo.save_operator_run(conn, record)
+        stored = pb_repo.load_operator_run(conn, operator_run_id)
+
+        result = _operator_run_to_json(stored)
+        result["lifecycle_result"] = _lifecycle_result_to_json(lifecycle_result)
+        result["soak_report"] = soak_report
+        result["controlled_readiness"] = {
+            "status": combined.status, "reasons": list(combined.reasons),
+            "paper_soak_status": combined.paper_soak_status, "shadow_activation_status": combined.shadow_activation_status,
+            "policy_version": combined.policy_version,
+            "checks": [
+                {
+                    "name": c.name, "classification": c.classification, "passed": c.passed,
+                    "observed_value": c.observed_value, "threshold_value": c.threshold_value,
+                    "source": c.source, "reason": c.reason,
+                }
+                for c in combined.checks
+            ],
+        }
+        return result
+
+
+def paper_soak_readiness_cli(db_path: Path, *, as_of: datetime) -> dict:
+    """`paper-soak-readiness` (Milestone 9.1 Section 10): combined
+    paper-soak + shadow-operational readiness, read-only, advisory-only.
+    Never activates or schedules anything — see
+    `controlled_soak_readiness.py` for the full rule set."""
+    from ..shadow.config import load_shadow_operations_config
+    from .controlled_soak_readiness import evaluate_controlled_soak_readiness
+
     cfg, error = _load_config_or_error()
     if error:
         return {"error": error}
     if not cfg.enabled:
         return {"error": "paper_books.enabled is false"}
 
+    shadow_cfg = load_shadow_operations_config()
     with session(db_path) as conn:
-        lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
-        market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
-        completed_cycles = len(lifecycle_runs)
-        both_enabled = cfg.is_book_enabled(cfg.baseline.book_id) and cfg.is_book_enabled(cfg.enhanced.book_id)
-
-        def outcome(result: str, reasons: list[str]) -> dict:
-            return {
-                "result": result, "reasons": reasons, "as_of": as_of.isoformat(),
-                "completed_cycles": completed_cycles, "market_days_covered": market_days_covered,
-                "both_books_enabled": both_enabled,
-            }
-
-        if not both_enabled:
-            return outcome("NOT_READY_INSUFFICIENT_CYCLES", ["both baseline and enhanced books must be enabled for a comparable soak"])
-        if completed_cycles < cfg.lifecycle.soak.minimum_completed_cycles:
-            return outcome(
-                "NOT_READY_INSUFFICIENT_CYCLES",
-                [f"completed_cycles {completed_cycles} < minimum_completed_cycles {cfg.lifecycle.soak.minimum_completed_cycles}"],
-            )
-        if market_days_covered < cfg.lifecycle.soak.minimum_market_days:
-            return outcome(
-                "NOT_READY_INSUFFICIENT_MARKET_DAYS",
-                [f"market_days_covered {market_days_covered} < minimum_market_days {cfg.lifecycle.soak.minimum_market_days}"],
-            )
-
-        lifecycle_failures = [reason for run in lifecycle_runs for reason in run["failure_reasons"]]
-        if lifecycle_failures:
-            return outcome("NOT_READY_LIFECYCLE_FAILURES", lifecycle_failures[:10])
-
-        recon_bad = []
-        valuation_bad = []
-        for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
-            reconciliations = pb_repo.list_reconciliations(conn, book_id)
-            recon_upto = [r for r in reconciliations if r["as_of"] <= as_of.isoformat()]
-            if recon_upto and recon_upto[-1]["status"] != "MATCHED":
-                recon_bad.append(f"{book_id}: {recon_upto[-1]['status']}")
-            snap = valuation.build_portfolio_snapshot(
-                conn, book_id, as_of, price_provider=None, maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
-            )
-            if snap.valuation_status != VALUATION_COMPLETE:
-                valuation_bad.append(f"{book_id}: {snap.valuation_status}")
-        if recon_bad:
-            return outcome("NOT_READY_RECONCILIATION", recon_bad)
-        if valuation_bad:
-            return outcome("NOT_READY_VALUATION", valuation_bad)
-
-        result = (
-            "READY_FOR_RECURRING_ACTIVATION_REVIEW"
-            if market_days_covered >= cfg.lifecycle.soak.minimum_market_days * 2
-            else "READY_FOR_MORE_MANUAL_SOAK"
-        )
-        return outcome(result, [])
+        combined = evaluate_controlled_soak_readiness(conn, as_of, cfg, shadow_cfg)
+        return {
+            "status": combined.status, "reasons": list(combined.reasons),
+            "paper_soak_status": combined.paper_soak_status, "shadow_activation_status": combined.shadow_activation_status,
+            "policy_version": combined.policy_version,
+            "checks": [
+                {
+                    "name": c.name, "classification": c.classification, "passed": c.passed,
+                    "observed_value": c.observed_value, "threshold_value": c.threshold_value,
+                    "source": c.source, "reason": c.reason,
+                }
+                for c in combined.checks
+            ],
+        }

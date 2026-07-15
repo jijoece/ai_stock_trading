@@ -47,7 +47,7 @@ def find_recent_alerts_by_dedup_key(
 
 def list_alerts(
     conn: sqlite3.Connection, *, severity: str | None = None, alert_type: str | None = None,
-    since_iso: str | None = None,
+    since_iso: str | None = None, unresolved_only: bool = False,
 ) -> list[dict]:
     clauses = []
     params: list[object] = []
@@ -60,12 +60,28 @@ def list_alerts(
     if since_iso is not None:
         clauses.append("created_at >= ?")
         params.append(since_iso)
+    if unresolved_only:
+        clauses.append("resolved_at IS NULL")
     query = "SELECT * FROM shadow_alerts"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY created_at DESC"
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def resolve_alert(conn: sqlite3.Connection, alert_id: str, *, resolved_by: str, reason: str, resolved_at: str) -> bool:
+    """Marks a persisted alert resolved (Milestone 9.1). Idempotent: a
+    already-resolved alert is left untouched (`resolved_at IS NULL` guard) —
+    returns whether this call actually resolved it, never overwrites an
+    earlier resolution's audit trail."""
+    cursor = conn.execute(
+        "UPDATE shadow_alerts SET resolved_at = ?, resolved_by = ?, resolved_reason = ? "
+        "WHERE alert_id = ? AND resolved_at IS NULL",
+        (resolved_at, resolved_by, reason, alert_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 # --- shadow_alert_deliveries ----------------------------------------------------

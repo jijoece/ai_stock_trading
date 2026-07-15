@@ -1,5 +1,12 @@
 # Milestone 9 — Manual paper-trading soak and position lifecycle
 
+**Milestone 9.1 pointer:** combined paper-soak + shadow-operational activation readiness, the
+single manual `paper-soak-run` operator command, and a lifecycle-CLI clock-anchoring fix are
+now implemented — see `docs/milestone9-1-controlled-soak-readiness.md`. This document's own
+`paper-book-lifecycle-run`/`paper-book-soak-report`/`paper-book-soak-readiness` commands
+described below are unchanged (the lifecycle service's own `as_of`-anchored clock default,
+Section 2 below, was always correct — only the CLI's separate wall-clock override was fixed).
+
 **Status:** Complete for this session's scope.
 **Date:** 2026-07-14
 **Applies to:** `src/trading_research/paper_books/exit_policy.py`,

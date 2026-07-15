@@ -2041,6 +2041,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_pb_lifecycle_run.add_argument("--as-of", required=True, help="ISO8601 timestamp")
     p_pb_lifecycle_run.add_argument("--integrate-cycle-id", action="append", default=[], dest="integrate_cycle_ids")
+    p_pb_lifecycle_run.add_argument(
+        "--audit-time-now", action="store_true",
+        help="Stamp real wall-clock time as created_at audit metadata (Milestone 9.1) — never changes "
+             "market-day calculations, order eligibility, price selection, holding-period calculation, "
+             "snapshot as_of, or exit-decision effective date, which remain keyed to --as-of regardless",
+    )
 
     p_pb_exit_request = sub.add_parser(
         "paper-book-exit-request", help="Create an explicit, audited manual exit request for one book/symbol (Milestone 9)"
@@ -2059,6 +2065,25 @@ def main(argv: list[str] | None = None) -> int:
         "paper-book-soak-readiness", help="Deterministic, advisory-only soak-readiness result (Milestone 9) — never activates anything"
     )
     p_pb_soak_readiness.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+
+    p_pb_soak_run = sub.add_parser(
+        "paper-soak-run",
+        help="Single manual operator command: validate, optionally integrate cycles, run lifecycle, report, "
+             "and evaluate combined controlled-soak readiness for one date (Milestone 9.1) — never recurring",
+    )
+    p_pb_soak_run.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+    p_pb_soak_run.add_argument("--integrate-cycle-id", action="append", default=[], dest="integrate_cycle_ids")
+    p_pb_soak_run.add_argument(
+        "--audit-time-now", action="store_true",
+        help="Stamp real wall-clock time as created_at audit metadata — never changes effective market time",
+    )
+
+    p_pb_soak_readiness_combined = sub.add_parser(
+        "paper-soak-readiness",
+        help="Combined paper-soak + shadow-operational activation readiness (Milestone 9.1) — advisory-only, "
+             "never activates or schedules anything",
+    )
+    p_pb_soak_readiness_combined.add_argument("--as-of", required=True, help="ISO8601 timestamp")
 
     args = parser.parse_args(argv)
 
@@ -2397,7 +2422,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         outcome = paper_book_lifecycle_run_cli(
             cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
-            integrate_cycle_ids=tuple(args.integrate_cycle_ids),
+            integrate_cycle_ids=tuple(args.integrate_cycle_ids), audit_time_now=args.audit_time_now,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
@@ -2426,6 +2451,25 @@ def main(argv: list[str] | None = None) -> int:
 
         cfg = load_config()
         outcome = paper_book_soak_readiness_cli(cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of))
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-run":
+        from .paper_books.cli_support import paper_soak_run_cli
+
+        cfg = load_config()
+        outcome = paper_soak_run_cli(
+            cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
+            integrate_cycle_ids=tuple(args.integrate_cycle_ids), audit_time_now=args.audit_time_now,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-readiness":
+        from .paper_books.cli_support import paper_soak_readiness_cli
+
+        cfg = load_config()
+        outcome = paper_soak_readiness_cli(cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of))
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 

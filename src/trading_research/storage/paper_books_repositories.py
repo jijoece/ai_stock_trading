@@ -836,3 +836,55 @@ def list_lifecycle_symbol_results(conn: sqlite3.Connection, lifecycle_run_id: st
         result["reasons"] = tuple(json.loads(result["reasons_json"]))
         results.append(result)
     return results
+
+
+def operator_run_exists(conn: sqlite3.Connection, operator_run_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM paper_soak_operator_runs WHERE operator_run_id = ?", (operator_run_id,)
+    ).fetchone()
+    return row is not None
+
+
+def save_operator_run(conn: sqlite3.Connection, run: dict) -> bool:
+    """Milestone 9.1 `paper-soak-run`: insert-or-ignore on the deterministic
+    `operator_run_id`, mirroring `save_lifecycle_run` above — a replayed
+    command for the identical `as_of`/cycle IDs resolves to the same
+    immutable row rather than creating a duplicate."""
+    if operator_run_exists(conn, run["operator_run_id"]):
+        return False
+    conn.execute(
+        "INSERT INTO paper_soak_operator_runs (operator_run_id, as_of, requested_cycle_ids_json, "
+        "lifecycle_run_id, baseline_reconciliation_status, enhanced_reconciliation_status, soak_report_status, "
+        "controlled_readiness_status, failure_reasons_json, policy_version, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run["operator_run_id"], _ts(run["as_of"]), json.dumps(list(run["requested_cycle_ids"])),
+            run["lifecycle_run_id"], run["baseline_reconciliation_status"], run["enhanced_reconciliation_status"],
+            run["soak_report_status"], run["controlled_readiness_status"],
+            json.dumps(list(run["failure_reasons"])), run["policy_version"], _ts(run["created_at"]),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def load_operator_run(conn: sqlite3.Connection, operator_run_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_soak_operator_runs WHERE operator_run_id = ?", (operator_run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["requested_cycle_ids"] = json.loads(result["requested_cycle_ids_json"])
+    result["failure_reasons"] = json.loads(result["failure_reasons_json"])
+    return result
+
+
+def list_operator_runs(conn: sqlite3.Connection, upto_as_of: str | None = None) -> list[dict]:
+    if upto_as_of is None:
+        rows = conn.execute("SELECT operator_run_id FROM paper_soak_operator_runs ORDER BY as_of").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT operator_run_id FROM paper_soak_operator_runs WHERE as_of <= ? ORDER BY as_of", (upto_as_of,)
+        ).fetchall()
+    return [load_operator_run(conn, row["operator_run_id"]) for row in rows]

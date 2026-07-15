@@ -339,6 +339,28 @@ CREATE TABLE IF NOT EXISTS paper_book_lifecycle_symbol_results (
     created_at TEXT NOT NULL,
     PRIMARY KEY (lifecycle_run_id, book_id, symbol, stage)
 );
+
+-- Milestone 9.1: one row per manual `paper-soak-run` operator invocation —
+-- the bounded audit trail for the single combined
+-- validate/integrate/lifecycle/reconcile/report/readiness workflow.
+-- `operator_run_id` is a deterministic hash of `as_of` + the explicit
+-- requested cycle IDs, so replaying the identical command resolves to the
+-- same row (idempotent insert-or-ignore, mirroring
+-- `paper_book_lifecycle_runs` above). Immutable once persisted — never
+-- updated, never a raw model output, never a credential.
+CREATE TABLE IF NOT EXISTS paper_soak_operator_runs (
+    operator_run_id TEXT PRIMARY KEY,
+    as_of TEXT NOT NULL,
+    requested_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle_run_id TEXT NOT NULL,
+    baseline_reconciliation_status TEXT,
+    enhanced_reconciliation_status TEXT,
+    soak_report_status TEXT NOT NULL,
+    controlled_readiness_status TEXT NOT NULL,
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -364,6 +386,8 @@ CREATE INDEX IF NOT EXISTS idx_paper_book_manual_exit_requests_book_symbol
     ON paper_book_manual_exit_requests(book_id, symbol, requested_at);
 CREATE INDEX IF NOT EXISTS idx_paper_book_lifecycle_symbol_results_run
     ON paper_book_lifecycle_symbol_results(lifecycle_run_id, book_id);
+CREATE INDEX IF NOT EXISTS idx_paper_soak_operator_runs_asof
+    ON paper_soak_operator_runs(as_of);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -489,6 +513,14 @@ BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_symbol_results are immutable onc
 CREATE TRIGGER IF NOT EXISTS trg_paper_book_lifecycle_symbol_results_no_delete
 BEFORE DELETE ON paper_book_lifecycle_symbol_results
 BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_symbol_results are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_operator_runs_no_update
+BEFORE UPDATE ON paper_soak_operator_runs
+BEGIN SELECT RAISE(ABORT, 'paper_soak_operator_runs are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_operator_runs_no_delete
+BEFORE DELETE ON paper_soak_operator_runs
+BEGIN SELECT RAISE(ABORT, 'paper_soak_operator_runs are immutable once persisted'); END;
 """
 
 

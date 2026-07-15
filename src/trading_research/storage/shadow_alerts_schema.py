@@ -105,8 +105,36 @@ CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_cycle ON shadow_run_heal
 CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_name ON shadow_run_health_checks(check_name);
 """
 
+# Milestone 9.1 (docs/milestone9-1-controlled-soak-readiness.md): additive,
+# nullable resolution columns on the pre-existing `shadow_alerts` table.
+# Milestone 7 never persisted any resolved/acknowledged concept for an
+# alert — every alert was permanently "open" with no way to distinguish a
+# stale historical CRITICAL alert from one still requiring attention. Added
+# via `ALTER TABLE` (mirrors `storage/trading_schema.py::_ensure_columns`)
+# rather than a destructive rebuild, so every pre-existing alert row simply
+# reads back as unresolved (`resolved_at IS NULL`) — never fabricated as
+# resolved.
+_SHADOW_ALERTS_COLUMN_UPGRADES = {
+    "shadow_alerts": {
+        "resolved_at": "TEXT",
+        "resolved_by": "TEXT",
+        "resolved_reason": "TEXT",
+    },
+}
+
+
+def _ensure_columns(conn) -> None:
+    for table, columns in _SHADOW_ALERTS_COLUMN_UPGRADES.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue  # table doesn't exist yet; CREATE handles it in full
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
 
 def apply_shadow_alerts_schema(conn) -> None:
     conn.executescript(SHADOW_ALERTS_DDL)
+    _ensure_columns(conn)
     conn.executescript(SHADOW_ALERTS_INDEXES)
     conn.commit()

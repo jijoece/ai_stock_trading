@@ -30,6 +30,7 @@ from trading_research.storage.shadow_alerts_repositories import (
     list_alert_deliveries,
     list_alerts,
     load_alert,
+    resolve_alert,
 )
 
 BASE_TIME = datetime(2026, 7, 13, 13, 30, tzinfo=timezone.utc)
@@ -387,3 +388,53 @@ def test_raise_alert_with_no_sinks_still_persists(conn):
     row = load_alert(conn, alert.alert_id)
     assert row is not None
     assert list_alert_deliveries(conn, alert.alert_id) == []
+
+
+# --- alert resolution (Milestone 9.1) ------------------------------------------------------
+
+
+def test_new_alert_reads_back_as_unresolved(conn):
+    alert = _alert(severity=SEVERITY_CRITICAL)
+    raise_alert(conn, alert, (), clock=_clock_at(BASE_TIME))
+    row = load_alert(conn, alert.alert_id)
+    assert row["resolved_at"] is None
+    unresolved = list_alerts(conn, severity=SEVERITY_CRITICAL, unresolved_only=True)
+    assert any(r["alert_id"] == alert.alert_id for r in unresolved)
+
+
+def test_resolve_alert_marks_it_resolved_and_excludes_from_unresolved_only(conn):
+    alert = _alert(severity=SEVERITY_CRITICAL)
+    raise_alert(conn, alert, (), clock=_clock_at(BASE_TIME))
+
+    resolved = resolve_alert(
+        conn, alert.alert_id, resolved_by="alice", reason="investigated — false positive",
+        resolved_at=(BASE_TIME + timedelta(minutes=5)).isoformat(),
+    )
+    assert resolved is True
+
+    row = load_alert(conn, alert.alert_id)
+    assert row["resolved_at"] is not None
+    assert row["resolved_by"] == "alice"
+
+    unresolved = list_alerts(conn, severity=SEVERITY_CRITICAL, unresolved_only=True)
+    assert not any(r["alert_id"] == alert.alert_id for r in unresolved)
+    all_critical = list_alerts(conn, severity=SEVERITY_CRITICAL)
+    assert any(r["alert_id"] == alert.alert_id for r in all_critical)
+
+
+def test_resolve_alert_is_idempotent_never_overwrites_first_resolution(conn):
+    alert = _alert(severity=SEVERITY_CRITICAL)
+    raise_alert(conn, alert, (), clock=_clock_at(BASE_TIME))
+
+    first = resolve_alert(
+        conn, alert.alert_id, resolved_by="alice", reason="first",
+        resolved_at=(BASE_TIME + timedelta(minutes=5)).isoformat(),
+    )
+    second = resolve_alert(
+        conn, alert.alert_id, resolved_by="bob", reason="second",
+        resolved_at=(BASE_TIME + timedelta(minutes=10)).isoformat(),
+    )
+    assert first is True
+    assert second is False
+    row = load_alert(conn, alert.alert_id)
+    assert row["resolved_by"] == "alice"
