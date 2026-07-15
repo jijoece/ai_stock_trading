@@ -23,4 +23,8 @@ research-results/*.json
 research-results/*.md
 !research-results/.gitkeep
 
+# Message Batch run artifacts (contain generated patches / results, not source)
+batch/runs/*
+!batch/runs/.gitkeep
+
 .DS_Store
