@@ -61,6 +61,7 @@ from .orchestration import ResearchRepository, analyze_with_research_committee
 from .overlay import apply_research_overlay
 from .prompt_registry import PromptRegistry
 from .provider_protocol import ResearchModelProvider
+from .provider_provenance import claude_provider_row, evidence_provider_row, record_cycle_provider_provenance
 from .recommendation_overlay import apply_overlay_to_recommendation
 
 CYCLE_STATUS_RUNNING = "RUNNING"
@@ -426,6 +427,27 @@ def _run_symbol(
 
     save_evidence_snapshot(conn, snapshot)
 
+    # Milestone 9.2 (docs/milestone-9.2.md Section 3): one authoritative
+    # provenance row per evidence category this symbol's snapshot actually
+    # populated, sourced from `configuration.provider_mode` — never from
+    # `cost_usd`. `research_run_id` is filled in below once known (a second,
+    # idempotent no-op call for categories already recorded).
+    observed_categories = sorted({s.source_type for s in snapshot.source_records})
+    if observed_categories:
+        record_cycle_provider_provenance(
+            conn,
+            [
+                evidence_provider_row(
+                    cycle_id=cycle_id, research_run_id=None, symbol=symbol, provider_category=category,
+                    provider_name=next(s.provider for s in snapshot.source_records if s.source_type == category),
+                    request_or_source_id=next(s.source_id for s in snapshot.source_records if s.source_type == category),
+                    status=next(s.status for s in snapshot.source_records if s.source_type == category),
+                    cycle_provider_mode=configuration.provider_mode, observed_at=clock(),
+                )
+                for category in observed_categories
+            ],
+        )
+
     corporate_status_id = save_corporate_status_evidence(conn, corporate_status, created_at=clock()) if corporate_status is not None else None
 
     required_categories = ("fundamentals",)
@@ -478,6 +500,20 @@ def _run_symbol(
         orchestration_status = orchestration_result.status
         decision = orchestration_result.decision
         research_run_id = orchestration_result.research_run_id
+        if research_run_id is not None:
+            # Milestone 9.2: the Claude provenance row, keyed on the ACTUAL
+            # `research_provider_name` (the Claude taxonomy axis — never
+            # `configuration.provider_mode`, the separate evidence-provider
+            # axis; see `provider_provenance.py`'s own docstring).
+            record_cycle_provider_provenance(
+                conn,
+                [
+                    claude_provider_row(
+                        cycle_id=cycle_id, research_run_id=research_run_id, symbol=symbol,
+                        provider_name=research_provider_name, observed_at=clock(),
+                    )
+                ],
+            )
 
     baseline_score = None
     factors = baseline_rec.payload.get("factors") or []

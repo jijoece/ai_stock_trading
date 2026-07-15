@@ -21,6 +21,8 @@ from trading_research.cli import (
     retention_apply_cli,
     retention_plan_cli,
     run_due_shadow_cycle_cli,
+    shadow_alert_list_cli,
+    shadow_alert_resolve_cli,
     shadow_alerts_cli,
     shadow_budget_status_cli,
     shadow_force_clear_kill_cli,
@@ -142,6 +144,89 @@ def test_shadow_alerts_filter_by_severity(db_path):
     outcome = shadow_alerts_cli(db_path, severity="CRITICAL")
     assert outcome["filter_severity"] == "CRITICAL"
     assert outcome["alerts"] == []
+
+
+# --- shadow-alert-list / shadow-alert-resolve (Milestone 9.2) -----------------
+
+
+def _seed_alert(db_path, *, severity="CRITICAL"):
+    from trading_research.shadow.alerts import OperationalAlert, raise_alert
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
+    alert = OperationalAlert(severity=severity, alert_type="PROVIDER_UNAVAILABLE", message="provider down", context={}, created_at=now)
+    with session(db_path) as conn:
+        raise_alert(conn, alert, (), clock=lambda: now)
+    return alert.alert_id
+
+
+def test_shadow_alert_list_empty_db(db_path):
+    outcome = shadow_alert_list_cli(db_path)
+    assert outcome["alerts"] == []
+    assert outcome["count"] == 0
+    assert outcome["limit"] == 50
+
+
+def test_shadow_alert_list_bounds_limit(db_path):
+    outcome = shadow_alert_list_cli(db_path, limit=10_000)
+    assert outcome["limit"] == 200  # clamped to _ALERT_LIST_MAX_LIMIT
+    outcome = shadow_alert_list_cli(db_path, limit=0)
+    assert outcome["limit"] == 1
+
+
+def test_shadow_alert_list_unresolved_only(db_path):
+    alert_id = _seed_alert(db_path)
+    outcome = shadow_alert_list_cli(db_path, unresolved_only=True)
+    assert outcome["count"] == 1
+    assert outcome["alerts"][0]["alert_id"] == alert_id
+    assert outcome["alerts"][0]["resolved"] is False
+
+    shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="alice", reason="handled")
+    outcome = shadow_alert_list_cli(db_path, unresolved_only=True)
+    assert outcome["count"] == 0
+    outcome = shadow_alert_list_cli(db_path, unresolved_only=False)
+    assert outcome["count"] == 1
+    assert outcome["alerts"][0]["resolved"] is True
+
+
+def test_shadow_alert_resolve_requires_operator_and_reason(db_path):
+    alert_id = _seed_alert(db_path)
+    assert "error" in shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="", reason="x")
+    assert "error" in shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="alice", reason="")
+
+
+def test_shadow_alert_resolve_unknown_alert_fails_closed(db_path):
+    outcome = shadow_alert_resolve_cli(db_path, alert_id="does-not-exist", operator="alice", reason="x")
+    assert "error" in outcome
+
+
+def test_shadow_alert_resolve_first_call_immutable_on_repeat(db_path):
+    alert_id = _seed_alert(db_path)
+    first = shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="alice", reason="first reason")
+    assert first["newly_resolved_this_call"] is True
+    second = shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="bob", reason="second reason")
+    assert second["newly_resolved_this_call"] is False
+    assert second["resolved_by"] == "alice"
+    assert second["resolved_reason"] == "first reason"
+    assert second["resolved_at"] == first["resolved_at"]
+
+
+def test_shadow_alert_resolve_does_not_change_pause_kill_state(db_path):
+    from trading_research.shadow import pause as pause_mod
+
+    alert_id = _seed_alert(db_path)
+    shadow_alert_resolve_cli(db_path, alert_id=alert_id, operator="alice", reason="handled")
+    with session(db_path) as conn:
+        state = pause_mod.current_state(conn)
+    assert state.state == "ACTIVE"
+
+
+def test_shadow_alert_list_output_has_no_raw_payloads_or_credentials(db_path):
+    _seed_alert(db_path)
+    outcome = shadow_alert_list_cli(db_path)
+    serialized = str(outcome).lower()
+    for forbidden in ("api_key", "authorization", "sk-ant-", "password", "secret"):
+        assert forbidden not in serialized
 
 
 # --- shadow-pause / shadow-resume / shadow-kill / shadow-force-clear-kill -----

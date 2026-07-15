@@ -571,6 +571,17 @@ def list_experiment_assignments(conn: sqlite3.Connection, experiment_id: str) ->
     return [dict(r) for r in rows]
 
 
+def list_all_experiment_assignments_upto(conn: sqlite3.Connection, upto_as_of: str) -> list[dict]:
+    """All experiment-assignment rows across every experiment, `as_of <=
+    upto_as_of` (Milestone 9.2 cross-book verification — unlike
+    `list_experiment_assignments`, not scoped to one `experiment_id`)."""
+    rows = conn.execute(
+        "SELECT * FROM paper_book_experiment_assignments WHERE as_of <= ? ORDER BY cycle_id, symbol",
+        (upto_as_of,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # -- comparisons and promotion evidence ---------------------------------------
 
 
@@ -849,19 +860,23 @@ def save_operator_run(conn: sqlite3.Connection, run: dict) -> bool:
     """Milestone 9.1 `paper-soak-run`: insert-or-ignore on the deterministic
     `operator_run_id`, mirroring `save_lifecycle_run` above — a replayed
     command for the identical `as_of`/cycle IDs resolves to the same
-    immutable row rather than creating a duplicate."""
+    immutable row rather than creating a duplicate. Milestone 9.2 adds the
+    optional `cross_book_verification_id`/`cross_book_verification_status`
+    (both `None` when the caller has none — never fabricated)."""
     if operator_run_exists(conn, run["operator_run_id"]):
         return False
     conn.execute(
         "INSERT INTO paper_soak_operator_runs (operator_run_id, as_of, requested_cycle_ids_json, "
         "lifecycle_run_id, baseline_reconciliation_status, enhanced_reconciliation_status, soak_report_status, "
-        "controlled_readiness_status, failure_reasons_json, policy_version, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "controlled_readiness_status, failure_reasons_json, policy_version, created_at, "
+        "cross_book_verification_id, cross_book_verification_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             run["operator_run_id"], _ts(run["as_of"]), json.dumps(list(run["requested_cycle_ids"])),
             run["lifecycle_run_id"], run["baseline_reconciliation_status"], run["enhanced_reconciliation_status"],
             run["soak_report_status"], run["controlled_readiness_status"],
             json.dumps(list(run["failure_reasons"])), run["policy_version"], _ts(run["created_at"]),
+            run.get("cross_book_verification_id"), run.get("cross_book_verification_status"),
         ),
     )
     conn.commit()
@@ -888,3 +903,79 @@ def list_operator_runs(conn: sqlite3.Connection, upto_as_of: str | None = None) 
             "SELECT operator_run_id FROM paper_soak_operator_runs WHERE as_of <= ? ORDER BY as_of", (upto_as_of,)
         ).fetchall()
     return [load_operator_run(conn, row["operator_run_id"]) for row in rows]
+
+
+# -- cross-book verification (Milestone 9.2) ----------------------------------
+
+
+def cross_book_verification_exists(conn: sqlite3.Connection, verification_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM paper_book_cross_book_verifications WHERE verification_id = ?", (verification_id,)
+    ).fetchone()
+    return row is not None
+
+
+def save_cross_book_verification(
+    conn: sqlite3.Connection, verification: dict, checks: list[dict],
+) -> bool:
+    """Insert-or-ignore on the deterministic `verification_id` — a replay for
+    identical inputs resolves to the same immutable header row plus its
+    already-persisted check rows, never a duplicate (mirrors
+    `save_operator_run`'s own convention)."""
+    if cross_book_verification_exists(conn, verification["verification_id"]):
+        return False
+    conn.execute(
+        "INSERT INTO paper_book_cross_book_verifications "
+        "(verification_id, as_of, operator_run_id, lifecycle_run_id, status, violation_count, "
+        "policy_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            verification["verification_id"], _ts(verification["as_of"]), verification.get("operator_run_id"),
+            verification.get("lifecycle_run_id"), verification["status"], verification["violation_count"],
+            verification["policy_version"], _ts(verification["created_at"]),
+        ),
+    )
+    for check in checks:
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_book_cross_book_verification_checks "
+            "(verification_id, check_name, status, observed, expected, source, reason, policy_version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                verification["verification_id"], check["name"], check["status"], check["observed"],
+                check["expected"], check["source"], check["reason"], verification["policy_version"],
+                _ts(verification["created_at"]),
+            ),
+        )
+    conn.commit()
+    return True
+
+
+def load_cross_book_verification(conn: sqlite3.Connection, verification_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_book_cross_book_verifications WHERE verification_id = ?", (verification_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["checks"] = list_cross_book_verification_checks(conn, verification_id)
+    return result
+
+
+def list_cross_book_verification_checks(conn: sqlite3.Connection, verification_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_book_cross_book_verification_checks WHERE verification_id = ? ORDER BY check_name",
+        (verification_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_cross_book_verification_upto(conn: sqlite3.Connection, upto_as_of: str) -> dict | None:
+    """Latest persisted verification with `as_of <= upto_as_of` (Section 8:
+    "the latest applicable persisted verification at or before `as_of`")."""
+    row = conn.execute(
+        "SELECT verification_id FROM paper_book_cross_book_verifications WHERE as_of <= ? "
+        "ORDER BY as_of DESC, created_at DESC LIMIT 1",
+        (upto_as_of,),
+    ).fetchone()
+    if row is None:
+        return None
+    return load_cross_book_verification(conn, row["verification_id"])

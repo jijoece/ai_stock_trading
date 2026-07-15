@@ -612,6 +612,8 @@ def _operator_run_to_json(run: dict) -> dict:
         "soak_report_status": run["soak_report_status"], "controlled_readiness_status": run["controlled_readiness_status"],
         "failure_reasons": list(run["failure_reasons"]), "policy_version": run["policy_version"],
         "created_at": run["created_at"],
+        "cross_book_verification_id": run.get("cross_book_verification_id"),
+        "cross_book_verification_status": run.get("cross_book_verification_status"),
     }
 
 
@@ -639,6 +641,7 @@ def paper_soak_run_cli(
     state (matching `paper_book_lifecycle_run_cli`'s own convention)."""
     from ..shadow.config import load_shadow_operations_config
     from .controlled_soak_readiness import evaluate_controlled_soak_readiness
+    from .cross_book_verification import persist_verification, verify_cross_book_integrity
 
     cfg, error = _load_config_or_error()
     if error:
@@ -666,6 +669,21 @@ def paper_soak_run_cli(
         except lifecycle.LifecycleError as exc:
             return {"error": str(exc)}
 
+        # Milestone 9.2 Section 12: cross-book verification runs after
+        # lifecycle/reconciliation and is persisted BEFORE readiness is
+        # evaluated, so `evaluate_controlled_soak_readiness`'s own lookup of
+        # "the latest persisted verification at-or-before as_of" always sees
+        # this run's own result. One verification failure never erases the
+        # lifecycle evidence already persisted above.
+        verification = verify_cross_book_integrity(
+            conn, as_of=as_of, paper_books_config=cfg, operator_run_id=operator_run_id,
+            lifecycle_run_id=lifecycle_result.lifecycle_run_id,
+        )
+        persist_verification(
+            conn, verification, operator_run_id=operator_run_id, lifecycle_run_id=lifecycle_result.lifecycle_run_id,
+            created_at=_utc_now(),
+        )
+
         soak_report = _build_soak_report(conn, as_of, cfg)
         shadow_cfg = load_shadow_operations_config()
         combined = evaluate_controlled_soak_readiness(conn, as_of, cfg, shadow_cfg)
@@ -678,26 +696,17 @@ def paper_soak_run_cli(
             "soak_report_status": soak_report["status"], "controlled_readiness_status": combined.status,
             "failure_reasons": list(lifecycle_result.failure_reasons), "policy_version": combined.policy_version,
             "created_at": _utc_now(),
+            "cross_book_verification_id": verification.verification_id,
+            "cross_book_verification_status": verification.status,
         }
         pb_repo.save_operator_run(conn, record)
         stored = pb_repo.load_operator_run(conn, operator_run_id)
 
         result = _operator_run_to_json(stored)
         result["lifecycle_result"] = _lifecycle_result_to_json(lifecycle_result)
+        result["cross_book_verification"] = _cross_book_result_to_json(verification)
         result["soak_report"] = soak_report
-        result["controlled_readiness"] = {
-            "status": combined.status, "reasons": list(combined.reasons),
-            "paper_soak_status": combined.paper_soak_status, "shadow_activation_status": combined.shadow_activation_status,
-            "policy_version": combined.policy_version,
-            "checks": [
-                {
-                    "name": c.name, "classification": c.classification, "passed": c.passed,
-                    "observed_value": c.observed_value, "threshold_value": c.threshold_value,
-                    "source": c.source, "reason": c.reason,
-                }
-                for c in combined.checks
-            ],
-        }
+        result["controlled_readiness"] = _controlled_readiness_to_json(combined)
         return result
 
 
@@ -718,16 +727,68 @@ def paper_soak_readiness_cli(db_path: Path, *, as_of: datetime) -> dict:
     shadow_cfg = load_shadow_operations_config()
     with session(db_path) as conn:
         combined = evaluate_controlled_soak_readiness(conn, as_of, cfg, shadow_cfg)
-        return {
-            "status": combined.status, "reasons": list(combined.reasons),
-            "paper_soak_status": combined.paper_soak_status, "shadow_activation_status": combined.shadow_activation_status,
-            "policy_version": combined.policy_version,
-            "checks": [
-                {
-                    "name": c.name, "classification": c.classification, "passed": c.passed,
-                    "observed_value": c.observed_value, "threshold_value": c.threshold_value,
-                    "source": c.source, "reason": c.reason,
-                }
-                for c in combined.checks
-            ],
-        }
+        return _controlled_readiness_to_json(combined)
+
+
+def _controlled_readiness_to_json(combined) -> dict:
+    return {
+        "status": combined.status, "reasons": list(combined.reasons),
+        "paper_soak_status": combined.paper_soak_status, "shadow_activation_status": combined.shadow_activation_status,
+        "policy_version": combined.policy_version,
+        "checks": [
+            {
+                "name": c.name, "classification": c.classification, "passed": c.passed,
+                "observed_value": c.observed_value, "threshold_value": c.threshold_value,
+                "source": c.source, "reason": c.reason,
+            }
+            for c in combined.checks
+        ],
+        "all_failed_checks": [c.name for c in combined.checks if c.passed is False],
+        "blocking_checks": [c.name for c in combined.checks if c.passed is False and c.classification != "MISSING"],
+        "advisory_checks": [c.name for c in combined.checks if c.classification == "DERIVED"],
+        "missing_checks": [c.name for c in combined.checks if c.classification == "MISSING"],
+    }
+
+
+def _cross_book_check_to_json(check) -> dict:
+    return {
+        "name": check.name, "status": check.status, "observed": check.observed, "expected": check.expected,
+        "source": check.source, "reason": check.reason,
+    }
+
+
+def _cross_book_result_to_json(result) -> dict:
+    return {
+        "verification_id": result.verification_id, "as_of": result.as_of.isoformat(), "status": result.status,
+        "violation_count": result.violation_count, "policy_version": result.policy_version,
+        "checks": [_cross_book_check_to_json(c) for c in result.checks],
+    }
+
+
+def paper_book_cross_check_cli(
+    db_path: Path, *, as_of: datetime, operator_run_id: str | None = None, lifecycle_run_id: str | None = None,
+) -> dict:
+    """`paper-book-cross-check` (Milestone 9.2 Section 13): read-only,
+    deterministic, no network call. Persists the verification (mirroring
+    `paper_book_lifecycle_run_cli`'s own convention: every sub-operation is
+    independently idempotent, and this function always recomputes fresh) so
+    `controlled_soak_readiness.py` has an authoritative row to read even
+    when this command is invoked standalone, outside `paper-soak-run`. Fails
+    closed with an `"error"` key when `paper_books.enabled` is false."""
+    from .cross_book_verification import persist_verification, verify_cross_book_integrity
+
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — paper-book-cross-check fails closed"}
+
+    with session(db_path) as conn:
+        result = verify_cross_book_integrity(
+            conn, as_of=as_of, paper_books_config=cfg, operator_run_id=operator_run_id,
+            lifecycle_run_id=lifecycle_run_id,
+        )
+        persist_verification(
+            conn, result, operator_run_id=operator_run_id, lifecycle_run_id=lifecycle_run_id, created_at=_utc_now(),
+        )
+        return _cross_book_result_to_json(result)

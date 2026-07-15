@@ -65,6 +65,33 @@ CREATE TABLE IF NOT EXISTS research_cycle_symbol_evidence_status (
     created_at TEXT NOT NULL,
     PRIMARY KEY (cycle_id, symbol)
 );
+
+-- Milestone 9.2 (docs/milestone-9.2.md Section 3): authoritative,
+-- per-(cycle_id, symbol, provider_category) provider-provenance record.
+-- Additive — never retrofits research_committee_runs/research_attempts
+-- (already-authoritative for Claude, joined by research_run_id) or
+-- evidence_provider_requests (still lacks a fixture/real column). Immutable
+-- (INSERT OR IGNORE keyed by (cycle_id, symbol, provider_category)); a
+-- record with insufficient metadata is simply never written, so its absence
+-- reads back as UNKNOWN rather than a fabricated guess. No raw provider
+-- payload/Claude output/credential is ever stored here — only the
+-- classification facts themselves.
+CREATE TABLE IF NOT EXISTS research_cycle_provider_provenance (
+    cycle_id TEXT NOT NULL REFERENCES research_cycles(cycle_id),
+    research_run_id TEXT,
+    symbol TEXT NOT NULL,
+    provider_category TEXT NOT NULL,
+    provider_name TEXT NOT NULL,
+    provider_mode TEXT NOT NULL,
+    is_fixture INTEGER NOT NULL,
+    is_real INTEGER NOT NULL,
+    request_or_source_id TEXT,
+    status TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    classification_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (cycle_id, symbol, provider_category)
+);
 """
 
 RESEARCH_CYCLE_INDEXES = """

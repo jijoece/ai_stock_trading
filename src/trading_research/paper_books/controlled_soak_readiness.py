@@ -15,19 +15,21 @@ reconciliation/isolation-violation signal), and produces one fail-closed,
 advisory-only verdict in the Milestone 9.1 vocabulary.
 
 `READY_FOR_RECURRING_ACTIVATION_REVIEW` (like Milestone 9's and Milestone
-7.2's own same-shaped statuses) NEVER activates or schedules anything. It
-is never returned today: `_CROSS_BOOK_SIGNAL_AVAILABLE` documents a known,
-deliberate gap (Section 4 of the milestone spec) rather than fabricating a
-`False`/clear result — see the module-level constant below.
+7.2's own same-shaped statuses) NEVER activates or schedules anything.
+Milestone 9.2 closed the cross-book gap this docstring used to describe as
+permanent: it is now reachable once a `PASSED` `cross_book_verification.py`
+result is persisted at-or-before `as_of` and every other gate clears.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 
+from ..research import provider_provenance
 from ..shadow import readiness as shadow_readiness
 from ..shadow import pause as pause_mod
 from ..shadow.config import ShadowOperationsConfiguration
+from ..storage import paper_books_repositories as pb_repo
 from ..storage import shadow_alerts_repositories as alerts_repo
 from .cli_support import evaluate_paper_soak_readiness
 from .config import PaperBooksConfiguration
@@ -42,6 +44,7 @@ STATUS_NOT_READY_CRITICAL_ALERTS = "NOT_READY_CRITICAL_ALERTS"
 STATUS_NOT_READY_PROVIDER_HISTORY = "NOT_READY_PROVIDER_HISTORY"
 STATUS_NOT_READY_RECONCILIATION = "NOT_READY_RECONCILIATION"
 STATUS_NOT_READY_VALUATION = "NOT_READY_VALUATION"
+STATUS_NOT_READY_CROSS_BOOK = "NOT_READY_CROSS_BOOK"
 STATUS_READY_FOR_MANUAL_SOAK = "READY_FOR_MANUAL_SOAK"
 STATUS_READY_FOR_EXTENDED_MANUAL_SOAK = "READY_FOR_EXTENDED_MANUAL_SOAK"
 STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW = "READY_FOR_RECURRING_ACTIVATION_REVIEW"
@@ -49,8 +52,8 @@ STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW = "READY_FOR_RECURRING_ACTIVATION_R
 CONTROLLED_SOAK_STATUSES = (
     STATUS_NOT_READY_PAPER_SOAK, STATUS_NOT_READY_SHADOW_PAUSED, STATUS_NOT_READY_SHADOW_KILLED,
     STATUS_NOT_READY_HEALTH_UNEXPLAINED, STATUS_NOT_READY_CRITICAL_ALERTS, STATUS_NOT_READY_PROVIDER_HISTORY,
-    STATUS_NOT_READY_RECONCILIATION, STATUS_NOT_READY_VALUATION, STATUS_READY_FOR_MANUAL_SOAK,
-    STATUS_READY_FOR_EXTENDED_MANUAL_SOAK, STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW,
+    STATUS_NOT_READY_RECONCILIATION, STATUS_NOT_READY_VALUATION, STATUS_NOT_READY_CROSS_BOOK,
+    STATUS_READY_FOR_MANUAL_SOAK, STATUS_READY_FOR_EXTENDED_MANUAL_SOAK, STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW,
 )
 
 CLASSIFICATION_AUTHORITATIVE = "AUTHORITATIVE"
@@ -61,14 +64,11 @@ CHECK_CLASSIFICATIONS = (
     CLASSIFICATION_AUTHORITATIVE, CLASSIFICATION_DERIVED, CLASSIFICATION_NOT_APPLICABLE, CLASSIFICATION_MISSING,
 )
 
-# Milestone 9.1 Section 4: no Milestone 8/9 module persists a dedicated
-# cross-book reconciliation/isolation-violation signal distinct from each
-# book's own `reconcile_book` status (per-book reconciliation is already an
-# input above, at `_paper_soak_check` — this is deliberately a SEPARATE,
-# narrower signal: "did book isolation itself ever leak," which nothing
-# here computes). Documented as a permanent `MISSING` input rather than a
-# fabricated `False` until a future milestone adds real detection.
-_CROSS_BOOK_SIGNAL_AVAILABLE = False
+# Milestone 9.2 closes the Milestone 9.1 Section 4 gap: `cross_book_verification.py`
+# now persists an authoritative PASSED/FAILED/INSUFFICIENT_DATA signal
+# (`paper_book_cross_book_verifications`), and this module reads the latest
+# one at-or-before `as_of` below instead of a hardcoded "always MISSING"
+# constant.
 
 
 class ControlledSoakReadinessError(RuntimeError):
@@ -197,20 +197,40 @@ def evaluate_controlled_soak_readiness(
             STATUS_NOT_READY_PAPER_SOAK, tuple(paper_soak["reasons"]), paper_soak_status=paper_soak["result"],
         )
 
-    # 8. Cross-book violation signal — documented, permanent MISSING (see
-    # module docstring / `_CROSS_BOOK_SIGNAL_AVAILABLE`). Never blocks manual
-    # or extended-manual soak; only caps the final advisory tier below.
+    # 8. Cross-book violation signal (Milestone 9.2, docs/milestone-9.2.md
+    # Section 8): the latest authoritative `cross_book_verification.py`
+    # result persisted at-or-before `as_of` — never a hardcoded MISSING
+    # constant, never a fabricated PASS from the mere absence of an
+    # exception. FAILED blocks readiness outright; INSUFFICIENT_DATA permits
+    # manual soak but caps the final tier below (never
+    # READY_FOR_RECURRING_ACTIVATION_REVIEW); PASSED satisfies this gate.
+    latest_verification = pb_repo.latest_cross_book_verification_upto(conn, as_of.isoformat())
+    cross_book_status = latest_verification["status"] if latest_verification else "INSUFFICIENT_DATA"
     checks.append(ReadinessCheck(
-        name="cross_book_violation_signal", classification=CLASSIFICATION_MISSING, passed=None,
-        observed_value=None, threshold_value="0 violations", source="none (not yet persisted — known gap)",
-        reason="no Milestone 8/9 module persists a cross-book reconciliation/isolation-violation signal distinct "
-               "from each book's own reconciliation status",
+        name="cross_book_violation_signal",
+        classification=CLASSIFICATION_AUTHORITATIVE if latest_verification else CLASSIFICATION_MISSING,
+        passed=(cross_book_status == "PASSED") if latest_verification else None,
+        observed_value=cross_book_status,
+        threshold_value="PASSED",
+        source="paper_book_cross_book_verifications" if latest_verification else "none (never yet run — see paper-book-cross-check)",
+        reason=(
+            f"verification_id={latest_verification['verification_id']}, "
+            f"violation_count={latest_verification['violation_count']}"
+        ) if latest_verification else "no cross-book verification has been run/persisted at or before as_of",
     ))
+    if cross_book_status == "FAILED":
+        return finish(
+            STATUS_NOT_READY_CROSS_BOOK,
+            (f"cross-book verification {latest_verification['verification_id']} is FAILED "
+             f"({latest_verification['violation_count']} violation(s)) — investigate before any further soak activity",),
+            paper_soak_status=paper_soak["result"],
+        )
 
     # 11-12. Real-provider-cycle history + provider/pricing readiness —
-    # reuses Milestone 7.2's `evaluate_activation_readiness` (which itself
-    # reuses `build_readiness_report`'s real-provider-cycle counting and
-    # provider-health category) rather than re-deriving either.
+    # reuses Milestone 7.2's `evaluate_activation_readiness` for provider
+    # health/pricing (unchanged), but Milestone 9.2 replaces its
+    # cost-based `real_provider_cycle_count` with the explicit
+    # provider-provenance classification below (Section 4).
     activation = shadow_readiness.evaluate_activation_readiness(conn, as_of, shadow_config, thresholds=shadow_thresholds)
     checks.append(ReadinessCheck(
         name="shadow_activation_readiness", classification=CLASSIFICATION_DERIVED,
@@ -221,26 +241,43 @@ def evaluate_controlled_soak_readiness(
         observed_value=activation.status, threshold_value="READY_*", source="shadow.readiness.evaluate_activation_readiness",
         reason="; ".join(activation.reasons),
     ))
+
+    provenance_summary = provider_provenance.compute_real_provider_history(conn, as_of)
+    real_provider_threshold = (
+        shadow_thresholds.min_real_provider_cycles_for_ready if shadow_thresholds
+        else shadow_readiness.DEFAULT_MIN_REAL_PROVIDER_CYCLES_FOR_READY
+    )
+    real_provider_history_sufficient = provenance_summary.real_provider_cycle_count >= real_provider_threshold
     checks.append(ReadinessCheck(
         name="real_provider_cycle_count", classification=CLASSIFICATION_AUTHORITATIVE,
-        passed=activation.readiness_report.real_provider_cycle_count >= (
-            shadow_thresholds.min_real_provider_cycles_for_ready if shadow_thresholds
-            else shadow_readiness.DEFAULT_MIN_REAL_PROVIDER_CYCLES_FOR_READY
-        ),
-        observed_value=str(activation.readiness_report.real_provider_cycle_count),
-        threshold_value=str(
-            shadow_thresholds.min_real_provider_cycles_for_ready if shadow_thresholds
-            else shadow_readiness.DEFAULT_MIN_REAL_PROVIDER_CYCLES_FOR_READY
-        ),
-        source="shadow_run_summaries (cost_usd > 0)", reason="real (non-fixture) shadow-cycle count",
+        passed=real_provider_history_sufficient,
+        observed_value=str(provenance_summary.real_provider_cycle_count), threshold_value=str(real_provider_threshold),
+        source="research_cycle_provider_provenance",
+        reason="cycles with at least one persisted real (non-fixture) evidence or Claude provider — never inferred from cost_usd",
     ))
+    for name, value in (
+        ("fixture_only_cycle_count", provenance_summary.fixture_only_cycle_count),
+        ("real_evidence_only_cycle_count", provenance_summary.real_evidence_only_cycle_count),
+        ("real_claude_only_cycle_count", provenance_summary.real_claude_only_cycle_count),
+        ("real_evidence_and_claude_cycle_count", provenance_summary.real_evidence_and_claude_cycle_count),
+        ("mixed_cycle_count", provenance_summary.mixed_cycle_count),
+        ("unknown_cycle_count", provenance_summary.unknown_cycle_count),
+    ):
+        checks.append(ReadinessCheck(
+            name=name, classification=CLASSIFICATION_AUTHORITATIVE, passed=None, observed_value=str(value),
+            threshold_value=None, source="research_cycle_provider_provenance", reason="informational breakdown, not itself a gate",
+        ))
 
     if activation.status in (
         shadow_readiness.ACTIVATION_NOT_READY_PRICING, shadow_readiness.ACTIVATION_NOT_READY_PROVIDER_HEALTH,
         shadow_readiness.ACTIVATION_NOT_READY_INSUFFICIENT_HISTORY, shadow_readiness.ACTIVATION_ENVIRONMENTALLY_BLOCKED,
-    ):
+    ) or not real_provider_history_sufficient:
+        reasons = activation.reasons if activation.status != shadow_readiness.ACTIVATION_READY_FOR_MANUAL_SHADOW_RUNS else (
+            f"real_provider_cycle_count {provenance_summary.real_provider_cycle_count} < minimum {real_provider_threshold} "
+            "(research_cycle_provider_provenance, never inferred from cost_usd)",
+        )
         return finish(
-            STATUS_NOT_READY_PROVIDER_HISTORY, activation.reasons, paper_soak_status=paper_soak["result"],
+            STATUS_NOT_READY_PROVIDER_HISTORY, reasons, paper_soak_status=paper_soak["result"],
             shadow_activation_status=activation.status,
         )
     if activation.status == shadow_readiness.ACTIVATION_NOT_READY_PAUSE_ACTIVE:
@@ -267,10 +304,11 @@ def evaluate_controlled_soak_readiness(
         status = STATUS_READY_FOR_MANUAL_SOAK
         reasons = (f"market_days_covered {market_days_covered} has not yet reached 2x minimum_market_days "
                    f"{minimum_market_days} — continue manual soak",)
-    elif not _CROSS_BOOK_SIGNAL_AVAILABLE:
+    elif cross_book_status != "PASSED":
         status = STATUS_READY_FOR_EXTENDED_MANUAL_SOAK
-        reasons = ("extended manual-soak history satisfied, but the cross-book violation signal is MISSING — "
-                   "recurring-activation review is withheld until that signal is persisted",)
+        reasons = (f"extended manual-soak history satisfied, but the cross-book verification signal is "
+                   f"{cross_book_status} (not PASSED) — recurring-activation review is withheld until a clean "
+                   f"verification is persisted",)
     else:
         status = STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW
         reasons = ("every controlled-soak and shadow-activation gate cleared — a human may now review recurring "

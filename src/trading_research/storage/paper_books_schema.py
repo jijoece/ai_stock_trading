@@ -361,6 +361,41 @@ CREATE TABLE IF NOT EXISTS paper_soak_operator_runs (
     policy_version TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Milestone 9.2 (Sections 5-7): one row per authoritative
+-- `verify_cross_book_integrity` invocation. `verification_id` is a
+-- deterministic hash of (as_of, operator_run_id, lifecycle_run_id,
+-- policy_version) — mirrors `paper_soak_operator_runs.operator_run_id`'s own
+-- hashing convention, so a replay for the identical inputs always resolves
+-- to the same row (INSERT OR IGNORE, immutable). Absence of an exception is
+-- never treated as a persisted pass — this row (status=PASSED) is the only
+-- authoritative "clean" signal.
+CREATE TABLE IF NOT EXISTS paper_book_cross_book_verifications (
+    verification_id TEXT PRIMARY KEY,
+    as_of TEXT NOT NULL,
+    operator_run_id TEXT,
+    lifecycle_run_id TEXT,
+    status TEXT NOT NULL,
+    violation_count INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Bounded per-check detail rows for one verification (Section 7). No FK on
+-- verification_id for the same "written during processing" ordering reason
+-- documented on paper_book_lifecycle_symbol_results above.
+CREATE TABLE IF NOT EXISTS paper_book_cross_book_verification_checks (
+    verification_id TEXT NOT NULL,
+    check_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    observed TEXT,
+    expected TEXT,
+    source TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (verification_id, check_name)
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -521,11 +556,50 @@ BEGIN SELECT RAISE(ABORT, 'paper_soak_operator_runs are immutable once persisted
 CREATE TRIGGER IF NOT EXISTS trg_paper_soak_operator_runs_no_delete
 BEFORE DELETE ON paper_soak_operator_runs
 BEGIN SELECT RAISE(ABORT, 'paper_soak_operator_runs are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_cross_book_verifications_no_update
+BEFORE UPDATE ON paper_book_cross_book_verifications
+BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verifications are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_cross_book_verifications_no_delete
+BEFORE DELETE ON paper_book_cross_book_verifications
+BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verifications are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_cross_book_verification_checks_no_update
+BEFORE UPDATE ON paper_book_cross_book_verification_checks
+BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verification_checks are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_cross_book_verification_checks_no_delete
+BEFORE DELETE ON paper_book_cross_book_verification_checks
+BEGIN SELECT RAISE(ABORT, 'paper_book_cross_book_verification_checks are immutable once persisted'); END;
 """
+
+# Milestone 9.2: additive, nullable columns on the pre-existing
+# `paper_soak_operator_runs` table — mirrors
+# `shadow_alerts_schema.py::_ensure_columns`'s own upgrade pattern. Every
+# pre-existing operator-run row predating this milestone simply reads back
+# with both columns NULL, never fabricated.
+_PAPER_BOOKS_COLUMN_UPGRADES = {
+    "paper_soak_operator_runs": {
+        "cross_book_verification_id": "TEXT",
+        "cross_book_verification_status": "TEXT",
+    },
+}
+
+
+def _ensure_columns(conn) -> None:
+    for table, columns in _PAPER_BOOKS_COLUMN_UPGRADES.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not existing:
+            continue  # table doesn't exist yet; CREATE handles it in full
+        for name, decl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
 def apply_paper_books_schema(conn) -> None:
     conn.executescript(PAPER_BOOKS_DDL)
+    _ensure_columns(conn)
     conn.executescript(PAPER_BOOKS_INDEXES)
     conn.executescript(PAPER_BOOKS_TRIGGERS)
     conn.commit()

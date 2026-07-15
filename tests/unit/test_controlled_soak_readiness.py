@@ -210,6 +210,8 @@ def test_insufficient_real_provider_history_blocks(conn, paper_cfg, shadow_cfg, 
 
 
 def test_manual_soak_ready_when_all_gates_clear_but_market_days_below_double_minimum(conn, paper_cfg, shadow_cfg, monkeypatch):
+    from trading_research.shadow.readiness import ReadinessThresholds
+
     monkeypatch.setattr(
         csr, "evaluate_paper_soak_readiness",
         lambda c, a, cfg: _ready_paper_soak(result="READY_FOR_MORE_MANUAL_SOAK", market_days_covered=1),
@@ -218,13 +220,21 @@ def test_manual_soak_ready_when_all_gates_clear_but_market_days_below_double_min
         "trading_research.shadow.readiness.evaluate_activation_readiness",
         lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
     )
-    result = csr.evaluate_controlled_soak_readiness(conn, BASE_TIME, paper_cfg, shadow_cfg)
+    # Milestone 9.2: real_provider_cycle_count now comes from persisted
+    # provenance, not cost_usd — zeroed out here (min=0) since this test's
+    # own focus is market-days tiering, not provider-history gating (that is
+    # covered separately by test_provenance-driven tests below).
+    result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg, shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=0),
+    )
     assert result.status == csr.STATUS_READY_FOR_MANUAL_SOAK
 
 
 def test_extended_manual_soak_ready_but_recurring_review_withheld_for_missing_cross_book_signal(
     conn, paper_cfg, shadow_cfg, monkeypatch,
 ):
+    from trading_research.shadow.readiness import ReadinessThresholds
+
     monkeypatch.setattr(
         csr, "evaluate_paper_soak_readiness",
         lambda c, a, cfg: _ready_paper_soak(result="READY_FOR_RECURRING_ACTIVATION_REVIEW", market_days_covered=100),
@@ -233,7 +243,9 @@ def test_extended_manual_soak_ready_but_recurring_review_withheld_for_missing_cr
         "trading_research.shadow.readiness.evaluate_activation_readiness",
         lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
     )
-    result = csr.evaluate_controlled_soak_readiness(conn, BASE_TIME, paper_cfg, shadow_cfg)
+    result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg, shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=0),
+    )
     assert result.status == csr.STATUS_READY_FOR_EXTENDED_MANUAL_SOAK
     assert result.status != csr.STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW
     cross_book_check = next(c for c in result.checks if c.name == "cross_book_violation_signal")
@@ -253,6 +265,51 @@ def test_never_returns_recurring_activation_review_today(conn, paper_cfg, shadow
     )
     result = csr.evaluate_controlled_soak_readiness(conn, BASE_TIME, paper_cfg, shadow_cfg)
     assert result.status != csr.STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW
+
+
+def test_cross_book_verification_failed_blocks_in_isolation(conn, paper_cfg, shadow_cfg, monkeypatch):
+    from trading_research.paper_books.cross_book_verification import CrossBookCheck, CrossBookVerificationResult, persist_verification
+
+    monkeypatch.setattr(csr, "evaluate_paper_soak_readiness", lambda c, a, cfg: _ready_paper_soak())
+    monkeypatch.setattr(
+        "trading_research.shadow.readiness.evaluate_activation_readiness",
+        lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
+    )
+    result = CrossBookVerificationResult(
+        verification_id="cbv-test-failed", as_of=BASE_TIME, status="FAILED",
+        checks=(CrossBookCheck("orders_arm_matches_book", "FAILED", "1", "0 violations", "paper_book_orders", "bad"),),
+        violation_count=1, policy_version="cross-book-verification/v1",
+    )
+    persist_verification(conn, result, operator_run_id=None, lifecycle_run_id=None, created_at=BASE_TIME)
+
+    readiness_result = csr.evaluate_controlled_soak_readiness(conn, BASE_TIME, paper_cfg, shadow_cfg)
+    assert readiness_result.status == csr.STATUS_NOT_READY_CROSS_BOOK
+
+
+def test_cross_book_verification_passed_allows_activation_review_when_everything_else_clears(
+    conn, paper_cfg, shadow_cfg, monkeypatch,
+):
+    from trading_research.paper_books.cross_book_verification import CrossBookCheck, CrossBookVerificationResult, persist_verification
+    from trading_research.shadow.readiness import ReadinessThresholds
+
+    monkeypatch.setattr(
+        csr, "evaluate_paper_soak_readiness",
+        lambda c, a, cfg: _ready_paper_soak(result="READY_FOR_RECURRING_ACTIVATION_REVIEW", market_days_covered=100),
+    )
+    monkeypatch.setattr(
+        "trading_research.shadow.readiness.evaluate_activation_readiness",
+        lambda c, a, cfg, thresholds=None, environmentally_blocked_reason=None: _ready_activation(readiness_conn=c),
+    )
+    result = CrossBookVerificationResult(
+        verification_id="cbv-test-passed", as_of=BASE_TIME, status="PASSED", checks=(), violation_count=0,
+        policy_version="cross-book-verification/v1",
+    )
+    persist_verification(conn, result, operator_run_id=None, lifecycle_run_id=None, created_at=BASE_TIME)
+
+    readiness_result = csr.evaluate_controlled_soak_readiness(
+        conn, BASE_TIME, paper_cfg, shadow_cfg, shadow_thresholds=ReadinessThresholds(min_real_provider_cycles_for_ready=0),
+    )
+    assert readiness_result.status == csr.STATUS_READY_FOR_RECURRING_ACTIVATION_REVIEW
 
 
 def test_result_status_always_in_documented_vocabulary(conn, paper_cfg, shadow_cfg):

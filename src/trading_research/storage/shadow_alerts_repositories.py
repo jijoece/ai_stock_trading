@@ -47,7 +47,7 @@ def find_recent_alerts_by_dedup_key(
 
 def list_alerts(
     conn: sqlite3.Connection, *, severity: str | None = None, alert_type: str | None = None,
-    since_iso: str | None = None, unresolved_only: bool = False,
+    since_iso: str | None = None, unresolved_only: bool = False, limit: int | None = None,
 ) -> list[dict]:
     clauses = []
     params: list[object] = []
@@ -66,6 +66,9 @@ def list_alerts(
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY created_at DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
 

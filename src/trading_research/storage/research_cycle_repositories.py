@@ -110,3 +110,49 @@ def list_symbol_evidence_status(conn: sqlite3.Connection, cycle_id: str) -> list
         "SELECT * FROM research_cycle_symbol_evidence_status WHERE cycle_id = ? ORDER BY symbol", (cycle_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# --- research_cycle_provider_provenance (Milestone 9.2) ----------------------
+
+
+def save_provider_provenance(conn: sqlite3.Connection, record: dict) -> bool:
+    """Insert-or-ignore keyed by `(cycle_id, symbol, provider_category)` — a
+    reprocessed symbol/category never creates a duplicate or overwrites an
+    earlier classification (immutable)."""
+    existing = conn.execute(
+        "SELECT 1 FROM research_cycle_provider_provenance WHERE cycle_id = ? AND symbol = ? AND provider_category = ?",
+        (record["cycle_id"], record["symbol"], record["provider_category"]),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        "INSERT INTO research_cycle_provider_provenance "
+        "(cycle_id, research_run_id, symbol, provider_category, provider_name, provider_mode, is_fixture, "
+        "is_real, request_or_source_id, status, observed_at, classification_version, created_at) "
+        "VALUES (:cycle_id, :research_run_id, :symbol, :provider_category, :provider_name, :provider_mode, "
+        ":is_fixture, :is_real, :request_or_source_id, :status, :observed_at, :classification_version, :created_at)",
+        record,
+    )
+    conn.commit()
+    return True
+
+
+def list_provider_provenance_for_cycle(conn: sqlite3.Connection, cycle_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM research_cycle_provider_provenance WHERE cycle_id = ? ORDER BY symbol, provider_category",
+        (cycle_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_provider_provenance_upto(conn: sqlite3.Connection, upto_as_of: str) -> list[dict]:
+    """Every provenance row for a cycle whose `research_cycles.as_of <=
+    upto_as_of` — the join `compute_real_provider_history` needs to bound
+    classification to cycles at-or-before a given date."""
+    rows = conn.execute(
+        "SELECT p.* FROM research_cycle_provider_provenance p "
+        "JOIN research_cycles c ON c.cycle_id = p.cycle_id "
+        "WHERE c.as_of <= ? ORDER BY p.cycle_id, p.symbol, p.provider_category",
+        (upto_as_of,),
+    ).fetchall()
+    return [dict(r) for r in rows]

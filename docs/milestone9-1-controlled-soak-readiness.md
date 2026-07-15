@@ -1,5 +1,11 @@
 # Milestone 9.1 — Controlled paper-soak activation and readiness closure
 
+**Milestone 9.2 pointer:** the cross-book violation signal this document's Section 4 records as a
+permanent, deliberate `MISSING` gap, and the cost-based real-provider-cycle counting described in
+Section 9, are both closed — see `docs/milestone9-2-soak-evidence-integrity.md`. Everything else
+below (combined-readiness inputs 1-13 other than those two, the blocking order, the manual
+`paper-soak-run`/`paper-soak-readiness` commands, the lifecycle clock fix) is unchanged.
+
 **Status:** Complete for this session's scope.
 **Date:** 2026-07-14.
 **Applies to:** `src/trading_research/paper_books/controlled_soak_readiness.py`,

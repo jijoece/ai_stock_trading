@@ -427,6 +427,50 @@ def test_paper_soak_readiness_cli_matches_controlled_readiness_module(db_path, m
     assert "checks" in outcome and isinstance(outcome["checks"], list)
 
 
+def test_paper_soak_run_persists_and_uses_cross_book_verification(db_path, monkeypatch):
+    """Milestone 9.2 Section 12: verification runs after lifecycle, is
+    persisted, and its ID/status are threaded onto the operator run."""
+    monkeypatch.setattr(cli_support, "load_paper_books_config", lambda: _config())
+    outcome = cli_support.paper_soak_run_cli(db_path, as_of=DAY1)
+    assert "error" not in outcome
+    assert outcome["cross_book_verification_id"] is not None
+    assert outcome["cross_book_verification_status"] in ("PASSED", "FAILED", "INSUFFICIENT_DATA")
+    assert outcome["cross_book_verification"]["verification_id"] == outcome["cross_book_verification_id"]
+
+    from trading_research.storage import paper_books_repositories as pb_repo
+    from trading_research.storage.database import connect
+
+    conn = connect(db_path)
+    stored = pb_repo.load_cross_book_verification(conn, outcome["cross_book_verification_id"])
+    assert stored is not None
+    conn.close()
+
+
+def test_paper_book_cross_check_cli_fails_closed_when_disabled(db_path, monkeypatch):
+    monkeypatch.setattr(cli_support, "load_paper_books_config", lambda: _config(paper_books_enabled=False))
+    outcome = cli_support.paper_book_cross_check_cli(db_path, as_of=DAY1)
+    assert "error" in outcome
+
+
+def test_paper_book_cross_check_cli_returns_bounded_sanitized_result(db_path, monkeypatch):
+    monkeypatch.setattr(cli_support, "load_paper_books_config", lambda: _config())
+    outcome = cli_support.paper_book_cross_check_cli(db_path, as_of=DAY1)
+    assert outcome["status"] in ("PASSED", "FAILED", "INSUFFICIENT_DATA")
+    assert isinstance(outcome["checks"], list)
+    serialized = str(outcome).lower()
+    for forbidden in ("api_key", "authorization", "sk-ant-", "password", "secret"):
+        assert forbidden not in serialized
+
+
+def test_readiness_diagnostics_expose_all_failed_and_missing_checks(db_path, monkeypatch):
+    monkeypatch.setattr(cli_support, "load_paper_books_config", lambda: _config())
+    outcome = cli_support.paper_soak_readiness_cli(db_path, as_of=DAY1)
+    assert "error" not in outcome
+    for key in ("all_failed_checks", "blocking_checks", "advisory_checks", "missing_checks"):
+        assert key in outcome
+        assert isinstance(outcome[key], list)
+
+
 def test_paper_soak_readiness_cli_fails_closed_when_disabled(db_path, monkeypatch):
     monkeypatch.setattr(cli_support, "load_paper_books_config", lambda: _config(paper_books_enabled=False))
     outcome = cli_support.paper_soak_readiness_cli(db_path, as_of=DAY1)

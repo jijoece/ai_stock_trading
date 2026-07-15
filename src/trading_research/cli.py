@@ -1560,6 +1560,72 @@ def shadow_alerts_cli(db_path: Path, *, severity: str | None = None, limit: int 
     return {"filter_severity": severity, "limit": limit, "alerts": result}
 
 
+_ALERT_LIST_DEFAULT_LIMIT = 50
+_ALERT_LIST_MAX_LIMIT = 200
+
+
+def shadow_alert_list_cli(
+    db_path: Path, *, severity: str | None = None, unresolved_only: bool = False, limit: int = _ALERT_LIST_DEFAULT_LIMIT,
+) -> dict:
+    """`shadow-alert-list` CLI command (Milestone 9.2 Section 9): read-only,
+    bounded, deterministically ordered (newest first, `shadow_alerts_repositories.
+    list_alerts`'s own `ORDER BY created_at DESC`), sanitized listing — never a
+    raw provider payload, never a credential. `limit` is clamped to
+    `[1, _ALERT_LIST_MAX_LIMIT]` so an operator can never request an
+    unbounded dump."""
+    from .storage.shadow_alerts_repositories import list_alerts
+
+    bounded_limit = max(1, min(limit, _ALERT_LIST_MAX_LIMIT))
+    with session(db_path) as conn:
+        alerts = list_alerts(conn, severity=severity, unresolved_only=unresolved_only, limit=bounded_limit)
+
+    return {
+        "filter_severity": severity, "unresolved_only": unresolved_only, "limit": bounded_limit,
+        "count": len(alerts),
+        "alerts": [
+            {
+                "alert_id": a["alert_id"], "alert_type": a["alert_type"], "severity": a["severity"],
+                "created_at": a["created_at"], "resolved": a["resolved_at"] is not None,
+                "resolved_at": a["resolved_at"], "resolved_by": a["resolved_by"],
+                "resolved_reason": a["resolved_reason"], "message": (a["message"] or "")[:500],
+            }
+            for a in alerts
+        ],
+    }
+
+
+def shadow_alert_resolve_cli(db_path: Path, *, alert_id: str, operator: str, reason: str) -> dict:
+    """`shadow-alert-resolve` CLI command (Milestone 9.2 Section 10): audited,
+    idempotent alert resolution — fails closed on an unknown alert, never
+    overwrites an already-resolved alert's original operator/reason/
+    resolved_at, never clears pause/kill state, never implies the underlying
+    incident is repaired. No bulk "resolve all" command exists here or
+    anywhere else in this milestone."""
+    from datetime import timezone as _tz
+
+    from .storage.shadow_alerts_repositories import load_alert, resolve_alert
+
+    if not operator or not operator.strip():
+        return {"error": "--operator is required and must be non-empty"}
+    if not reason or not reason.strip():
+        return {"error": "--reason is required and must be non-empty"}
+
+    with session(db_path) as conn:
+        existing = load_alert(conn, alert_id)
+        if existing is None:
+            return {"error": f"unknown alert_id {alert_id!r} — fails closed"}
+        resolve_alert(conn, alert_id, resolved_by=operator, reason=reason, resolved_at=datetime.now(_tz.utc).isoformat())
+        current = load_alert(conn, alert_id)
+        assert current is not None  # just resolved (or already resolved) above — always present now
+
+    return {
+        "alert_id": current["alert_id"], "resolved": current["resolved_at"] is not None,
+        "resolved_at": current["resolved_at"], "resolved_by": current["resolved_by"],
+        "resolved_reason": current["resolved_reason"],
+        "newly_resolved_this_call": existing["resolved_at"] is None,
+    }
+
+
 def shadow_pause_cli(db_path: Path, reason: str) -> dict:
     """`shadow-pause --reason "..."` CLI command (docs/milestone-7.md Step
     25). Delegates to `shadow/pause.py::request_pause` with
@@ -1949,6 +2015,20 @@ def main(argv: list[str] | None = None) -> int:
     p_shadow_alerts.add_argument("--severity", default=None, choices=["INFO", "WARNING", "ERROR", "CRITICAL"])
     p_shadow_alerts.add_argument("--limit", type=int, default=20)
 
+    p_shadow_alert_list = sub.add_parser(
+        "shadow-alert-list", help="Read-only, bounded operator alert listing (Milestone 9.2)",
+    )
+    p_shadow_alert_list.add_argument("--severity", default=None, choices=["INFO", "WARNING", "ERROR", "CRITICAL"])
+    p_shadow_alert_list.add_argument("--unresolved-only", action="store_true")
+    p_shadow_alert_list.add_argument("--limit", type=int, default=_ALERT_LIST_DEFAULT_LIMIT)
+
+    p_shadow_alert_resolve = sub.add_parser(
+        "shadow-alert-resolve", help="Audited, idempotent alert resolution — never clears pause/kill state (Milestone 9.2)",
+    )
+    p_shadow_alert_resolve.add_argument("--alert-id", required=True)
+    p_shadow_alert_resolve.add_argument("--operator", required=True)
+    p_shadow_alert_resolve.add_argument("--reason", required=True)
+
     p_shadow_pause = sub.add_parser("shadow-pause", help="Request an operator pause of shadow operations (Milestone 7)")
     p_shadow_pause.add_argument("--reason", required=True)
 
@@ -2084,6 +2164,14 @@ def main(argv: list[str] | None = None) -> int:
              "never activates or schedules anything",
     )
     p_pb_soak_readiness_combined.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+
+    p_pb_cross_check = sub.add_parser(
+        "paper-book-cross-check",
+        help="Read-only authoritative cross-book isolation verification (Milestone 9.2) — deterministic, no network call",
+    )
+    p_pb_cross_check.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+    p_pb_cross_check.add_argument("--operator-run-id", default=None)
+    p_pb_cross_check.add_argument("--lifecycle-run-id", default=None)
 
     args = parser.parse_args(argv)
 
@@ -2276,6 +2364,22 @@ def main(argv: list[str] | None = None) -> int:
         outcome = shadow_alerts_cli(cfg.research_database_path, severity=args.severity, limit=args.limit)
         print(json.dumps(outcome, indent=2, default=str))
         return 0
+
+    if args.command == "shadow-alert-list":
+        cfg = load_config()
+        outcome = shadow_alert_list_cli(
+            cfg.research_database_path, severity=args.severity, unresolved_only=args.unresolved_only, limit=args.limit,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
+
+    if args.command == "shadow-alert-resolve":
+        cfg = load_config()
+        outcome = shadow_alert_resolve_cli(
+            cfg.research_database_path, alert_id=args.alert_id, operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
 
     if args.command == "shadow-pause":
         cfg = load_config()
@@ -2470,6 +2574,17 @@ def main(argv: list[str] | None = None) -> int:
 
         cfg = load_config()
         outcome = paper_soak_readiness_cli(cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of))
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-cross-check":
+        from .paper_books.cli_support import paper_book_cross_check_cli
+
+        cfg = load_config()
+        outcome = paper_book_cross_check_cli(
+            cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
+            operator_run_id=args.operator_run_id, lifecycle_run_id=args.lifecycle_run_id,
+        )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
