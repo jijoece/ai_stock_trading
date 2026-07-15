@@ -128,6 +128,15 @@ class ShadowCycleRunResult:
     failure_reason: str | None
     lease_owner: str | None
     reason: str
+    # Milestone 8.1: set only when a `paper_book_integrator` was supplied and
+    # actually invoked (i.e. `run_cycle` returned a result without raising).
+    # `None`/`None` for every pre-existing caller (default parameter, so this
+    # is zero behavior change unless a caller opts in). A paper-book
+    # integration failure is recorded here — distinct from `failure_reason`
+    # above, which is reserved for the cycle/Claude-provider path — and never
+    # raised, never mutates `cycle_id`/symbol counts/`status` above.
+    paper_book_integration_status: str | None = None
+    paper_book_integration_reason: str | None = None
 
     @property
     def is_successful_no_op(self) -> bool:
@@ -405,6 +414,7 @@ def run_due_shadow_cycle(
     research_roles: tuple[str, ...] | None = None,
     owner: str | None = None,
     deployment_source: str = DEPLOYMENT_SOURCE_MANUAL,
+    paper_book_integrator: Callable[[ResearchCycleResult, datetime], Any] | None = None,
 ) -> ShadowCycleRunResult:
     """Single-invocation orchestrator wrapping `run_scheduled_research_cycle`
     (injected as `run_cycle` so this module never imports it directly,
@@ -444,6 +454,22 @@ def run_due_shadow_cycle(
     (threaded into `run_cycle` as `attempt_controller_factory`). `None`
     (every existing caller) disables per-attempt enforcement exactly as
     before this task — only the cycle-level reservation gates the run.
+
+    `paper_book_integrator` (docs/milestone-8.1.md Step 7, default `None` =
+    every existing caller's exact behavior): an optional
+    `(cycle_result, intended_schedule_time) -> Any` callable invoked once,
+    only after `run_cycle` returns without raising (i.e. only after frozen
+    recommendations actually exist), wrapped in its own try/except. This
+    module never imports `paper_books` directly — the real CLI wrapper
+    injects `paper_books.scheduled_integration.
+    integrate_scheduled_cycle_into_paper_books` (already gated closed by its
+    own `paper_books.enabled`/`paper_books.scheduled_integration.enabled`
+    checks) only when explicitly wired to do so. A raised exception here is
+    recorded on `ShadowCycleRunResult.paper_book_integration_status`
+    (`"FAILED"`)/`.paper_book_integration_reason` and NEVER re-raised, never
+    mutates `cycle_result`/the frozen research output, and is never folded
+    into `failure_reason` (which stays reserved for the Claude/cycle path,
+    so a paper-book failure is never mislabeled as a provider failure).
     """
     # --- Step 1: enabled check — before anything else is touched. ----------
     if not shadow_config.shadow_operations.enabled:
@@ -705,6 +731,21 @@ def run_due_shadow_cycle(
         except Exception as exc:  # cycle-level crash — visible as a partial/failed run, never silently lost
             failure_reason = str(exc)
 
+        # --- Step 7b (docs/milestone-8.1.md Step 7): optional paper-book
+        # integration, only after frozen recommendations actually exist
+        # (cycle_result is not None). Never allowed to affect the research
+        # result above, and never re-raised — a failure here is recorded on
+        # its own dedicated result fields, distinct from `failure_reason`.
+        paper_book_integration_status: str | None = None
+        paper_book_integration_reason: str | None = None
+        if paper_book_integrator is not None and cycle_result is not None:
+            try:
+                paper_book_integrator(cycle_result, intended_schedule_time)
+                paper_book_integration_status = "INTEGRATED"
+            except Exception as exc:  # paper-book failure must never look like a Claude-provider failure
+                paper_book_integration_status = "FAILED"
+                paper_book_integration_reason = str(exc)
+
         finish_time = clock()
 
         # --- Step 8: record actual usage and settle. -------------------------
@@ -855,6 +896,8 @@ def run_due_shadow_cycle(
             budget_consumed_usd=str(reservation.reserved_estimated_cost_usd - updated_reservation["remaining_cost_usd"]),
             failure_reason=failure_reason, lease_owner=lease_owner,
             reason=f"cycle {final_status.lower()}",
+            paper_book_integration_status=paper_book_integration_status,
+            paper_book_integration_reason=paper_book_integration_reason,
         )
     finally:
         # --- Step 10: release the lease — always. -----------------------------

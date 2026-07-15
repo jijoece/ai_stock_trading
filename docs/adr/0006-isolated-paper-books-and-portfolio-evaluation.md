@@ -2,7 +2,9 @@
 
 **Status:** Accepted (2026-07-14 — `pytest tests/ -q` shows 1355 passed/14 skipped, zero
 regressions against the 1266/14 baseline; the isolation and offline end-to-end tests
-described in "Acceptance" below all pass)
+described in "Acceptance" below all pass). **Decision 9 corrected 2026-07-13 (Milestone 8.1)**
+— see the inline correction below; the execution architecture description now matches the
+actual code (in-process local simulator, not a `paper_runtime` subprocess call).
 **Date:** 2026-07-13 (Milestone 8)
 
 ## Context
@@ -42,8 +44,10 @@ A `PaperBook` (`paper_books/models.py`) is a typed identity (`book_id`, `experim
 `NOT NULL` column inside a `book_id`-scoped uniqueness constraint. It is not a second
 `PaperLedger` instance pointed at a different SQLite file (that would fragment the single
 source of truth / reconciliation story), and it is not a broker-paper account (no credential,
-no network call, no broker order ID — `paper_books/execution.py` only ever talks to the
-existing local-simulated `paper_runtime` process boundary, extended additively). This mirrors
+no network call, no broker order ID — `paper_books/execution.py` is a self-contained,
+in-process, book-aware, deterministic local simulator; see the correction in Decision 9 below
+— Milestone 8/8.1 does not round-trip through the isolated `paper_runtime` subprocess). This
+mirrors
 ADR 0004 Decision 1's "smallest safe extension point" precedent: the existing
 `simulated_*`/`paper_cash_state`/`execution/models.py` tables and types are **not modified at
 all** — Milestone 8 adds a wholly new, parallel set of tables and modules. The legacy global
@@ -141,10 +145,23 @@ cycle time, before any comparison or evaluation ever runs.
 
 ## Decision 9: Enhanced paper execution cannot create a path to live execution, structurally
 
+**Correction (Milestone 8.1):** this decision originally implied Milestone 8's execution path
+round-trips through the existing isolated `paper_runtime` subprocess boundary. It does not.
+Milestone 8/8.1 uses an in-process, book-aware, deterministic local simulator
+(`paper_books/execution.py::simulate_fill`/`submit_and_simulate`) — a fresh, self-contained
+reimplementation of the limit-order-crossing rule, not a call into `paper_runtime` at all (see
+`.claude/scratchpads/milestone8-progress.md` "Paper execution" for the full rationale: the
+`paper_runtime` `BrokerGateway` implementations key state per *process instance*, not per
+`book_id`, so true per-book isolation there would require one subprocess per book — materially
+larger than this milestone's LOCAL-SIMULATED-PAPER scope). `paper_runtime/src/
+trading_paper_runtime/models.py::OrderIntentPayload` gained an additive, optional `book_id:
+str | None = None` field purely for a **possible future** subprocess-per-book integration —
+that field is not read or written by any Milestone 8/8.1 code path today. **Per-book
+`paper_runtime` subprocess execution is deferred** (see `docs/milestone8-1-scheduled-paper-book-integration.md`
+"Deferred").
+
 `paper_books/execution.py` never imports `runtime/lumibot/`, never imports a broker credential,
-and only ever calls the existing local-simulated `paper_runtime` boundary (fixture-mode or
-deterministic-mode, exactly like the Milestone 3/4 legacy path already does) with an
-additive, optional `book_id` field on `OrderIntentPayload`. `research/experiment_policy.py`'s
+and never calls any subprocess or broker boundary at all. `research/experiment_policy.py`'s
 existing `may_submit_enhanced()` (hardcoded `False`, gating the **legacy** global-ledger path)
 is left completely untouched; a new, separate function
 `may_submit_enhanced_to_paper_book(policy, *, enhanced_book_enabled)` governs only the new

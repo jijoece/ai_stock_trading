@@ -9,6 +9,11 @@ See `.claude/scratchpads/milestone8-progress.md` for the full session log (archi
 inventory, per-step verification narrative, exact commands run). This document is the
 durable architecture record.
 
+**Milestone 8.1 pointer:** the real scheduled-research-cycle-to-isolated-paper-book
+integration this document's Section 20/21 recorded as deferred is now implemented — see
+`docs/milestone8-1-scheduled-paper-book-integration.md`. Section 5's table count below is
+corrected to 14 (was previously misstated as "ten" in an earlier draft of this document).
+
 ---
 
 ## 1. What this milestone built
@@ -82,7 +87,7 @@ at all.
 
 ## 5. Schema
 
-Ten new tables in `storage/paper_books_schema.py` (`paper_books`, `paper_book_cash_ledger`,
+Fourteen new tables in `storage/paper_books_schema.py` (`paper_books`, `paper_book_cash_ledger`,
 `paper_book_risk_decisions`, `paper_book_orders`, `paper_book_fills`, `paper_book_positions`,
 `paper_book_position_lots`, `paper_book_snapshots`, `paper_book_snapshot_positions`,
 `paper_book_reconciliations`, `paper_book_daily_metrics`,

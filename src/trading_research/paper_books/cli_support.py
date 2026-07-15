@@ -19,6 +19,7 @@ from ..storage import paper_books_repositories as pb_repo
 from ..storage.database import session
 from . import cash_ledger, comparison as comparison_module, execution, order_intent, promotion_evidence, reconciliation, risk as risk_module, valuation
 from .config import PaperBooksConfigError, load_paper_books_config
+from .scheduled_integration import ScheduledIntegrationError, integrate_scheduled_cycle_into_paper_books
 
 
 def _utc_now() -> datetime:
@@ -252,4 +253,49 @@ def paper_promotion_status_cli(
         return {
             "experiment_id": experiment_id, "comparison_id": cmp.comparison_id,
             "promotion_evidence_id": promotion_evidence_id, "result": result, "reasons": list(reasons),
+        }
+
+
+def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_policy: str) -> dict:
+    """`paper-book-integrate-cycle` (docs/milestone-8.1.md Step 11): loads an
+    ACTUAL persisted scheduled-research-cycle (never a fixture recommendation)
+    and drives it through the isolated paper books. Fails closed with an
+    `"error"` key + non-zero exit whenever `paper_books.enabled` or
+    `paper_books.scheduled_integration.enabled` is false, or the cycle_id is
+    unknown. Returns sanitized, deterministic, structured JSON only — no raw
+    Claude prompt/response content ever appears here (this function never
+    touches `research_committee_reports`/model request-response tables)."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — scheduled integration requires paper configuration enabled"}
+    if not cfg.scheduled_integration.enabled:
+        return {"error": "paper_books.scheduled_integration.enabled is false — scheduled integration fails closed"}
+
+    with session(db_path) as conn:
+        try:
+            result = integrate_scheduled_cycle_into_paper_books(
+                conn, cycle_id=cycle_id, experiment_policy=experiment_policy, paper_books_config=cfg,
+                clock=_utc_now,
+            )
+        except ScheduledIntegrationError as exc:
+            return {"error": str(exc)}
+
+        return {
+            "cycle_id": result.cycle_id, "experiment_policy": result.experiment_policy,
+            "as_of": result.as_of.isoformat(),
+            "symbol_outcomes": [
+                {
+                    "symbol": o.symbol, "arm": o.arm, "book_id": o.book_id, "recommendation_id": o.recommendation_id,
+                    "outcome": o.outcome, "reasons": list(o.reasons), "risk_decision_id": o.risk_decision_id,
+                    "paper_order_intent_id": o.paper_order_intent_id, "fill_id": o.fill_id,
+                    "market_simulation_input_source": o.market_simulation_input_source,
+                }
+                for o in result.symbol_outcomes
+            ],
+            "reconciliations": {
+                book_id: {"reconciliation_id": r["reconciliation_id"], "status": r["status"], "mismatch_count": len(r["mismatches"])}
+                for book_id, r in result.reconciliations.items()
+            },
         }

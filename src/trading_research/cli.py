@@ -2025,6 +2025,16 @@ def main(argv: list[str] | None = None) -> int:
     p_pb_promotion.add_argument("--min-trading-days", type=int, default=1)
     p_pb_promotion.add_argument("--min-closed-trades", type=int, default=1)
 
+    p_pb_integrate = sub.add_parser(
+        "paper-book-integrate-cycle",
+        help="Drive an ACTUAL persisted scheduled-research cycle through the isolated paper books (Milestone 8.1) — manual, non-recurring",
+    )
+    p_pb_integrate.add_argument("--cycle-id", required=True)
+    p_pb_integrate.add_argument(
+        "--experiment-policy", default="BOTH_SEPARATE_PAPER_BOOKS",
+        choices=("OBSERVE_ONLY", "BASELINE_ONLY", "ENHANCED_ONLY", "BOTH_SEPARATE_PAPER_BOOKS", "SHADOW_ENHANCED"),
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
@@ -2342,6 +2352,16 @@ def main(argv: list[str] | None = None) -> int:
             cfg.research_database_path, experiment_id=args.experiment_id,
             min_comparable_cycles=args.min_comparable_cycles, min_trading_days=args.min_trading_days,
             min_closed_trades=args.min_closed_trades,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-integrate-cycle":
+        from .paper_books.cli_support import paper_book_integrate_cycle_cli
+
+        cfg = load_config()
+        outcome = paper_book_integrate_cycle_cli(
+            cfg.research_database_path, cycle_id=args.cycle_id, experiment_policy=args.experiment_policy,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2

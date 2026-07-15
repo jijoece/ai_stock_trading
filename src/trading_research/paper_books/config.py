@@ -130,6 +130,18 @@ class ValuationSection:
 
 
 @dataclass(frozen=True)
+class ScheduledIntegrationSection:
+    """Milestone 8.1 gate for the real-scheduled-cycle-to-paper-books
+    integration path — distinct from `paper_books.enabled` (which also
+    gates the fixture-mode `paper-book-run-cycle` CLI command).
+    `enabled` defaults `False` and this whole section is OPTIONAL in the raw
+    YAML (absent entirely = disabled), so every pre-existing config fixture
+    that predates this section keeps loading unchanged."""
+
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class PaperBooksConfiguration:
     version: int
     enabled: bool
@@ -138,6 +150,7 @@ class PaperBooksConfiguration:
     execution: ExecutionSection
     risk: RiskSection
     valuation: ValuationSection
+    scheduled_integration: ScheduledIntegrationSection
     config_hash: str
     raw: dict
 
@@ -171,7 +184,9 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
     if not isinstance(pb, dict):
         raise PaperBooksConfigError("paper-books config missing top-level 'paper_books' section")
 
-    _require_no_unknown_keys(pb, {"enabled", "books", "execution", "risk", "valuation"}, "paper_books")
+    _require_no_unknown_keys(
+        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration"}, "paper_books"
+    )
 
     books = pb.get("books")
     if not isinstance(books, dict):
@@ -237,6 +252,14 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             maximum_price_age_seconds=int(valuation["maximum_price_age_seconds"]),
             missing_price_policy=str(valuation["missing_price_policy"]),
         )
+
+        scheduled_integration_raw = pb.get("scheduled_integration", {})
+        if not isinstance(scheduled_integration_raw, dict):
+            raise PaperBooksConfigError("paper_books.scheduled_integration must be a mapping")
+        _require_no_unknown_keys(scheduled_integration_raw, {"enabled"}, "scheduled_integration")
+        scheduled_integration_section = ScheduledIntegrationSection(
+            enabled=bool(scheduled_integration_raw.get("enabled", False)),
+        )
     except PaperBooksConfigError:
         raise
     except Exception as exc:
@@ -245,5 +268,6 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
     return PaperBooksConfiguration(
         version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
+        scheduled_integration=scheduled_integration_section,
         config_hash=hash_config(raw), raw=raw,
     )

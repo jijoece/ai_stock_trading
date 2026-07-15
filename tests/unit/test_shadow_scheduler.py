@@ -317,6 +317,67 @@ def test_partial_cycle_visible_in_scheduler_runs_on_crash(conn):
     assert list_leases(conn)[0]["status"] == "RELEASED"
 
 
+# --- Milestone 8.1: optional paper_book_integrator hook -----------------------
+
+
+def test_paper_book_integrator_not_supplied_is_zero_behavior_change(conn):
+    """Default `paper_book_integrator=None` — every pre-existing caller's
+    exact behavior, including the new result fields staying `None`."""
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    assert result.status == STATUS_COMPLETED
+    assert result.paper_book_integration_status is None
+    assert result.paper_book_integration_reason is None
+
+
+def test_paper_book_integrator_invoked_after_cycle_result_and_recorded(conn):
+    calls = []
+
+    def _integrator(cycle_result, intended_schedule_time):
+        calls.append((cycle_result, intended_schedule_time))
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_integrator=_integrator, **_base_kwargs(conn),
+    )
+    assert result.status == STATUS_COMPLETED
+    assert len(calls) == 1
+    assert calls[0][0].cycle_id == result.cycle_id  # invoked with the real cycle_result, not a copy/guess
+    assert result.paper_book_integration_status == "INTEGRATED"
+    assert result.paper_book_integration_reason is None
+
+
+def test_paper_book_integrator_exception_is_recorded_not_raised_not_misclassified(conn):
+    def _failing_integrator(cycle_result, intended_schedule_time):
+        raise RuntimeError("simulated paper-book integration failure")
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_integrator=_failing_integrator, **_base_kwargs(conn),
+    )
+    # The cycle itself still completed successfully — a paper-book failure
+    # must never mutate/invalidate the frozen research result.
+    assert result.status == STATUS_COMPLETED
+    assert result.symbols_completed == 1
+    assert result.paper_book_integration_status == "FAILED"
+    assert "simulated paper-book integration failure" in result.paper_book_integration_reason
+    # Never folded into the cycle-level failure_reason (which stays reserved
+    # for the Claude/cycle-crash path) — never mislabeled as a provider failure.
+    assert result.failure_reason is None
+
+
+def test_paper_book_integrator_never_invoked_when_cycle_crashes(conn):
+    calls = []
+
+    def _integrator(cycle_result, intended_schedule_time):
+        calls.append(cycle_result)
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_integrator=_integrator,
+        **_base_kwargs(conn, run_cycle=_stub_run_cycle_raises),
+    )
+    assert result.status == "FAILED"
+    assert len(calls) == 0  # no frozen recommendations exist yet — nothing to integrate
+    assert result.paper_book_integration_status is None
+
+
 # --- Crash recovery via lease TTL expiry -------------------------------------
 
 

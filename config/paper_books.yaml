@@ -13,6 +13,14 @@ version: 1
 paper_books:
   enabled: false
 
+  # Milestone 8.1: gates the real-scheduled-cycle integration path
+  # (`paper-book-integrate-cycle` / `scheduled_integration.py`) separately
+  # from the fixture-mode `paper-book-run-cycle` command above, which is
+  # only gated by `paper_books.enabled`. Both this flag AND
+  # `paper_books.enabled` must be true for the scheduled path to run.
+  scheduled_integration:
+    enabled: false
+
   books:
     baseline:
       enabled: true
