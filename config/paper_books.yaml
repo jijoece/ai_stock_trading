@@ -31,6 +31,22 @@ paper_books:
     maximum_unresolved_warnings: 0
     stop_on_blocker: true
 
+  # Milestone 10: local simulated recurring paper lifecycle. Configuration
+  # is only one gate: an immutable ready review, activation request, and
+  # separate explicit activation event are also required.
+  recurring:
+    enabled: false
+    schedule:
+      timezone: America/Los_Angeles
+      market_days_only: true
+      hour: 13
+      minute: 30
+    maximum_cycles_per_run: 5
+    maximum_runtime_seconds: 900
+    lease_ttl_seconds: 1200
+    activation_review_max_age_market_days: 10
+    pause_on_safety_block: true
+
   books:
     baseline:
       enabled: true

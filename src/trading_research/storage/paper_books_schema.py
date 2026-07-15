@@ -454,6 +454,89 @@ CREATE TABLE IF NOT EXISTS paper_soak_activation_reviews (
     policy_version TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Milestone 10: append-only human activation audit. Current state is
+-- derived from the latest event; configuration never writes this table.
+CREATE TABLE IF NOT EXISTS paper_recurring_activation_events (
+    activation_event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    new_state TEXT NOT NULL,
+    activation_review_id TEXT,
+    campaign_id TEXT,
+    request_event_id TEXT,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requested_schedule_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    policy_version TEXT NOT NULL
+);
+
+-- Explicit bounded queue. The frozen-state hash detects changes to a cycle's
+-- persisted recommendation/evidence linkage after enqueue.
+CREATE TABLE IF NOT EXISTS paper_recurring_cycle_queue (
+    queue_item_id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    frozen_state_hash TEXT NOT NULL,
+    retry_of_queue_item_id TEXT,
+    enqueued_by TEXT NOT NULL,
+    enqueue_reason TEXT NOT NULL,
+    enqueued_at TEXT NOT NULL,
+    claimed_by_run_id TEXT,
+    claimed_at TEXT,
+    processed_operator_run_id TEXT,
+    processed_at TEXT,
+    failure_reason TEXT,
+    cancelled_by TEXT,
+    cancel_reason TEXT,
+    cancelled_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- Paper-specific singleton lease. It deliberately has no execution or book
+-- fields: acquiring it alone cannot mutate a paper portfolio.
+CREATE TABLE IF NOT EXISTS paper_recurring_scheduler_leases (
+    lease_name TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    scheduler_run_id TEXT,
+    status TEXT NOT NULL,
+    released_at TEXT
+);
+
+-- A row starts as RUNNING for crash recovery and becomes immutable at its
+-- first terminal status. The deterministic ID is derived from the intended
+-- schedule identity.
+CREATE TABLE IF NOT EXISTS paper_recurring_scheduler_runs (
+    scheduler_run_id TEXT PRIMARY KEY,
+    intended_schedule_id TEXT NOT NULL,
+    intended_at TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    owner_id TEXT NOT NULL,
+    lease_name TEXT NOT NULL,
+    activation_event_id TEXT,
+    activation_review_id TEXT,
+    queue_item_ids_json TEXT NOT NULL DEFAULT '[]',
+    requested_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    processed_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    operator_run_id TEXT,
+    lifecycle_run_id TEXT,
+    cross_book_verification_id TEXT,
+    cross_book_verification_status TEXT,
+    controlled_readiness_status TEXT,
+    all_failed_checks_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle_only INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    config_hash TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (intended_schedule_id)
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -485,6 +568,15 @@ CREATE INDEX IF NOT EXISTS idx_paper_book_cross_book_verifications_scope
     ON paper_book_cross_book_verifications(verification_scope_id, as_of, created_at);
 CREATE INDEX IF NOT EXISTS idx_paper_soak_campaign_days_campaign
     ON paper_soak_campaign_days(campaign_id, as_of);
+CREATE INDEX IF NOT EXISTS idx_paper_recurring_activation_created
+    ON paper_recurring_activation_events(created_at, activation_event_id);
+CREATE INDEX IF NOT EXISTS idx_paper_recurring_queue_order
+    ON paper_recurring_cycle_queue(status, enqueued_at, queue_item_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_recurring_queue_active_cycle
+    ON paper_recurring_cycle_queue(cycle_id)
+    WHERE status IN ('QUEUED', 'CLAIMED');
+CREATE INDEX IF NOT EXISTS idx_paper_recurring_runs_schedule
+    ON paper_recurring_scheduler_runs(intended_schedule_id, status);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -658,6 +750,23 @@ BEGIN SELECT RAISE(ABORT, 'paper_soak_activation_reviews are immutable once pers
 CREATE TRIGGER IF NOT EXISTS trg_paper_soak_activation_reviews_no_delete
 BEFORE DELETE ON paper_soak_activation_reviews
 BEGIN SELECT RAISE(ABORT, 'paper_soak_activation_reviews are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_recurring_activation_events_no_update
+BEFORE UPDATE ON paper_recurring_activation_events
+BEGIN SELECT RAISE(ABORT, 'paper recurring activation events are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_recurring_activation_events_no_delete
+BEFORE DELETE ON paper_recurring_activation_events
+BEGIN SELECT RAISE(ABORT, 'paper recurring activation events are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_recurring_scheduler_runs_terminal_no_update
+BEFORE UPDATE ON paper_recurring_scheduler_runs
+WHEN OLD.status <> 'RUNNING'
+BEGIN SELECT RAISE(ABORT, 'terminal paper recurring scheduler runs are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_recurring_scheduler_runs_no_delete
+BEFORE DELETE ON paper_recurring_scheduler_runs
+BEGIN SELECT RAISE(ABORT, 'paper recurring scheduler runs are immutable'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing
@@ -673,6 +782,9 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     "paper_book_cross_book_verifications": {
         "verification_scope_id": "TEXT",
         "source_state_hash": "TEXT",
+    },
+    "paper_recurring_cycle_queue": {
+        "retry_of_queue_item_id": "TEXT",
     },
 }
 

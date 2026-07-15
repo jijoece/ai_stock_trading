@@ -823,3 +823,118 @@ def paper_soak_activation_review_cli(db_path: Path, *, campaign_id: str) -> dict
         if review is None:
             return {"error": f"campaign {campaign_id!r} has no persisted activation review"}
         return review
+
+
+def paper_recurring_request_activation_cli(
+    db_path: Path, *, activation_review_id: str, operator: str, reason: str,
+) -> dict:
+    from .recurring_scheduler import RecurringPaperError, request_recurring_activation
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    try:
+        with session(db_path) as conn:
+            return request_recurring_activation(
+                conn, activation_review_id=activation_review_id, operator=operator, reason=reason,
+                paper_books_config=cfg, now=_utc_now(),
+            )
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_activate_cli(db_path: Path, *, request_event_id: str, operator: str) -> dict:
+    from .recurring_scheduler import RecurringPaperError, activate_recurring
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    try:
+        with session(db_path) as conn:
+            return activate_recurring(
+                conn, request_event_id=request_event_id, operator=operator,
+                paper_books_config=cfg, now=_utc_now(),
+            )
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_deactivate_cli(db_path: Path, *, operator: str, reason: str) -> dict:
+    from .recurring_scheduler import RecurringPaperError, deactivate_recurring
+    try:
+        with session(db_path) as conn:
+            return deactivate_recurring(conn, operator=operator, reason=reason, now=_utc_now())
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_enqueue_cycle_cli(db_path: Path, *, cycle_id: str, operator: str, reason: str) -> dict:
+    from .recurring_scheduler import RecurringPaperError, enqueue_recurring_cycle
+    try:
+        with session(db_path) as conn:
+            return enqueue_recurring_cycle(conn, cycle_id=cycle_id, operator=operator, reason=reason, now=_utc_now())
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_cancel_cycle_cli(
+    db_path: Path, *, queue_item_id: str, operator: str, reason: str,
+) -> dict:
+    from .recurring_scheduler import RecurringPaperError, cancel_recurring_cycle
+    try:
+        with session(db_path) as conn:
+            return cancel_recurring_cycle(
+                conn, queue_item_id=queue_item_id, operator=operator, reason=reason, now=_utc_now(),
+            )
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_run_once_cli(db_path: Path, *, now: datetime, owner_id: str) -> dict:
+    from dataclasses import asdict
+    from ..shadow.config import load_shadow_operations_config
+    from .recurring_scheduler import RecurringPaperError, run_recurring_paper_scheduler
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    try:
+        with session(db_path) as conn:
+            result = run_recurring_paper_scheduler(
+                conn, now=now, paper_books_config=cfg, shadow_config=load_shadow_operations_config(),
+                owner_id=owner_id, audit_clock=_utc_now,
+            )
+        return asdict(result)
+    except RecurringPaperError as exc:
+        return {"error": str(exc)}
+
+
+def paper_recurring_status_cli(db_path: Path) -> dict:
+    from .recurring_scheduler import current_activation_state, recurring_config_hash
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    with session(db_path) as conn:
+        state = current_activation_state(conn)
+        queue = pb_repo.list_recurring_queue_items(conn)
+        runs = pb_repo.list_recurring_scheduler_runs(conn, limit=10)
+        lease = conn.execute(
+            "SELECT * FROM paper_recurring_scheduler_leases WHERE lease_name = 'paper-recurring-local'"
+        ).fetchone()
+    return {
+        "configuration_enabled": cfg.recurring.enabled,
+        "activation_state": state.state,
+        "activation_event": state.event,
+        "recurring_config_hash": recurring_config_hash(cfg),
+        "queue_counts": {status: sum(item["status"] == status for item in queue) for status in (
+            "QUEUED", "CLAIMED", "PROCESSED", "FAILED", "CANCELLED",
+        )},
+        "lease": dict(lease) if lease else None,
+        "recent_scheduler_runs": runs,
+    }
+
+
+def paper_recurring_queue_list_cli(db_path: Path, *, status: str | None = None) -> dict:
+    from .recurring_scheduler import QUEUE_STATUSES
+    if status is not None and status not in QUEUE_STATUSES:
+        return {"error": f"unknown queue status {status!r}"}
+    with session(db_path) as conn:
+        items = pb_repo.list_recurring_queue_items(conn, status=status)
+    return {"status_filter": status, "count": len(items), "items": items}

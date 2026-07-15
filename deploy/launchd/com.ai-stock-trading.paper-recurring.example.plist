@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  INERT EXAMPLE ONLY. Nothing in this repository installs or loads it.
+  Replace every angle-bracket placeholder manually before making a copy.
+  It invokes only the local paper-recurring-run-once command and contains no secrets.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-stock-trading.paper-recurring.example</string>
+  <key>Disabled</key>
+  <true/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>&lt;PATH_TO_REPOSITORY_VENV_PYTHON&gt;</string>
+    <string>-m</string>
+    <string>trading_research.cli</string>
+    <string>paper-recurring-run-once</string>
+    <string>--now</string>
+    <string>&lt;TIMEZONE_AWARE_ISO8601_SUPPLIED_BY_WRAPPER&gt;</string>
+    <string>--owner-id</string>
+    <string>&lt;UNIQUE_OWNER_ID&gt;</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>&lt;PATH_TO_REPOSITORY&gt;</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>13</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+</dict>
+</plist>
