@@ -10,6 +10,7 @@ they never silently proceed.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,8 +18,10 @@ from pathlib import Path
 from ..research import experiment_policy as ep
 from ..storage import paper_books_repositories as pb_repo
 from ..storage.database import session
-from . import cash_ledger, comparison as comparison_module, execution, order_intent, promotion_evidence, reconciliation, risk as risk_module, valuation
+from . import cash_ledger, comparison as comparison_module, execution, lifecycle, order_intent, promotion_evidence, reconciliation, risk as risk_module, valuation
 from .config import PaperBooksConfigError, load_paper_books_config
+from .exit_policy import EXIT_DECISIONS
+from .models import VALUATION_COMPLETE
 from .scheduled_integration import ScheduledIntegrationError, integrate_scheduled_cycle_into_paper_books
 
 
@@ -299,3 +302,252 @@ def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_p
                 for book_id, r in result.reconciliations.items()
             },
         }
+
+
+def paper_book_lifecycle_run_cli(db_path: Path, *, as_of: datetime, integrate_cycle_ids: tuple[str, ...] = ()) -> dict:
+    """`paper-book-lifecycle-run` (docs/milestone-9.md Section 11). Fails
+    closed with an `"error"` key + non-zero exit whenever `paper_books.enabled`
+    or `paper_books.lifecycle.enabled` is false. Returns sanitized,
+    deterministic JSON only."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — lifecycle run fails closed"}
+    if not cfg.lifecycle.enabled:
+        return {"error": "paper_books.lifecycle.enabled is false — lifecycle run fails closed"}
+
+    with session(db_path) as conn:
+        try:
+            result = lifecycle.run_paper_book_lifecycle(
+                conn, as_of=as_of, paper_books_config=cfg, integrate_cycle_ids=tuple(integrate_cycle_ids),
+                clock=_utc_now,
+            )
+        except lifecycle.LifecycleError as exc:
+            return {"error": str(exc)}
+
+        return {
+            "lifecycle_run_id": result.lifecycle_run_id, "as_of": result.as_of.isoformat(),
+            "processed_cycle_ids": list(result.processed_cycle_ids), "books_processed": list(result.books_processed),
+            "pending_orders_filled": result.pending_orders_filled,
+            "pending_orders_expired": result.pending_orders_expired,
+            "exit_decisions": list(result.exit_decisions), "exit_orders_created": result.exit_orders_created,
+            "exit_orders_filled": result.exit_orders_filled, "snapshot_ids": dict(result.snapshot_ids),
+            "reconciliation_statuses": dict(result.reconciliation_statuses), "metrics_ids": dict(result.metrics_ids),
+            "failure_reasons": list(result.failure_reasons),
+        }
+
+
+def paper_book_exit_request_cli(
+    db_path: Path, *, book_id: str, symbol: str, operator: str, reason: str,
+    requested_at: datetime | None = None, idempotency_key: str | None = None,
+) -> dict:
+    """`paper-book-exit-request` (docs/milestone-9.md Section 11): creates an
+    explicit, audited manual exit request. Never mutates a position or
+    submits an order directly — the request is only consumed the next time
+    `paper-book-lifecycle-run` evaluates exits for this book/symbol
+    (docs/milestone-9.md Section 3 "Manual exit")."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — manual exit request fails closed"}
+    if book_id not in (cfg.baseline.book_id, cfg.enhanced.book_id):
+        return {"error": f"unknown book_id {book_id!r} — fails closed"}
+    if not symbol:
+        return {"error": "symbol is required"}
+    if not operator:
+        return {"error": "operator is required for an audited manual exit request"}
+    if not reason:
+        return {"error": "reason is required for an audited manual exit request"}
+
+    now = _utc_now()
+    requested_at = requested_at or now
+    idempotency_key = idempotency_key or hashlib.sha256(
+        f"{book_id}:{symbol}:{operator}:{reason}:{requested_at.isoformat()}".encode()
+    ).hexdigest()[:32]
+    manual_exit_request_id = f"pb-manual-exit-{hashlib.sha256(f'{book_id}:{idempotency_key}'.encode()).hexdigest()[:32]}"
+
+    with session(db_path) as conn:
+        if pb_repo.load_book(conn, book_id) is None:
+            return {"error": f"book {book_id!r} has not been opened yet — fails closed"}
+        created = pb_repo.save_manual_exit_request(
+            conn, manual_exit_request_id=manual_exit_request_id, book_id=book_id, symbol=symbol, operator=operator,
+            reason=reason, requested_at=requested_at, idempotency_key=idempotency_key, created_at=now,
+        )
+        return {
+            "manual_exit_request_id": manual_exit_request_id, "book_id": book_id, "symbol": symbol,
+            "operator": operator, "reason": reason, "requested_at": requested_at.isoformat(),
+            "idempotency_key": idempotency_key, "created": created,
+        }
+
+
+def _lifecycle_runs_upto(conn, as_of: datetime) -> list[dict]:
+    return pb_repo.list_lifecycle_runs(conn, upto_as_of=as_of.isoformat())
+
+
+def _report_for_book(conn, book_id: str, as_of: datetime, cfg) -> dict:
+    snap = valuation.build_portfolio_snapshot(
+        conn, book_id, as_of, price_provider=None, maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
+    )
+    positions = pb_repo.list_positions(conn, book_id, open_only=True)
+    orders = pb_repo.list_order_intents(conn, book_id)
+    pending_orders = [o for o in orders if o["status"] == "PENDING_SUBMISSION"]
+    fills = pb_repo.list_fills(conn, book_id)
+    today = as_of.date().isoformat()
+    orders_filled_today = len([f for f in fills if f["fill_timestamp"][:10] == today])
+    exit_decisions = pb_repo.list_exit_decisions(conn, book_id)
+    exits_triggered_today = len([
+        d for d in exit_decisions if d["as_of"][:10] == today and d["decision"] in EXIT_DECISIONS
+    ])
+    reconciliations = pb_repo.list_reconciliations(conn, book_id)
+    recon_upto = [r for r in reconciliations if r["as_of"] <= as_of.isoformat()]
+    reconciliation_status = recon_upto[-1]["status"] if recon_upto else None
+    snap_positions = pb_repo.list_snapshot_positions(conn, book_id, snap.snapshot_id)
+    max_concentration = None
+    if snap.net_liquidation_value_usd:
+        weights = [
+            Decimal(p["market_value_usd"]) / snap.net_liquidation_value_usd
+            for p in snap_positions if p["market_value_usd"] is not None
+        ]
+        max_concentration = max(weights) if weights else Decimal("0")
+    completed_cycles = len({o["cycle_id"] for o in orders if not str(o["cycle_id"]).startswith("lifecycle:")})
+
+    return {
+        "book_id": book_id, "enabled": True,
+        "cash_available_usd": str(cash_ledger.available_cash(conn, book_id)),
+        "cash_reserved_usd": str(cash_ledger.reserved_cash(conn, book_id)),
+        "net_liquidation_value_usd": str(snap.net_liquidation_value_usd) if snap.net_liquidation_value_usd is not None else None,
+        "realized_pnl_usd": str(snap.realized_pnl_usd),
+        "unrealized_pnl_usd": str(snap.unrealized_pnl_usd) if snap.unrealized_pnl_usd is not None else None,
+        "open_positions": len(positions), "pending_orders": len(pending_orders),
+        "orders_filled_today": orders_filled_today, "exits_triggered_today": exits_triggered_today,
+        "reconciliation_status": reconciliation_status, "valuation_status": snap.valuation_status,
+        "unvalued_positions": snap.unvalued_position_count,
+        "maximum_position_concentration": str(max_concentration) if max_concentration is not None else None,
+        "completed_experiment_cycles": completed_cycles,
+    }
+
+
+def paper_book_soak_report_cli(db_path: Path, *, as_of: datetime) -> dict:
+    """`paper-book-soak-report` (docs/milestone-9.md Section 9): read-only.
+    Never declares a winner — `promotion_evidence_status` here is only a
+    pointer to the existing, authoritative `paper-promotion-status` command
+    (Milestone 8), never recomputed/duplicated here."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false — no books exist to report on"}
+
+    with session(db_path) as conn:
+        lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
+        market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
+        completed_experiment_cycles = len(lifecycle_runs)
+
+        books = {}
+        for name, book_id in (("baseline", cfg.baseline.book_id), ("enhanced", cfg.enhanced.book_id)):
+            if not cfg.is_book_enabled(book_id) or pb_repo.load_book(conn, book_id) is None:
+                books[name] = {"book_id": book_id, "enabled": False}
+                continue
+            books[name] = _report_for_book(conn, book_id, as_of, cfg)
+
+        enabled_reports = [b for b in books.values() if b.get("enabled")]
+        if (
+            completed_experiment_cycles < cfg.lifecycle.soak.minimum_completed_cycles
+            or market_days_covered < cfg.lifecycle.soak.minimum_market_days
+        ):
+            status = "NOT_ENOUGH_HISTORY"
+        elif any(
+            b.get("reconciliation_status") not in (None, "MATCHED") or b.get("valuation_status") != VALUATION_COMPLETE
+            for b in enabled_reports
+        ):
+            status = "ATTENTION_REQUIRED"
+        else:
+            status = "READY_FOR_ACTIVATION_REVIEW"
+
+        comparison = None
+        if books["baseline"].get("enabled") and books["enhanced"].get("enabled"):
+            comparable_cycles = min(
+                books["baseline"]["completed_experiment_cycles"], books["enhanced"]["completed_experiment_cycles"]
+            )
+            deltas = {}
+            for key in ("net_liquidation_value_usd", "realized_pnl_usd", "unrealized_pnl_usd"):
+                b_val, e_val = books["baseline"].get(key), books["enhanced"].get(key)
+                deltas[key] = str(Decimal(e_val) - Decimal(b_val)) if b_val is not None and e_val is not None else None
+            comparison = {
+                "comparable_cycles": comparable_cycles, "metric_deltas": deltas,
+                "promotion_evidence_status": "run paper-promotion-status for an authoritative, evidence-only result",
+            }
+
+        return {
+            "as_of": as_of.isoformat(), "status": status,
+            "completed_experiment_cycles": completed_experiment_cycles, "market_days_covered": market_days_covered,
+            "books": books, "baseline_vs_enhanced": comparison,
+        }
+
+
+def paper_book_soak_readiness_cli(db_path: Path, *, as_of: datetime) -> dict:
+    """`paper-book-soak-readiness` (docs/milestone-9.md Section 10):
+    deterministic, advisory-only. Never enables recurring processing —
+    `READY_FOR_RECURRING_ACTIVATION_REVIEW` means "a human may now review
+    activation," nothing here activates anything."""
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    if not cfg.enabled:
+        return {"error": "paper_books.enabled is false"}
+
+    with session(db_path) as conn:
+        lifecycle_runs = _lifecycle_runs_upto(conn, as_of)
+        market_days_covered = len({r["as_of"][:10] for r in lifecycle_runs})
+        completed_cycles = len(lifecycle_runs)
+        both_enabled = cfg.is_book_enabled(cfg.baseline.book_id) and cfg.is_book_enabled(cfg.enhanced.book_id)
+
+        def outcome(result: str, reasons: list[str]) -> dict:
+            return {
+                "result": result, "reasons": reasons, "as_of": as_of.isoformat(),
+                "completed_cycles": completed_cycles, "market_days_covered": market_days_covered,
+                "both_books_enabled": both_enabled,
+            }
+
+        if not both_enabled:
+            return outcome("NOT_READY_INSUFFICIENT_CYCLES", ["both baseline and enhanced books must be enabled for a comparable soak"])
+        if completed_cycles < cfg.lifecycle.soak.minimum_completed_cycles:
+            return outcome(
+                "NOT_READY_INSUFFICIENT_CYCLES",
+                [f"completed_cycles {completed_cycles} < minimum_completed_cycles {cfg.lifecycle.soak.minimum_completed_cycles}"],
+            )
+        if market_days_covered < cfg.lifecycle.soak.minimum_market_days:
+            return outcome(
+                "NOT_READY_INSUFFICIENT_MARKET_DAYS",
+                [f"market_days_covered {market_days_covered} < minimum_market_days {cfg.lifecycle.soak.minimum_market_days}"],
+            )
+
+        lifecycle_failures = [reason for run in lifecycle_runs for reason in run["failure_reasons"]]
+        if lifecycle_failures:
+            return outcome("NOT_READY_LIFECYCLE_FAILURES", lifecycle_failures[:10])
+
+        recon_bad = []
+        valuation_bad = []
+        for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
+            reconciliations = pb_repo.list_reconciliations(conn, book_id)
+            recon_upto = [r for r in reconciliations if r["as_of"] <= as_of.isoformat()]
+            if recon_upto and recon_upto[-1]["status"] != "MATCHED":
+                recon_bad.append(f"{book_id}: {recon_upto[-1]['status']}")
+            snap = valuation.build_portfolio_snapshot(
+                conn, book_id, as_of, price_provider=None, maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
+            )
+            if snap.valuation_status != VALUATION_COMPLETE:
+                valuation_bad.append(f"{book_id}: {snap.valuation_status}")
+        if recon_bad:
+            return outcome("NOT_READY_RECONCILIATION", recon_bad)
+        if valuation_bad:
+            return outcome("NOT_READY_VALUATION", valuation_bad)
+
+        result = (
+            "READY_FOR_RECURRING_ACTIVATION_REVIEW"
+            if market_days_covered >= cfg.lifecycle.soak.minimum_market_days * 2
+            else "READY_FOR_MORE_MANUAL_SOAK"
+        )
+        return outcome(result, [])

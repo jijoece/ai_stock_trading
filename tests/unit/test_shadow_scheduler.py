@@ -378,6 +378,63 @@ def test_paper_book_integrator_never_invoked_when_cycle_crashes(conn):
     assert result.paper_book_integration_status is None
 
 
+# --- Milestone 9: optional paper_book_lifecycle_hook -------------------------
+
+
+def test_paper_book_lifecycle_hook_not_supplied_is_zero_behavior_change(conn):
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn))
+    assert result.status == STATUS_COMPLETED
+    assert result.paper_book_lifecycle_status is None
+    assert result.paper_book_lifecycle_reason is None
+
+
+def test_paper_book_lifecycle_hook_invoked_with_intended_schedule_time(conn):
+    calls = []
+
+    def _hook(intended_schedule_time):
+        calls.append(intended_schedule_time)
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_lifecycle_hook=_hook, **_base_kwargs(conn),
+    )
+    assert result.status == STATUS_COMPLETED
+    assert len(calls) == 1
+    assert result.paper_book_lifecycle_status == "PROCESSED"
+    assert result.paper_book_lifecycle_reason is None
+
+
+def test_paper_book_lifecycle_hook_exception_is_recorded_not_raised_not_misclassified(conn):
+    def _failing_hook(intended_schedule_time):
+        raise RuntimeError("simulated lifecycle failure")
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_lifecycle_hook=_failing_hook, **_base_kwargs(conn),
+    )
+    assert result.status == STATUS_COMPLETED
+    assert result.paper_book_lifecycle_status == "FAILED"
+    assert "simulated lifecycle failure" in result.paper_book_lifecycle_reason
+    assert result.failure_reason is None
+    assert result.paper_book_integration_status is None  # never conflated with the integration hook
+
+
+def test_paper_book_lifecycle_hook_runs_independently_of_integrator(conn):
+    lifecycle_calls = []
+
+    def _failing_integrator(cycle_result, intended_schedule_time):
+        raise RuntimeError("integration failed")
+
+    def _hook(intended_schedule_time):
+        lifecycle_calls.append(intended_schedule_time)
+
+    result = run_due_shadow_cycle(
+        now=DUE_NOW, clock=_clock_at(DUE_NOW), paper_book_integrator=_failing_integrator,
+        paper_book_lifecycle_hook=_hook, **_base_kwargs(conn),
+    )
+    assert result.paper_book_integration_status == "FAILED"
+    assert result.paper_book_lifecycle_status == "PROCESSED"
+    assert len(lifecycle_calls) == 1
+
+
 # --- Crash recovery via lease TTL expiry -------------------------------------
 
 

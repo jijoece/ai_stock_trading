@@ -6,6 +6,13 @@
 `src/trading_research/paper_books/config.py`, `src/trading_research/shadow/scheduler.py`,
 `config/paper_books.yaml`, `docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md`.
 
+**Milestone 9 pointer:** the manual daily lifecycle (pending-order resolution, deterministic
+exits, soak reporting/readiness) this document's own Section 13 recorded as a "recommended
+Milestone 9 scope" item is now implemented — see
+`docs/milestone9-manual-paper-soak-and-lifecycle.md`. `run_due_shadow_cycle`'s
+`paper_book_integrator` hook described below is unchanged; a second, independent optional hook
+(`paper_book_lifecycle_hook`) was added beside it.
+
 See `.claude/scratchpads/milestone8-1-progress.md` for the full session log. This document is
 the durable architecture record for the integration closure Milestone 8 left deferred:
 

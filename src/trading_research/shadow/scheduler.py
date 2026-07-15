@@ -137,6 +137,15 @@ class ShadowCycleRunResult:
     # raised, never mutates `cycle_id`/symbol counts/`status` above.
     paper_book_integration_status: str | None = None
     paper_book_integration_reason: str | None = None
+    # Milestone 9: set only when a `paper_book_lifecycle_hook` was supplied
+    # and actually invoked. `None`/`None` for every pre-existing caller
+    # (default parameter, zero behavior change unless a caller opts in). A
+    # lifecycle failure is recorded here — distinct from both
+    # `failure_reason` (Claude/cycle path) and
+    # `paper_book_integration_status` (entry-integration path) — and never
+    # raised, never mutates any other field above.
+    paper_book_lifecycle_status: str | None = None
+    paper_book_lifecycle_reason: str | None = None
 
     @property
     def is_successful_no_op(self) -> bool:
@@ -415,6 +424,7 @@ def run_due_shadow_cycle(
     owner: str | None = None,
     deployment_source: str = DEPLOYMENT_SOURCE_MANUAL,
     paper_book_integrator: Callable[[ResearchCycleResult, datetime], Any] | None = None,
+    paper_book_lifecycle_hook: Callable[[datetime], Any] | None = None,
 ) -> ShadowCycleRunResult:
     """Single-invocation orchestrator wrapping `run_scheduled_research_cycle`
     (injected as `run_cycle` so this module never imports it directly,
@@ -470,6 +480,21 @@ def run_due_shadow_cycle(
     mutates `cycle_result`/the frozen research output, and is never folded
     into `failure_reason` (which stays reserved for the Claude/cycle path,
     so a paper-book failure is never mislabeled as a provider failure).
+
+    `paper_book_lifecycle_hook` (docs/milestone-9.md Section 12, default
+    `None` = every existing caller's exact behavior): an optional
+    `(intended_schedule_time) -> Any` callable invoked once, only after
+    `paper_book_integrator` (if any) has run, wrapped in its own try/except.
+    This module never imports `paper_books` directly — a real caller would
+    inject `paper_books.lifecycle.run_paper_book_lifecycle` (already gated
+    closed by its own `paper_books.enabled`/`paper_books.lifecycle.enabled`
+    checks) only when explicitly wired to do so; no such wiring exists in
+    this codebase yet, so supplying this hook does not by itself create any
+    recurring/automatic lifecycle processing. A raised exception here is
+    recorded on `ShadowCycleRunResult.paper_book_lifecycle_status`
+    (`"FAILED"`)/`.paper_book_lifecycle_reason` and NEVER re-raised, never
+    mutates `cycle_result`/`status`/`failure_reason`/
+    `paper_book_integration_status` above.
     """
     # --- Step 1: enabled check — before anything else is touched. ----------
     if not shadow_config.shadow_operations.enabled:
@@ -746,6 +771,19 @@ def run_due_shadow_cycle(
                 paper_book_integration_status = "FAILED"
                 paper_book_integration_reason = str(exc)
 
+        # --- Step 7c (docs/milestone-9.md Section 12): optional daily
+        # lifecycle hook — invoked once, independent of whether the entry
+        # integration above ran or succeeded, wrapped in its own try/except.
+        paper_book_lifecycle_status: str | None = None
+        paper_book_lifecycle_reason: str | None = None
+        if paper_book_lifecycle_hook is not None:
+            try:
+                paper_book_lifecycle_hook(intended_schedule_time)
+                paper_book_lifecycle_status = "PROCESSED"
+            except Exception as exc:  # lifecycle failure must never look like a Claude-provider failure
+                paper_book_lifecycle_status = "FAILED"
+                paper_book_lifecycle_reason = str(exc)
+
         finish_time = clock()
 
         # --- Step 8: record actual usage and settle. -------------------------
@@ -898,6 +936,8 @@ def run_due_shadow_cycle(
             reason=f"cycle {final_status.lower()}",
             paper_book_integration_status=paper_book_integration_status,
             paper_book_integration_reason=paper_book_integration_reason,
+            paper_book_lifecycle_status=paper_book_lifecycle_status,
+            paper_book_lifecycle_reason=paper_book_lifecycle_reason,
         )
     finally:
         # --- Step 10: release the lease — always. -----------------------------

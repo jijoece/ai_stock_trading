@@ -259,6 +259,86 @@ CREATE TABLE IF NOT EXISTS paper_book_promotion_evidence (
     policy_version TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- Milestone 9: deterministic exit decisions (HOLD/EXIT_*/SKIPPED_*),
+-- immutable once persisted. `exit_decision_id` is a deterministic hash of
+-- (book_id, symbol, as_of, policy_version), so re-running the same
+-- lifecycle date never creates a duplicate decision row.
+CREATE TABLE IF NOT EXISTS paper_book_exit_decisions (
+    exit_decision_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    reference_price TEXT,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    policy_version TEXT NOT NULL,
+    manual_exit_request_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- Milestone 9: explicit, audited manual exit requests (Section 3 "Manual
+-- exit"). Immutable once persisted — a request is never edited, only
+-- consumed (its own row never changes; consumption is observable via the
+-- exit decision/order it produced). `idempotency_key` is UNIQUE so a
+-- retried identical request never creates a second row.
+CREATE TABLE IF NOT EXISTS paper_book_manual_exit_requests (
+    manual_exit_request_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Milestone 9: one row per manual, explicit `run_paper_book_lifecycle`
+-- invocation — the persistent audit trail a soak session is evaluated
+-- against. `lifecycle_run_id` is a deterministic hash of `as_of` (+
+-- config_hash), so retrying the same lifecycle date resolves to the same
+-- row (idempotent insert; the function's return value always reflects a
+-- fresh recompute of the actual current state, per-operation idempotency
+-- guards it independently).
+CREATE TABLE IF NOT EXISTS paper_book_lifecycle_runs (
+    lifecycle_run_id TEXT PRIMARY KEY,
+    as_of TEXT NOT NULL,
+    processed_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    books_processed_json TEXT NOT NULL DEFAULT '[]',
+    pending_orders_filled INTEGER NOT NULL DEFAULT 0,
+    pending_orders_expired INTEGER NOT NULL DEFAULT 0,
+    exit_decisions_json TEXT NOT NULL DEFAULT '[]',
+    exit_orders_created INTEGER NOT NULL DEFAULT 0,
+    exit_orders_filled INTEGER NOT NULL DEFAULT 0,
+    snapshot_ids_json TEXT NOT NULL DEFAULT '{}',
+    reconciliation_statuses_json TEXT NOT NULL DEFAULT '{}',
+    metrics_ids_json TEXT NOT NULL DEFAULT '{}',
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- Milestone 9: bounded per-book/per-symbol outcome for one lifecycle run
+-- (pending-order processing or exit evaluation) — the queryable audit trail
+-- for "why did/didn't this symbol do anything on this lifecycle date."
+-- No REFERENCES paper_book_lifecycle_runs here on purpose: per-symbol
+-- results are written *during* processing, before the run-summary row that
+-- describes them is written at the very end (Section 7 step 11), so a FK
+-- would invert the natural write order.
+CREATE TABLE IF NOT EXISTS paper_book_lifecycle_symbol_results (
+    lifecycle_run_id TEXT NOT NULL,
+    book_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    exit_decision_id TEXT,
+    paper_order_intent_id TEXT,
+    fill_id TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (lifecycle_run_id, book_id, symbol, stage)
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -276,6 +356,14 @@ CREATE INDEX IF NOT EXISTS idx_paper_book_experiment_assignments_experiment
     ON paper_book_experiment_assignments(experiment_id, symbol);
 CREATE INDEX IF NOT EXISTS idx_paper_book_experiment_comparisons_experiment
     ON paper_book_experiment_comparisons(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_paper_book_exit_decisions_book_symbol
+    ON paper_book_exit_decisions(book_id, symbol, as_of);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_book_manual_exit_requests_idem
+    ON paper_book_manual_exit_requests(book_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_paper_book_manual_exit_requests_book_symbol
+    ON paper_book_manual_exit_requests(book_id, symbol, requested_at);
+CREATE INDEX IF NOT EXISTS idx_paper_book_lifecycle_symbol_results_run
+    ON paper_book_lifecycle_symbol_results(lifecycle_run_id, book_id);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -369,6 +457,38 @@ BEGIN SELECT RAISE(ABORT, 'paper_book_experiment_comparisons are immutable once 
 CREATE TRIGGER IF NOT EXISTS trg_paper_book_experiment_comparisons_no_delete
 BEFORE DELETE ON paper_book_experiment_comparisons
 BEGIN SELECT RAISE(ABORT, 'paper_book_experiment_comparisons are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_exit_decisions_no_update
+BEFORE UPDATE ON paper_book_exit_decisions
+BEGIN SELECT RAISE(ABORT, 'paper_book_exit_decisions are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_exit_decisions_no_delete
+BEFORE DELETE ON paper_book_exit_decisions
+BEGIN SELECT RAISE(ABORT, 'paper_book_exit_decisions are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_manual_exit_requests_no_update
+BEFORE UPDATE ON paper_book_manual_exit_requests
+BEGIN SELECT RAISE(ABORT, 'paper_book_manual_exit_requests are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_manual_exit_requests_no_delete
+BEFORE DELETE ON paper_book_manual_exit_requests
+BEGIN SELECT RAISE(ABORT, 'paper_book_manual_exit_requests are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_lifecycle_runs_no_update
+BEFORE UPDATE ON paper_book_lifecycle_runs
+BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_runs are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_lifecycle_runs_no_delete
+BEFORE DELETE ON paper_book_lifecycle_runs
+BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_runs are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_lifecycle_symbol_results_no_update
+BEFORE UPDATE ON paper_book_lifecycle_symbol_results
+BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_symbol_results are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_book_lifecycle_symbol_results_no_delete
+BEFORE DELETE ON paper_book_lifecycle_symbol_results
+BEGIN SELECT RAISE(ABORT, 'paper_book_lifecycle_symbol_results are immutable once persisted'); END;
 """
 
 

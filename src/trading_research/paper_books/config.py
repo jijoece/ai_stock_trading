@@ -142,6 +142,75 @@ class ScheduledIntegrationSection:
 
 
 @dataclass(frozen=True)
+class PendingOrdersSection:
+    expire_after_market_days: int
+
+    def __post_init__(self) -> None:
+        if self.expire_after_market_days <= 0:
+            raise PaperBooksConfigError("lifecycle.pending_orders.expire_after_market_days must be > 0")
+
+
+@dataclass(frozen=True)
+class ExitsSection:
+    """Milestone 9 deterministic exit-policy thresholds. `enabled=False`
+    (the shipped default) means `lifecycle.py` never evaluates exits at all
+    — open positions are only ever closed by an explicit manual request
+    (Section 3's "Manual exit"), never automatically."""
+
+    enabled: bool
+    stop_loss_percent: Decimal
+    profit_target_percent: Decimal
+    maximum_holding_market_days: int
+    exit_on_recommendation_reversal: bool
+
+    def __post_init__(self) -> None:
+        for field_name in ("stop_loss_percent", "profit_target_percent"):
+            value = getattr(self, field_name)
+            if not (Decimal("0") < value < Decimal("1")):
+                raise PaperBooksConfigError(f"lifecycle.exits.{field_name} must be in (0,1) — got {value}")
+        if self.maximum_holding_market_days <= 0:
+            raise PaperBooksConfigError("lifecycle.exits.maximum_holding_market_days must be > 0")
+
+
+@dataclass(frozen=True)
+class SoakSection:
+    minimum_completed_cycles: int
+    minimum_market_days: int
+
+    def __post_init__(self) -> None:
+        if self.minimum_completed_cycles <= 0:
+            raise PaperBooksConfigError("lifecycle.soak.minimum_completed_cycles must be > 0")
+        if self.minimum_market_days <= 0:
+            raise PaperBooksConfigError("lifecycle.soak.minimum_market_days must be > 0")
+
+
+@dataclass(frozen=True)
+class LifecycleSection:
+    """Milestone 9 gate for `paper_books/lifecycle.py`'s manual daily
+    lifecycle run — distinct from, and additional to, `paper_books.enabled`
+    and `paper_books.scheduled_integration.enabled`. `enabled` defaults
+    `False` and this whole section is OPTIONAL in the raw YAML (absent
+    entirely = disabled), so every pre-existing config fixture that predates
+    this section keeps loading unchanged. No environment variable can ever
+    enable this section — only this file can."""
+
+    enabled: bool
+    pending_orders: PendingOrdersSection
+    exits: ExitsSection
+    soak: SoakSection
+
+
+_DISABLED_LIFECYCLE_SECTION = LifecycleSection(
+    enabled=False, pending_orders=PendingOrdersSection(expire_after_market_days=1),
+    exits=ExitsSection(
+        enabled=False, stop_loss_percent=Decimal("0.08"), profit_target_percent=Decimal("0.15"),
+        maximum_holding_market_days=20, exit_on_recommendation_reversal=True,
+    ),
+    soak=SoakSection(minimum_completed_cycles=10, minimum_market_days=5),
+)
+
+
+@dataclass(frozen=True)
 class PaperBooksConfiguration:
     version: int
     enabled: bool
@@ -153,6 +222,11 @@ class PaperBooksConfiguration:
     scheduled_integration: ScheduledIntegrationSection
     config_hash: str
     raw: dict
+    # Milestone 9, added after every other field so pre-existing direct
+    # `PaperBooksConfiguration(...)` construction sites (tests predating this
+    # milestone) keep working unchanged — defaults fully disabled, matching
+    # every other Milestone 9 gate's "absent = closed" convention.
+    lifecycle: LifecycleSection = _DISABLED_LIFECYCLE_SECTION
 
     def __post_init__(self) -> None:
         if self.baseline.book_id == self.enhanced.book_id:
@@ -185,7 +259,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         raise PaperBooksConfigError("paper-books config missing top-level 'paper_books' section")
 
     _require_no_unknown_keys(
-        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration"}, "paper_books"
+        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle"}, "paper_books"
     )
 
     books = pb.get("books")
@@ -260,6 +334,54 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         scheduled_integration_section = ScheduledIntegrationSection(
             enabled=bool(scheduled_integration_raw.get("enabled", False)),
         )
+
+        lifecycle_raw = pb.get("lifecycle", {})
+        if not isinstance(lifecycle_raw, dict):
+            raise PaperBooksConfigError("paper_books.lifecycle must be a mapping")
+        _require_no_unknown_keys(lifecycle_raw, {"enabled", "pending_orders", "exits", "soak"}, "lifecycle")
+
+        pending_orders_raw = lifecycle_raw.get("pending_orders", {})
+        if not isinstance(pending_orders_raw, dict):
+            raise PaperBooksConfigError("lifecycle.pending_orders must be a mapping")
+        _require_no_unknown_keys(pending_orders_raw, {"expire_after_market_days"}, "lifecycle.pending_orders")
+        pending_orders_section = PendingOrdersSection(
+            expire_after_market_days=int(pending_orders_raw.get("expire_after_market_days", 1)),
+        )
+
+        exits_raw = lifecycle_raw.get("exits", {})
+        if not isinstance(exits_raw, dict):
+            raise PaperBooksConfigError("lifecycle.exits must be a mapping")
+        _require_no_unknown_keys(
+            exits_raw,
+            {
+                "enabled", "stop_loss_percent", "profit_target_percent", "maximum_holding_market_days",
+                "exit_on_recommendation_reversal",
+            },
+            "lifecycle.exits",
+        )
+        exits_section = ExitsSection(
+            enabled=bool(exits_raw.get("enabled", False)),
+            stop_loss_percent=_decimal(exits_raw.get("stop_loss_percent", "0.08"), "lifecycle.exits.stop_loss_percent"),
+            profit_target_percent=_decimal(
+                exits_raw.get("profit_target_percent", "0.15"), "lifecycle.exits.profit_target_percent"
+            ),
+            maximum_holding_market_days=int(exits_raw.get("maximum_holding_market_days", 20)),
+            exit_on_recommendation_reversal=bool(exits_raw.get("exit_on_recommendation_reversal", True)),
+        )
+
+        soak_raw = lifecycle_raw.get("soak", {})
+        if not isinstance(soak_raw, dict):
+            raise PaperBooksConfigError("lifecycle.soak must be a mapping")
+        _require_no_unknown_keys(soak_raw, {"minimum_completed_cycles", "minimum_market_days"}, "lifecycle.soak")
+        soak_section = SoakSection(
+            minimum_completed_cycles=int(soak_raw.get("minimum_completed_cycles", 10)),
+            minimum_market_days=int(soak_raw.get("minimum_market_days", 5)),
+        )
+
+        lifecycle_section = LifecycleSection(
+            enabled=bool(lifecycle_raw.get("enabled", False)),
+            pending_orders=pending_orders_section, exits=exits_section, soak=soak_section,
+        )
     except PaperBooksConfigError:
         raise
     except Exception as exc:
@@ -268,6 +390,6 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
     return PaperBooksConfiguration(
         version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
-        scheduled_integration=scheduled_integration_section,
+        scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section,
         config_hash=hash_config(raw), raw=raw,
     )

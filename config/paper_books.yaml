@@ -50,3 +50,25 @@ paper_books:
     price_source: evidence_snapshot        # evidence_snapshot | persisted_market_bar — unknown values fail closed
     maximum_price_age_seconds: 900
     missing_price_policy: MARK_UNVALUED     # MARK_UNVALUED is the only supported policy — fails closed otherwise
+
+  # Milestone 9: manual, disabled-by-default daily lifecycle processing
+  # (pending-order resolution + deterministic exits + soak reporting). No
+  # environment variable can enable this section — only this file can, and
+  # `paper_books/lifecycle.py::run_paper_book_lifecycle` is manually invoked
+  # only (never launchd, never a recurring scheduler).
+  lifecycle:
+    enabled: false
+
+    pending_orders:
+      expire_after_market_days: 1
+
+    exits:
+      enabled: false
+      stop_loss_percent: "0.08"
+      profit_target_percent: "0.15"
+      maximum_holding_market_days: 20
+      exit_on_recommendation_reversal: true
+
+    soak:
+      minimum_completed_cycles: 10
+      minimum_market_days: 5

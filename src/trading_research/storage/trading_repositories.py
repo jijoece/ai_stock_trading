@@ -117,3 +117,20 @@ def load_recommendation_factors(conn: sqlite3.Connection, rec_id: str) -> list[d
         (rec_id,),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_recommendations_by_symbol_since(
+    conn: sqlite3.Connection, symbol: str, after_ts: str, upto_ts: str
+) -> list[dict]:
+    """Frozen recommendations for `symbol` strictly newer than `after_ts` and
+    at-or-before `upto_ts` (ISO8601 strings, lexically comparable), newest
+    first — Milestone 9's point-in-time-safe recommendation-reversal lookup
+    (docs/milestone-9.md Section 3: `position_opened_at < ts <= as_of`).
+    Flat columns only (rec_id/side/status/ts); never the full payload_json,
+    since a reversal check only needs the frozen side/status classification."""
+    rows = conn.execute(
+        "SELECT rec_id, symbol, side, status, ts FROM recommendations "
+        "WHERE symbol = ? AND ts > ? AND ts <= ? ORDER BY ts DESC",
+        (symbol, after_ts, upto_ts),
+    ).fetchall()
+    return [dict(r) for r in rows]

@@ -642,3 +642,197 @@ def load_promotion_evidence(conn: sqlite3.Connection, promotion_evidence_id: str
     result = dict(row)
     result["reasons"] = tuple(json.loads(result["reasons_json"]))
     return result
+
+
+# -- Milestone 9: exit decisions / manual exit requests / lifecycle runs ----
+
+
+def exit_decision_exists(conn: sqlite3.Connection, exit_decision_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM paper_book_exit_decisions WHERE exit_decision_id = ?", (exit_decision_id,)
+    ).fetchone()
+    return row is not None
+
+
+def save_exit_decision(
+    conn: sqlite3.Connection, *, exit_decision_id: str, book_id: str, symbol: str, as_of: datetime,
+    decision, manual_exit_request_id: str | None, created_at: datetime,
+) -> bool:
+    """`decision` is a `paper_books.exit_policy.PaperExitDecision`. Idempotent:
+    a retried lifecycle run for the same (book_id, symbol, as_of,
+    policy_version) resolves to the same `exit_decision_id` and is a no-op."""
+    if exit_decision_exists(conn, exit_decision_id):
+        return False
+    conn.execute(
+        "INSERT INTO paper_book_exit_decisions (exit_decision_id, book_id, symbol, as_of, decision, "
+        "quantity, reference_price, reasons_json, policy_version, manual_exit_request_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            exit_decision_id, book_id, symbol, _ts(as_of), decision.decision, str(decision.quantity),
+            _dec_str(decision.reference_price), json.dumps(list(decision.reasons)), decision.policy_version,
+            manual_exit_request_id, _ts(created_at),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def load_exit_decision(conn: sqlite3.Connection, exit_decision_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_book_exit_decisions WHERE exit_decision_id = ?", (exit_decision_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["reasons"] = tuple(json.loads(result["reasons_json"]))
+    return result
+
+
+def list_exit_decisions(conn: sqlite3.Connection, book_id: str, symbol: str | None = None) -> list[dict]:
+    if symbol is None:
+        rows = conn.execute(
+            "SELECT * FROM paper_book_exit_decisions WHERE book_id = ? ORDER BY as_of", (book_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM paper_book_exit_decisions WHERE book_id = ? AND symbol = ? ORDER BY as_of",
+            (book_id, symbol),
+        ).fetchall()
+    results = []
+    for row in rows:
+        result = dict(row)
+        result["reasons"] = tuple(json.loads(result["reasons_json"]))
+        results.append(result)
+    return results
+
+
+def manual_exit_request_exists(conn: sqlite3.Connection, book_id: str, idempotency_key: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM paper_book_manual_exit_requests WHERE book_id = ? AND idempotency_key = ?",
+        (book_id, idempotency_key),
+    ).fetchone()
+    return row is not None
+
+
+def save_manual_exit_request(
+    conn: sqlite3.Connection, *, manual_exit_request_id: str, book_id: str, symbol: str, operator: str,
+    reason: str, requested_at: datetime, idempotency_key: str, created_at: datetime,
+) -> bool:
+    if manual_exit_request_exists(conn, book_id, idempotency_key):
+        return False
+    conn.execute(
+        "INSERT INTO paper_book_manual_exit_requests (manual_exit_request_id, book_id, symbol, operator, "
+        "reason, requested_at, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            manual_exit_request_id, book_id, symbol, operator, reason, _ts(requested_at), idempotency_key,
+            _ts(created_at),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def list_unconsumed_manual_exit_requests(conn: sqlite3.Connection, book_id: str, symbol: str) -> list[dict]:
+    """A manual request is "consumed" once an exit decision references its
+    `manual_exit_request_id` — this query excludes any such request, so a
+    lifecycle rerun never re-triggers an already-acted-on manual exit."""
+    rows = conn.execute(
+        "SELECT * FROM paper_book_manual_exit_requests r WHERE r.book_id = ? AND r.symbol = ? "
+        "AND NOT EXISTS (SELECT 1 FROM paper_book_exit_decisions d "
+        "WHERE d.manual_exit_request_id = r.manual_exit_request_id) "
+        "ORDER BY r.requested_at",
+        (book_id, symbol),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def lifecycle_run_exists(conn: sqlite3.Connection, lifecycle_run_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM paper_book_lifecycle_runs WHERE lifecycle_run_id = ?", (lifecycle_run_id,)
+    ).fetchone()
+    return row is not None
+
+
+def save_lifecycle_run(conn: sqlite3.Connection, run: dict) -> bool:
+    if lifecycle_run_exists(conn, run["lifecycle_run_id"]):
+        return False
+    conn.execute(
+        "INSERT INTO paper_book_lifecycle_runs (lifecycle_run_id, as_of, processed_cycle_ids_json, "
+        "books_processed_json, pending_orders_filled, pending_orders_expired, exit_decisions_json, "
+        "exit_orders_created, exit_orders_filled, snapshot_ids_json, reconciliation_statuses_json, "
+        "metrics_ids_json, failure_reasons_json, config_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            run["lifecycle_run_id"], _ts(run["as_of"]), json.dumps(list(run["processed_cycle_ids"])),
+            json.dumps(list(run["books_processed"])), run["pending_orders_filled"], run["pending_orders_expired"],
+            json.dumps(list(run["exit_decisions"])), run["exit_orders_created"], run["exit_orders_filled"],
+            json.dumps(run["snapshot_ids"]), json.dumps(run["reconciliation_statuses"]),
+            json.dumps(run["metrics_ids"]), json.dumps(list(run["failure_reasons"])), run["config_hash"],
+            _ts(run["created_at"]),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def list_lifecycle_runs(conn: sqlite3.Connection, upto_as_of: str | None = None) -> list[dict]:
+    if upto_as_of is None:
+        rows = conn.execute("SELECT lifecycle_run_id FROM paper_book_lifecycle_runs ORDER BY as_of").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT lifecycle_run_id FROM paper_book_lifecycle_runs WHERE as_of <= ? ORDER BY as_of", (upto_as_of,)
+        ).fetchall()
+    return [load_lifecycle_run(conn, row["lifecycle_run_id"]) for row in rows]
+
+
+def load_lifecycle_run(conn: sqlite3.Connection, lifecycle_run_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_book_lifecycle_runs WHERE lifecycle_run_id = ?", (lifecycle_run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["processed_cycle_ids"] = json.loads(result["processed_cycle_ids_json"])
+    result["books_processed"] = json.loads(result["books_processed_json"])
+    result["exit_decisions"] = json.loads(result["exit_decisions_json"])
+    result["snapshot_ids"] = json.loads(result["snapshot_ids_json"])
+    result["reconciliation_statuses"] = json.loads(result["reconciliation_statuses_json"])
+    result["metrics_ids"] = json.loads(result["metrics_ids_json"])
+    result["failure_reasons"] = json.loads(result["failure_reasons_json"])
+    return result
+
+
+def save_lifecycle_symbol_result(conn: sqlite3.Connection, *, lifecycle_run_id: str, book_id: str, symbol: str,
+                                  stage: str, outcome: str, reasons: tuple, exit_decision_id: str | None,
+                                  paper_order_intent_id: str | None, fill_id: str | None, created_at: datetime) -> bool:
+    existing = conn.execute(
+        "SELECT 1 FROM paper_book_lifecycle_symbol_results WHERE lifecycle_run_id = ? AND book_id = ? "
+        "AND symbol = ? AND stage = ?",
+        (lifecycle_run_id, book_id, symbol, stage),
+    ).fetchone()
+    if existing is not None:
+        return False
+    conn.execute(
+        "INSERT INTO paper_book_lifecycle_symbol_results (lifecycle_run_id, book_id, symbol, stage, outcome, "
+        "reasons_json, exit_decision_id, paper_order_intent_id, fill_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            lifecycle_run_id, book_id, symbol, stage, outcome, json.dumps(list(reasons)), exit_decision_id,
+            paper_order_intent_id, fill_id, _ts(created_at),
+        ),
+    )
+    conn.commit()
+    return True
+
+
+def list_lifecycle_symbol_results(conn: sqlite3.Connection, lifecycle_run_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_book_lifecycle_symbol_results WHERE lifecycle_run_id = ? ORDER BY book_id, symbol, stage",
+        (lifecycle_run_id,),
+    ).fetchall()
+    results = []
+    for row in rows:
+        result = dict(row)
+        result["reasons"] = tuple(json.loads(result["reasons_json"]))
+        results.append(result)
+    return results

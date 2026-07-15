@@ -2035,6 +2035,31 @@ def main(argv: list[str] | None = None) -> int:
         choices=("OBSERVE_ONLY", "BASELINE_ONLY", "ENHANCED_ONLY", "BOTH_SEPARATE_PAPER_BOOKS", "SHADOW_ENHANCED"),
     )
 
+    p_pb_lifecycle_run = sub.add_parser(
+        "paper-book-lifecycle-run",
+        help="Manually process pending orders, evaluate exits, snapshot, and reconcile both books for one lifecycle date (Milestone 9)",
+    )
+    p_pb_lifecycle_run.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+    p_pb_lifecycle_run.add_argument("--integrate-cycle-id", action="append", default=[], dest="integrate_cycle_ids")
+
+    p_pb_exit_request = sub.add_parser(
+        "paper-book-exit-request", help="Create an explicit, audited manual exit request for one book/symbol (Milestone 9)"
+    )
+    p_pb_exit_request.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_pb_exit_request.add_argument("--symbol", required=True)
+    p_pb_exit_request.add_argument("--operator", required=True)
+    p_pb_exit_request.add_argument("--reason", required=True)
+
+    p_pb_soak_report = sub.add_parser(
+        "paper-book-soak-report", help="Read-only daily soak report for both isolated paper books (Milestone 9)"
+    )
+    p_pb_soak_report.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+
+    p_pb_soak_readiness = sub.add_parser(
+        "paper-book-soak-readiness", help="Deterministic, advisory-only soak-readiness result (Milestone 9) — never activates anything"
+    )
+    p_pb_soak_readiness.add_argument("--as-of", required=True, help="ISO8601 timestamp")
+
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
@@ -2363,6 +2388,44 @@ def main(argv: list[str] | None = None) -> int:
         outcome = paper_book_integrate_cycle_cli(
             cfg.research_database_path, cycle_id=args.cycle_id, experiment_policy=args.experiment_policy,
         )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-lifecycle-run":
+        from .paper_books.cli_support import paper_book_lifecycle_run_cli
+
+        cfg = load_config()
+        outcome = paper_book_lifecycle_run_cli(
+            cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
+            integrate_cycle_ids=tuple(args.integrate_cycle_ids),
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-exit-request":
+        from .paper_books.cli_support import paper_book_exit_request_cli
+
+        cfg = load_config()
+        outcome = paper_book_exit_request_cli(
+            cfg.research_database_path, book_id=args.book_id, symbol=args.symbol, operator=args.operator,
+            reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-soak-report":
+        from .paper_books.cli_support import paper_book_soak_report_cli
+
+        cfg = load_config()
+        outcome = paper_book_soak_report_cli(cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of))
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-book-soak-readiness":
+        from .paper_books.cli_support import paper_book_soak_readiness_cli
+
+        cfg = load_config()
+        outcome = paper_book_soak_readiness_cli(cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of))
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
