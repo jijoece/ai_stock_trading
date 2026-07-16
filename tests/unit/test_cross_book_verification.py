@@ -224,6 +224,27 @@ def test_verified_state_change_generates_new_id_and_stale_signal(conn, cfg):
     assert cbv.verification_is_stale(conn, pb_repo.load_cross_book_verification(conn, first.verification_id), DAY1)
 
 
+def test_future_rows_and_current_position_do_not_change_historical_verification(conn, cfg):
+    _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
+    first = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    cbv.persist_verification(conn, first, operator_run_id=None, lifecycle_run_id=None, created_at=DAY1)
+    future = DAY1.replace(day=6)
+    cash_ledger.cash_adjustment(
+        conn, "BASELINE", Decimal("1"), operator="auditor", reason="future correction",
+        idempotency_key="future-adjustment", now=future,
+    )
+    conn.execute(
+        "UPDATE paper_book_positions SET quantity='999', updated_at=? WHERE book_id='BASELINE' AND symbol='AAPL'",
+        (future.isoformat(),),
+    )
+    conn.commit()
+    rebuilt = cbv.verify_cross_book_integrity(conn, as_of=DAY1, paper_books_config=cfg)
+    assert rebuilt.verification_id == first.verification_id
+    assert cbv.verification_is_stale(
+        conn, pb_repo.load_cross_book_verification(conn, first.verification_id), future,
+    ) is False
+
+
 def test_failed_then_repaired_state_preserves_both_events(conn, cfg):
     _open_position(conn, cfg, book_id="BASELINE", arm="BASELINE")
     conn.execute("UPDATE paper_book_positions SET quantity = '999' WHERE book_id = 'BASELINE' AND symbol = 'AAPL'")

@@ -784,6 +784,7 @@ def paper_soak_campaign_validate_cli(manifest_path: Path) -> dict:
 
 def paper_soak_campaign_run_cli(
     db_path: Path, *, manifest_path: Path, continue_on_blocker: bool = False,
+    operator: str | None = None, reason: str | None = None,
 ) -> dict:
     from ..shadow.config import load_shadow_operations_config
     from .soak_campaign import SoakCampaignError, load_campaign_manifest, run_soak_campaign
@@ -792,6 +793,8 @@ def paper_soak_campaign_run_cli(
         return {"error": error}
     if not cfg.soak_campaign.enabled:
         return {"error": "paper_books.soak_campaign.enabled is false — campaign run fails closed"}
+    if continue_on_blocker and (not operator or not reason):
+        return {"error": "--continue-on-blocker requires --operator and --reason"}
     try:
         manifest = load_campaign_manifest(manifest_path)
         with session(db_path) as conn:
@@ -799,7 +802,7 @@ def paper_soak_campaign_run_cli(
                 conn, manifest=manifest, paper_books_config=cfg,
                 shadow_config=load_shadow_operations_config(),
                 stop_on_blocker=False if continue_on_blocker else cfg.soak_campaign.stop_on_blocker,
-                audit_clock=_utc_now,
+                audit_clock=_utc_now, continuation_operator=operator, continuation_reason=reason,
             )
     except SoakCampaignError as exc:
         return {"error": str(exc)}
@@ -814,15 +817,46 @@ def paper_soak_campaign_show_cli(db_path: Path, *, campaign_id: str) -> dict:
         return {"error": str(exc)}
 
 
-def paper_soak_activation_review_cli(db_path: Path, *, campaign_id: str) -> dict:
-    with session(db_path) as conn:
-        campaign = pb_repo.load_soak_campaign(conn, campaign_id)
-        if campaign is None:
-            return {"error": f"unknown campaign_id {campaign_id!r}"}
-        review = pb_repo.load_soak_activation_review_for_campaign(conn, campaign_id)
-        if review is None:
-            return {"error": f"campaign {campaign_id!r} has no persisted activation review"}
-        return review
+def paper_soak_campaign_resume_cli(db_path: Path, *, campaign_id: str, operator: str, reason: str) -> dict:
+    from ..shadow.config import load_shadow_operations_config
+    from .soak_campaign import SoakCampaignError, manifest_from_persisted_campaign, run_soak_campaign
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    try:
+        with session(db_path) as conn:
+            manifest = manifest_from_persisted_campaign(conn, campaign_id)
+            return run_soak_campaign(
+                conn, manifest=manifest, paper_books_config=cfg,
+                shadow_config=load_shadow_operations_config(), stop_on_blocker=False,
+                audit_clock=_utc_now, continuation_operator=operator, continuation_reason=reason,
+            )
+    except SoakCampaignError as exc:
+        return {"error": str(exc)}
+
+
+def paper_soak_activation_review_cli(
+    db_path: Path, *, campaign_id: str, attempt_id: str | None = None,
+) -> dict:
+    from .soak_campaign import (
+        SoakCampaignError, build_activation_review, campaign_config_hash, manifest_from_persisted_campaign,
+    )
+    cfg, error = _load_config_or_error()
+    if error:
+        return {"error": error}
+    try:
+        with session(db_path) as conn:
+            campaign = pb_repo.load_soak_campaign(conn, campaign_id)
+            if campaign is None:
+                return {"error": f"unknown campaign_id {campaign_id!r}"}
+            if campaign["config_hash"] != campaign_config_hash(cfg):
+                return {"error": "current campaign configuration differs from the immutable campaign definition"}
+            return build_activation_review(
+                conn, manifest=manifest_from_persisted_campaign(conn, campaign_id), config=cfg,
+                audit_clock=_utc_now, campaign_attempt_id=attempt_id,
+            )
+    except SoakCampaignError as exc:
+        return {"error": str(exc)}
 
 
 def paper_recurring_request_activation_cli(

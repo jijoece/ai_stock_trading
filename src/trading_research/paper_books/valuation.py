@@ -21,6 +21,7 @@ from decimal import Decimal
 
 from ..hashing import hash_config
 from ..storage import paper_books_repositories as repo
+from ..utc import TimestampError, canonical_utc
 from .models import (
     VALUATION_COMPLETE,
     VALUATION_PARTIAL_MISSING_PRICE,
@@ -64,8 +65,19 @@ def select_valuation_price(
             )
             price = Decimal(str(market_item.normalized_values["latest_close"]))
             available_at = source.available_at if source else market_item.as_of
-            point_in_time_safe = source.point_in_time_safe if source else (available_at <= as_of)
-            staleness_seconds = int((as_of - available_at).total_seconds()) if available_at else None
+            try:
+                valuation_at = canonical_utc(as_of)
+                canonical_available = canonical_utc(available_at) if available_at else None
+            except TimestampError:
+                canonical_available = None
+                valuation_at = canonical_utc(as_of)
+            declared_safe = source.point_in_time_safe if source else True
+            point_in_time_safe = bool(
+                declared_safe and canonical_available is not None and canonical_available <= valuation_at
+            )
+            staleness_seconds = (
+                int((valuation_at - canonical_available).total_seconds()) if point_in_time_safe else None
+            )
             if not point_in_time_safe:
                 status = VALUATION_POINT_IN_TIME_UNSAFE
             elif staleness_seconds is not None and staleness_seconds > maximum_price_age_seconds:
@@ -83,10 +95,32 @@ def select_valuation_price(
     if price_provider is not None:
         point = price_provider.get_close(symbol, as_of.date())
         if point is not None:
+            try:
+                valuation_at = canonical_utc(as_of)
+                # Providers implementing the 9.3.1 seam supply authoritative
+                # availability. A legacy provider without that field retains
+                # the prior contract (available at the requested valuation
+                # instant) for compatibility; campaign manifests separately
+                # reject normal pre-close dates.
+                available_at = canonical_utc(point.available_at) if point.available_at else valuation_at
+            except (TimestampError, ValueError):
+                available_at = None
+                valuation_at = canonical_utc(as_of)
+            if available_at is None or available_at > valuation_at:
+                return PriceSelection(
+                    symbol=symbol, price=Decimal(str(point.close)), provider=point.source,
+                    price_timestamp=available_at, available_at=available_at, point_in_time_safe=False,
+                    source_record_id=None, staleness_seconds=None, status=VALUATION_POINT_IN_TIME_UNSAFE,
+                )
+            staleness_seconds = int((valuation_at - available_at).total_seconds())
+            status = (
+                VALUATION_PARTIAL_STALE_PRICE
+                if staleness_seconds > maximum_price_age_seconds else VALUATION_COMPLETE
+            )
             return PriceSelection(
                 symbol=symbol, price=Decimal(str(point.close)), provider=point.source,
-                price_timestamp=as_of, available_at=as_of, point_in_time_safe=True,
-                source_record_id=None, staleness_seconds=0, status=VALUATION_COMPLETE,
+                price_timestamp=available_at, available_at=available_at, point_in_time_safe=True,
+                source_record_id=None, staleness_seconds=staleness_seconds, status=status,
             )
 
     # Priority 3: explicit unavailability — never fabricate a zero.

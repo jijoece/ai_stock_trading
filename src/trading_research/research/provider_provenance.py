@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
+from ..utc import TimestampError, canonical_utc, parse_aware_utc
+
 # Deferred import (inside functions below): `storage.research_cycle_repositories`
 # itself imports `SymbolCycleResult` from this package's `scheduled_cycle`
 # module, which imports this module — a module-level import here would be
@@ -118,6 +120,7 @@ class ProviderProvenanceSummary:
     excluded_partial_cycle_count: int = 0
     excluded_failed_cycle_count: int = 0
     excluded_running_cycle_count: int = 0
+    qualifying_real_provider_cycle_count: int = 0
 
 
 def normalize_evidence_outcome(status: str | None) -> ProviderOutcome:
@@ -277,7 +280,9 @@ def classify_cycle(conn, cycle_id: str) -> ProviderProvenanceClassification:
     return _classify_rows(rows)
 
 
-def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSummary:
+def compute_real_provider_history(
+    conn, as_of: datetime, *, cycle_ids: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> ProviderProvenanceSummary:
     """Aggregate completed cycles at-or-before ``as_of``.
 
     Only ``research_cycles.status == COMPLETED`` participates in the category
@@ -285,17 +290,43 @@ def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSu
     FAILED, and still-running cycles are excluded and reported separately.
     The successful-provider floor uses only explicit SUCCEEDED real activity.
     """
-    from ..storage import research_cycle_repositories as cycle_repo
-
-    rows = cycle_repo.list_provider_provenance_upto(conn, as_of.isoformat())
-    cycles = cycle_repo.list_cycle_headers_upto(conn, as_of.isoformat())
+    cutoff = canonical_utc(as_of)
+    rows = []
+    for raw in conn.execute(
+        "SELECT p.*, c.as_of AS cycle_as_of FROM research_cycle_provider_provenance p "
+        "JOIN research_cycles c ON c.cycle_id = p.cycle_id"
+    ).fetchall():
+        row = dict(raw)
+        try:
+            if parse_aware_utc(row["cycle_as_of"]) <= cutoff and parse_aware_utc(row["observed_at"]) <= cutoff:
+                rows.append(row)
+        except TimestampError:
+            continue
+    cycles = []
+    for raw in conn.execute(
+        "SELECT cycle_id, as_of, status, completed_at FROM research_cycles"
+    ).fetchall():
+        cycle = dict(raw)
+        try:
+            if parse_aware_utc(cycle["as_of"]) > cutoff:
+                continue
+            if cycle["status"] == "COMPLETED" and (
+                not cycle["completed_at"] or parse_aware_utc(cycle["completed_at"]) > cutoff
+            ):
+                continue
+        except TimestampError:
+            continue
+        cycles.append(cycle)
     by_cycle: dict[str, list[dict]] = {}
     for row in rows:
         by_cycle.setdefault(row["cycle_id"], []).append(row)
 
+    selected_ids = set(cycle_ids) if cycle_ids is not None else None
+    if selected_ids is not None:
+        cycles = [c for c in cycles if c["cycle_id"] in selected_ids]
     completed = [c for c in cycles if c["status"] == "COMPLETED"]
     counts = {c: 0 for c in ProviderProvenanceClassification}
-    attempt_count = success_count = failure_count = partial_count = 0
+    attempt_count = success_count = failure_count = partial_count = qualifying_count = 0
     for cycle in completed:
         cycle_rows = by_cycle.get(cycle["cycle_id"], [])
         counts[_classify_rows(cycle_rows)] += 1
@@ -311,6 +342,13 @@ def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSu
             ProviderOutcome.SUCCEEDED.value in outcomes and outcomes.intersection(o.value for o in FAILURE_OUTCOMES)
         ):
             partial_count += 1
+        # No authoritative configured category set is persisted today. The
+        # mandated conservative fallback therefore qualifies only a cycle
+        # with explicit real activity where every observed real-provider row
+        # succeeded. A single PARTIAL/FAILED/UNAVAILABLE/ATTEMPTED/UNKNOWN
+        # row disqualifies the whole cycle.
+        if real_rows and all(_row_outcome(r) == ProviderOutcome.SUCCEEDED.value for r in real_rows):
+            qualifying_count += 1
 
     real_count = success_count
     return ProviderProvenanceSummary(
@@ -328,4 +366,5 @@ def compute_real_provider_history(conn, as_of: datetime) -> ProviderProvenanceSu
         excluded_partial_cycle_count=sum(c["status"] == "PARTIALLY_COMPLETE" for c in cycles),
         excluded_failed_cycle_count=sum(c["status"] == "FAILED" for c in cycles),
         excluded_running_cycle_count=sum(c["status"] == "RUNNING" for c in cycles),
+        qualifying_real_provider_cycle_count=qualifying_count,
     )

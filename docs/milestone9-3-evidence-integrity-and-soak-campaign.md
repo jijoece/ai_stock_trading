@@ -1,5 +1,10 @@
 # Milestone 9.3 — Evidence integrity and controlled soak campaign
 
+> Milestone 9.3.1 supersedes the original single-execution details below with resumable campaign
+> attempts, cutoff-frozen refreshable reviews, UTC/session validation, historically bounded
+> verification, and qualifying provider-cycle semantics. See
+> [Campaign resumability and point-in-time integrity](milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md).
+
 Milestone 10 consumes the immutable activation-review output through a separate two-step, explicitly queued local-paper scheduler. See [Recurring Local Paper Trading](runbooks/recurring-local-paper-trading.md); Milestone 9.3 itself remains manual and advisory-only.
 
 Milestone 9.3 corrects the remaining Milestone 9.2 evidence gaps and adds a manually invoked,
@@ -58,12 +63,34 @@ identical completed campaign returns the persisted evidence without duplicating 
 recommendation is one of `INSUFFICIENT_EVIDENCE`, `CONTINUE_MANUAL_SOAK`,
 `BLOCKED_REQUIRES_REMEDIATION`, or `READY_FOR_RECURRING_ACTIVATION_REVIEW`; all are advisory.
 
+## Milestone 9.3.1 corrections
+
+The campaign header is now a definition and each execution is a separate attempt. Continuation
+requires an operator and reason, creates a new attempt, preserves earlier attempt/day rows, skips
+completed dates, and resumes retry-safe dates. A `RUNNING` attempt is crash-recoverable; uncertain
+partially persisted mutation becomes `RECOVERY_REQUIRES_REVIEW`.
+
+Reviews are immutable state-sensitive events with explicit supersession. Their evidence is limited
+to campaign-associated IDs and the campaign cutoff. Alerts, pause state, cost, comparisons,
+promotion evidence, reconciliations, valuations, and final positions do not consult unrestricted
+current state. Normal dates must be trading sessions at or after regular New York close;
+non-trading lifecycle-only dates require an explicit flag and empty cycle IDs. Early closes remain
+an offline-calendar limitation.
+
+The successful-provider counter remains available for reporting, but controlled readiness uses the
+stricter qualifying count: all observed real-provider outcomes for the completed cycle must succeed.
+Historical cross-book checks use cutoff-bounded immutable evidence and report insufficient data
+when reconstruction is unsafe.
+
 ## Commands
 
 ```bash
 python -m trading_research.cli paper-soak-campaign-validate --manifest campaign.json
 python -m trading_research.cli paper-soak-campaign-run --manifest campaign.json
-python -m trading_research.cli paper-soak-campaign-run --manifest campaign.json --continue-on-blocker
+python -m trading_research.cli paper-soak-campaign-run --manifest campaign.json \
+  --continue-on-blocker --operator OPERATOR --reason "remediation"
+python -m trading_research.cli paper-soak-campaign-resume \
+  --campaign-id CAMPAIGN_ID --operator OPERATOR --reason "recovery"
 python -m trading_research.cli paper-soak-campaign-show --campaign-id CAMPAIGN_ID
 python -m trading_research.cli paper-soak-activation-review --campaign-id CAMPAIGN_ID
 ```

@@ -146,3 +146,17 @@ def is_market_open(moment: datetime) -> bool:
     if not is_trading_day(local.date()):
         return False
     return MARKET_OPEN_TIME <= local.time() < MARKET_CLOSE_TIME
+
+
+def regular_session_close(day: date) -> datetime:
+    """Regular-session close as an aware New York datetime.
+
+    The fixed offline calendar intentionally does not model early closes;
+    callers must retain that limitation rather than guessing a half-day.
+    """
+    if not is_trading_day(day):
+        raise MarketCalendarError(f"{day.isoformat()} is not a trading session")
+    try:
+        return datetime.combine(day, MARKET_CLOSE_TIME, ZoneInfo(MARKET_TIMEZONE_NAME))
+    except ZoneInfoNotFoundError as exc:
+        raise MarketCalendarError("America/New_York timezone data is unavailable") from exc

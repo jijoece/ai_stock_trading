@@ -22,6 +22,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 
 from ..evaluation.price_provider import PricePoint
+from ..evaluation.market_calendar import regular_session_close
 from .cache import CacheKey, ProviderCache, TTL_CURRENT_QUOTE, TTL_HISTORICAL_BARS
 from .errors import MalformedProviderResponseError, ProviderConfigurationError
 from .http_client import HttpJsonClient
@@ -146,5 +147,8 @@ class AlpacaMarketDataClient:
         bars = self.get_price_history(symbol, start=as_of, end=as_of, as_of=as_of_dt)
         for bar in bars:
             if bar.session_date == as_of:
-                return PricePoint(symbol=symbol, as_of=as_of, close=bar.close, source=PROVIDER_NAME)
+                return PricePoint(
+                    symbol=symbol, as_of=as_of, close=bar.close, source=PROVIDER_NAME,
+                    available_at=regular_session_close(as_of).astimezone(timezone.utc),
+                )
         return None
