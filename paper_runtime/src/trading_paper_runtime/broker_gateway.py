@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from .models import AccountSnapshotPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
+from .models import AccountSnapshotPayload, FillPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
 
 
 class BrokerGateway(Protocol):
@@ -31,6 +31,16 @@ class BrokerGateway(Protocol):
         ...
 
     def get_order(self, client_order_id: str) -> OrderSnapshotPayload | None:
+        ...
+
+    def get_order_by_broker_id(self, broker_order_id: str) -> OrderSnapshotPayload | None:
+        ...
+
+    def list_order_fills(self, client_order_id: str) -> list[FillPayload]:
+        ...
+
+    def account_fingerprint(self) -> str:
+        """Stable one-way identifier; never the raw broker account ID."""
         ...
 
     def list_open_orders(self) -> list[OrderSnapshotPayload]:

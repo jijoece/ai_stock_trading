@@ -31,6 +31,9 @@ BOOK_ID_ENHANCED = "ENHANCED"
 KNOWN_BOOK_IDS = (BOOK_ID_BASELINE, BOOK_ID_ENHANCED)
 
 KNOWN_EXECUTION_PROVIDERS = ("local_simulated", "external_paper_broker")
+KNOWN_EXTERNAL_BROKER_PROVIDERS = ("alpaca_paper",)
+KNOWN_EXTERNAL_ORDER_TYPES = ("limit",)
+KNOWN_EXTERNAL_TIME_IN_FORCE = ("day",)
 KNOWN_PRICE_SOURCES = ("evidence_snapshot", "persisted_market_bar")
 KNOWN_MISSING_PRICE_POLICIES = ("MARK_UNVALUED",)
 
@@ -99,6 +102,72 @@ class ExecutionSection:
             raise PaperBooksConfigError(
                 "execution.provider=external_paper_broker requires allow_external_paper_broker=true"
             )
+
+
+@dataclass(frozen=True)
+class ExternalBrokerSection:
+    enabled: bool
+    provider: str
+    allow_order_submission: bool
+    enabled_book_ids: tuple[str, ...]
+    require_explicit_preview: bool
+    require_recent_preview_seconds: int
+    maximum_order_notional_usd: Decimal
+    permitted_order_types: tuple[str, ...]
+    permitted_time_in_force: tuple[str, ...]
+    maximum_retry_attempts: int = 1
+
+    def __post_init__(self) -> None:
+        if self.provider not in KNOWN_EXTERNAL_BROKER_PROVIDERS:
+            raise PaperBooksConfigError(
+                f"external_broker.provider {self.provider!r} is not one of "
+                f"{KNOWN_EXTERNAL_BROKER_PROVIDERS} — fails closed"
+            )
+        if len(self.enabled_book_ids) > 1:
+            raise PaperBooksConfigError(
+                "a single external paper account may enable at most one book — one-account/one-book"
+            )
+        if self.enabled and len(self.enabled_book_ids) != 1:
+            raise PaperBooksConfigError(
+                "external_broker.enabled=true requires exactly one enabled book"
+            )
+        if not self.enabled and self.enabled_book_ids:
+            raise PaperBooksConfigError(
+                "external_broker.enabled_book_ids must be empty while external_broker.enabled=false"
+            )
+        if len(set(self.enabled_book_ids)) != len(self.enabled_book_ids):
+            raise PaperBooksConfigError("external_broker.enabled_book_ids contains duplicates")
+        unknown_books = set(self.enabled_book_ids) - set(KNOWN_BOOK_IDS)
+        if unknown_books:
+            raise PaperBooksConfigError(
+                f"external_broker.enabled_book_ids contains unknown books: {sorted(unknown_books)}"
+            )
+        if self.maximum_order_notional_usd <= 0:
+            raise PaperBooksConfigError("external_broker.maximum_order_notional_usd must be > 0")
+        if not 1 <= self.require_recent_preview_seconds <= 86_400:
+            raise PaperBooksConfigError(
+                "external_broker.require_recent_preview_seconds must be in [1,86400]"
+            )
+        if not 1 <= self.maximum_retry_attempts <= 3:
+            raise PaperBooksConfigError("external_broker.maximum_retry_attempts must be in [1,3]")
+        if not self.permitted_order_types or any(
+            value not in KNOWN_EXTERNAL_ORDER_TYPES for value in self.permitted_order_types
+        ):
+            raise PaperBooksConfigError(
+                f"external_broker.permitted_order_types must contain only {KNOWN_EXTERNAL_ORDER_TYPES}"
+            )
+        if not self.permitted_time_in_force or any(
+            value not in KNOWN_EXTERNAL_TIME_IN_FORCE for value in self.permitted_time_in_force
+        ):
+            raise PaperBooksConfigError(
+                f"external_broker.permitted_time_in_force must contain only {KNOWN_EXTERNAL_TIME_IN_FORCE}"
+            )
+        if self.allow_order_submission and not self.enabled:
+            raise PaperBooksConfigError(
+                "external_broker.allow_order_submission=true requires external_broker.enabled=true"
+            )
+        if not self.require_explicit_preview:
+            raise PaperBooksConfigError("external_broker.require_explicit_preview must be true")
 
 
 @dataclass(frozen=True)
@@ -301,6 +370,14 @@ _DISABLED_RECURRING_SECTION = RecurringSection(
     activation_review_max_age_market_days=10, pause_on_safety_block=True,
 )
 
+_DISABLED_EXTERNAL_BROKER_SECTION = ExternalBrokerSection(
+    enabled=False, provider="alpaca_paper", allow_order_submission=False,
+    enabled_book_ids=(), require_explicit_preview=True,
+    require_recent_preview_seconds=300, maximum_order_notional_usd=Decimal("50.00"),
+    permitted_order_types=("limit",), permitted_time_in_force=("day",),
+    maximum_retry_attempts=1,
+)
+
 
 @dataclass(frozen=True)
 class PaperBooksConfiguration:
@@ -321,10 +398,18 @@ class PaperBooksConfiguration:
     lifecycle: LifecycleSection = _DISABLED_LIFECYCLE_SECTION
     soak_campaign: SoakCampaignSection = _DISABLED_SOAK_CAMPAIGN_SECTION
     recurring: RecurringSection = _DISABLED_RECURRING_SECTION
+    external_broker: ExternalBrokerSection = _DISABLED_EXTERNAL_BROKER_SECTION
 
     def __post_init__(self) -> None:
         if self.baseline.book_id == self.enhanced.book_id:
             raise PaperBooksConfigError("baseline and enhanced books must not share the same book_id")
+        if self.external_broker.enabled and (
+            self.execution.provider != "local_simulated" or self.execution.allow_external_paper_broker
+        ):
+            raise PaperBooksConfigError(
+                "Milestone 11 external_broker requires execution.provider=local_simulated and "
+                "execution.allow_external_paper_broker=false so recurring execution stays disconnected"
+            )
 
     def book(self, book_id: str) -> PaperBookDefinition:
         if book_id == self.baseline.book_id:
@@ -353,7 +438,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         raise PaperBooksConfigError("paper-books config missing top-level 'paper_books' section")
 
     _require_no_unknown_keys(
-        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle", "soak_campaign", "recurring"}, "paper_books"
+        pb, {"enabled", "books", "execution", "risk", "valuation", "scheduled_integration", "lifecycle", "soak_campaign", "recurring", "external_broker"}, "paper_books"
     )
 
     books = pb.get("books")
@@ -550,6 +635,57 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
                 recurring_raw.get("pause_on_safety_block", True), "recurring.pause_on_safety_block"
             ),
         )
+
+        external_raw = pb.get("external_broker", {})
+        if not isinstance(external_raw, dict):
+            raise PaperBooksConfigError("paper_books.external_broker must be a mapping")
+        _require_no_unknown_keys(
+            external_raw,
+            {
+                "enabled", "provider", "allow_order_submission", "enabled_book_ids",
+                "require_explicit_preview", "require_recent_preview_seconds",
+                "maximum_order_notional_usd", "permitted_order_types",
+                "permitted_time_in_force", "maximum_retry_attempts",
+            },
+            "external_broker",
+        )
+        enabled_book_ids = external_raw.get("enabled_book_ids", [])
+        permitted_order_types = external_raw.get("permitted_order_types", ["limit"])
+        permitted_tif = external_raw.get("permitted_time_in_force", ["day"])
+        for name, value in (
+            ("enabled_book_ids", enabled_book_ids),
+            ("permitted_order_types", permitted_order_types),
+            ("permitted_time_in_force", permitted_tif),
+        ):
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise PaperBooksConfigError(f"external_broker.{name} must be a list of strings")
+        external_broker_section = ExternalBrokerSection(
+            enabled=_strict_bool(external_raw.get("enabled", False), "external_broker.enabled"),
+            provider=str(external_raw.get("provider", "alpaca_paper")),
+            allow_order_submission=_strict_bool(
+                external_raw.get("allow_order_submission", False),
+                "external_broker.allow_order_submission",
+            ),
+            enabled_book_ids=tuple(enabled_book_ids),
+            require_explicit_preview=_strict_bool(
+                external_raw.get("require_explicit_preview", True),
+                "external_broker.require_explicit_preview",
+            ),
+            require_recent_preview_seconds=_strict_int(
+                external_raw.get("require_recent_preview_seconds", 300),
+                "external_broker.require_recent_preview_seconds", minimum=1, maximum=86_400,
+            ),
+            maximum_order_notional_usd=_decimal(
+                external_raw.get("maximum_order_notional_usd", "50.00"),
+                "external_broker.maximum_order_notional_usd",
+            ),
+            permitted_order_types=tuple(item.lower() for item in permitted_order_types),
+            permitted_time_in_force=tuple(item.lower() for item in permitted_tif),
+            maximum_retry_attempts=_strict_int(
+                external_raw.get("maximum_retry_attempts", 1),
+                "external_broker.maximum_retry_attempts", minimum=1, maximum=3,
+            ),
+        )
     except PaperBooksConfigError:
         raise
     except Exception as exc:
@@ -559,6 +695,6 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
         scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section, soak_campaign=campaign_section,
-        recurring=recurring_section,
+        recurring=recurring_section, external_broker=external_broker_section,
         config_hash=hash_config(raw), raw=raw,
     )

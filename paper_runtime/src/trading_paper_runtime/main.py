@@ -33,7 +33,7 @@ def run(stdin=None, stdout=None, gateway_factory=_build_gateway) -> int:
     # smoke test of this CLI's `paper-runtime-health` command) — anything
     # written through `sys.stdout` after this point (by LumiBot or any
     # other imported library) must go to stderr instead, since stdout is
-    # reserved exclusively for paper-runtime.v1 JSON Lines responses,
+    # reserved exclusively for paper-runtime.v2 JSON Lines responses,
     # written below via the captured `stdout` handle directly, never via
     # `print`/`sys.stdout`.
     sys.stdout = sys.stderr
@@ -61,12 +61,14 @@ def run(stdin=None, stdout=None, gateway_factory=_build_gateway) -> int:
                 request_id, operation, runtime_version=RUNTIME_VERSION, error=exc,
             )
         except Exception as exc:  # never let an unexpected exception crash the read loop
-            logger.exception("unexpected error handling request")
+            logger.error("unexpected error handling request (type=%s)", type(exc).__name__)
             from .errors import ErrorCode
 
             response = build_error_response(
                 request_id, operation, runtime_version=RUNTIME_VERSION,
-                error=RuntimeOperationError(ErrorCode.INTERNAL_ERROR, str(exc), retryable=False),
+                error=RuntimeOperationError(
+                    ErrorCode.INTERNAL_ERROR, "unexpected isolated runtime error", retryable=False,
+                ),
             )
         stdout.write(response.to_json_line() + "\n")
         stdout.flush()

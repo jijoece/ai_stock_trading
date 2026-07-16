@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+import hashlib
 from typing import Any, Callable
 
 from ..recommendations.builder import SIDE_BUY_CANDIDATE, STATUS_ACTIVE
@@ -49,6 +50,7 @@ from ..research.evidence_completeness import STATUS_COMPLETE_FOR_SCREENING
 from ..research.models import EvidenceSnapshot
 from ..storage.research_cycle_repositories import SQLiteResearchCycleRepository, load_symbol_evidence_status
 from ..storage.research_repositories import load_evidence_snapshot
+from ..storage import paper_books_repositories as pb_repo
 from ..storage.trading_repositories import load_recommendation
 from . import cash_ledger, execution, order_intent, reconciliation
 from . import risk as risk_module
@@ -69,6 +71,7 @@ MARKET_SIMULATION_POLICY_VERSION = "paper-books-scheduled-market-sim-v1"
 
 OUTCOME_EXECUTED = "EXECUTED"
 OUTCOME_INTENT_CREATED_PENDING_FILL = "INTENT_CREATED_PENDING_FILL"
+OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION = "AWAITING_OPERATOR_EXTERNAL_SUBMISSION"
 OUTCOME_SKIPPED_BOOK_DISABLED = "SKIPPED_BOOK_DISABLED"
 OUTCOME_SKIPPED_POLICY = "SKIPPED_POLICY"
 OUTCOME_SKIPPED_RECOMMENDATION_MISSING = "SKIPPED_RECOMMENDATION_MISSING"
@@ -79,7 +82,8 @@ OUTCOME_SKIPPED_VALUATION_UNAVAILABLE = "SKIPPED_VALUATION_UNAVAILABLE"
 OUTCOME_REJECTED_BY_RISK = "REJECTED_BY_RISK"
 OUTCOME_FAILED = "FAILED"
 KNOWN_SYMBOL_ARM_OUTCOMES = (
-    OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL, OUTCOME_SKIPPED_BOOK_DISABLED, OUTCOME_SKIPPED_POLICY,
+    OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL, OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION,
+    OUTCOME_SKIPPED_BOOK_DISABLED, OUTCOME_SKIPPED_POLICY,
     OUTCOME_SKIPPED_RECOMMENDATION_MISSING, OUTCOME_SKIPPED_RECOMMENDATION_INVALID,
     OUTCOME_SKIPPED_EVIDENCE_INCOMPLETE, OUTCOME_SKIPPED_SNAPSHOT_MISMATCH, OUTCOME_SKIPPED_VALUATION_UNAVAILABLE,
     OUTCOME_REJECTED_BY_RISK, OUTCOME_FAILED,
@@ -91,7 +95,10 @@ KNOWN_SYMBOL_ARM_OUTCOMES = (
 # book_id would raise `ValueError: unknown book_id` (no `paper_books` row
 # exists yet). Reconciliation is only attempted for books this invocation
 # actually touched.
-_BOOK_OPENED_OUTCOMES = (OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL, OUTCOME_REJECTED_BY_RISK)
+_BOOK_OPENED_OUTCOMES = (
+    OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL,
+    OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION, OUTCOME_REJECTED_BY_RISK,
+)
 
 
 class ScheduledIntegrationError(RuntimeError):
@@ -269,6 +276,22 @@ def _process_arm(
         config_hash=cfg.config_hash, as_of=as_of, clock=clock,
     )
     assert intent is not None  # decision.decision is one of APPROVED_RISK_DECISIONS
+
+    if cfg.external_broker.enabled and book_id in cfg.external_broker.enabled_book_ids:
+        order_intent.persist_order_intent(conn, intent)
+        queue_id = "peqs_" + hashlib.sha256(
+            f"{book_id}:{intent.paper_order_intent_id}:scheduled".encode()
+        ).hexdigest()[:40]
+        pb_repo.enqueue_external_submission(
+            conn, queue_id=queue_id, book_id=book_id,
+            paper_order_intent_id=intent.paper_order_intent_id, source="RECURRING_LOCAL_PAPER",
+            created_at=clock().isoformat(),
+        )
+        return outcome(
+            OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION,
+            "external-enabled intent awaits explicit operator preview and submission; scheduler made no broker call",
+            risk_decision_id=risk_decision_id, paper_order_intent_id=intent.paper_order_intent_id,
+        )
 
     market_input, source = _build_market_simulation_input(symbol, as_of, evidence_snapshot, price_selection)
     if market_input is None:

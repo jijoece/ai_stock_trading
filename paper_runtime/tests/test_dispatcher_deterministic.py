@@ -22,8 +22,8 @@ def _intent_payload(**overrides) -> dict:
         "symbol": "AAPL",
         "side": "BUY",
         "quantity": 10,
-        "order_type": "MARKET",
-        "limit_price": None,
+        "order_type": "LIMIT",
+        "limit_price": "150.00",
         "reference_price": "150.00",
         "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         "idempotency_key": "intent-abc123",
@@ -34,9 +34,22 @@ def _intent_payload(**overrides) -> dict:
 
 def _request(operation: str, payload: dict) -> RequestEnvelope:
     return RequestEnvelope(
-        protocol_version="paper-runtime.v1", request_id="req-1", operation=operation,
+        protocol_version="paper-runtime.v2", request_id="req-1", operation=operation,
         sent_at=datetime.now(timezone.utc).isoformat(), payload=payload,
     )
+
+
+def _external_payload(**overrides) -> dict:
+    base = {
+        "book_id": "BASELINE", "paper_order_intent_id": "pb-intent-1",
+        "client_order_id": "epb-baseline-0123456789abcdef", "symbol": "AAPL", "side": "BUY",
+        "quantity": 1, "limit_price": "40.00", "time_in_force": "DAY", "asset_type": "equity",
+        "extended_hours": False, "payload_hash": "a" * 64,
+        "account_fingerprint": "acct_" + "0" * 32,
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    }
+    base.update(overrides)
+    return base
 
 
 def _dispatcher() -> Dispatcher:
@@ -57,7 +70,7 @@ def test_capabilities_reports_fixed_allowlist():
     assert payload["real_money"] is False
     assert payload["short_selling"] is False
     assert payload["options"] is False
-    assert payload["supported_sides"] == ["BUY"]
+    assert payload["supported_sides"] == ["BUY", "SELL"]
     assert "submit_order" in payload["supported_operations"]
 
 
@@ -160,6 +173,20 @@ def test_unknown_broker_status_fails_closed():
     assert exc.value.code == ErrorCode.UNKNOWN_BROKER_STATUS
 
 
+def test_expired_status_is_preserved_and_only_http_404_is_authoritative_not_found():
+    from trading_paper_runtime.lumibot_gateway import _is_authoritative_not_found, _map_status
+
+    class Response:
+        status_code = 404
+
+    class ApiError(Exception):
+        response = Response()
+
+    assert _map_status("expired") == "EXPIRED"
+    assert _is_authoritative_not_found(ApiError("broker response")) is True
+    assert _is_authoritative_not_found(Exception("404 not found in an arbitrary message")) is False
+
+
 def test_not_paper_mode_blocks_submission_when_gateway_unverified():
     class _UnverifiedGateway(DeterministicBrokerGateway):
         def is_paper_mode_verified(self) -> bool:
@@ -173,3 +200,28 @@ def test_not_paper_mode_blocks_submission_when_gateway_unverified():
     # health/capabilities must still answer even when not paper-verified
     health = dispatcher.handle(_request("health", {}))
     assert health["available"] is True
+
+
+def test_v2_account_preview_submit_and_lookup_are_paper_scoped():
+    gateway = DeterministicBrokerGateway()
+    dispatcher = Dispatcher(gateway=gateway, config=CONFIG)
+    account = dispatcher.handle(_request("ACCOUNT_CHECK", {"book_id": "BASELINE"}))
+    payload = _external_payload(account_fingerprint=account["account_fingerprint"])
+    preview = dispatcher.handle(_request("PREVIEW_LIMIT_ORDER", payload))
+    assert preview["result"] == "APPROVED"
+    submitted = dispatcher.handle(_request("SUBMIT_LIMIT_ORDER", payload))
+    assert submitted["book_id"] == "BASELINE"
+    found = dispatcher.handle(_request(
+        "GET_ORDER_BY_CLIENT_ID", {"book_id": "BASELINE", "client_order_id": payload["client_order_id"]},
+    ))
+    assert found["found"] is True
+    assert gateway.submit_calls == [payload["client_order_id"]]
+
+
+def test_v2_preview_rejects_unknown_fields_and_market_shape():
+    dispatcher = _dispatcher()
+    payload = _external_payload(account_fingerprint=dispatcher._gateway.account_fingerprint())
+    payload["order_type"] = "MARKET"
+    with pytest.raises(RuntimeOperationError) as exc:
+        dispatcher.handle(_request("PREVIEW_LIMIT_ORDER", payload))
+    assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD

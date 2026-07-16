@@ -236,12 +236,106 @@ def _paper_runtime_command_env() -> dict:
     imports lumibot itself)."""
     import os
 
-    env = os.environ.copy()
+    # Deliberately do not copy the parent environment: in particular the
+    # main process never reads or forwards Alpaca credential variables.
+    # The isolated runtime loads credentials itself (or a deployment uses a
+    # credential-injecting runtime command).
+    env = {key: os.environ[key] for key in ("PATH", "PYTHONPATH") if key in os.environ}
     paper_runtime_src = REPO_ROOT / "paper_runtime" / "src"
     if paper_runtime_src.is_dir():
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = str(paper_runtime_src) + (os.pathsep + existing if existing else "")
     return env
+
+
+def _external_paper_cli(db_path: Path, operation) -> dict:
+    from .paper_books.external_broker import ExternalPaperError
+    from .paper_books.config import load_paper_books_config
+
+    client, _runtime_config = _build_runtime_client()
+    try:
+        client.start()
+        with session(db_path) as conn:
+            return operation(conn, client, load_paper_books_config())
+    except ExternalPaperError as exc:
+        return {"error": {"code": exc.code, "message": exc.message}}
+    except Exception as exc:
+        return {"error": {"code": getattr(exc, "code", "EXTERNAL_RUNTIME_ERROR"), "message": str(exc)}}
+    finally:
+        client.shutdown()
+
+
+def external_paper_account_check_cli(db_path: Path, *, book_id: str) -> dict:
+    from .paper_books.external_broker import check_external_paper_account
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: check_external_paper_account(
+            conn, book_id=book_id, runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_preview_cli(db_path: Path, *, book_id: str, intent_id: str, operator: str) -> dict:
+    from .paper_books.external_broker import preview_external_paper_order
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: preview_external_paper_order(
+            conn, book_id=book_id, paper_order_intent_id=intent_id, operator=operator,
+            runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_submit_cli(
+    db_path: Path, *, book_id: str, intent_id: str, preview_id: str, operator: str, reason: str,
+) -> dict:
+    from .paper_books.external_broker import submit_external_paper_order
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: submit_external_paper_order(
+            conn, book_id=book_id, paper_order_intent_id=intent_id, preview_id=preview_id,
+            operator=operator, reason=reason, runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_reconcile_cli(db_path: Path, *, book_id: str, client_order_id: str | None) -> dict:
+    from .paper_books.external_broker import reconcile_external_paper_order
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: reconcile_external_paper_order(
+            conn, book_id=book_id, client_order_id=client_order_id, runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_cancel_cli(
+    db_path: Path, *, book_id: str, client_order_id: str, operator: str, reason: str,
+) -> dict:
+    from .paper_books.external_broker import cancel_external_paper_order
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: cancel_external_paper_order(
+            conn, book_id=book_id, client_order_id=client_order_id, operator=operator,
+            reason=reason, runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_retry_cli(
+    db_path: Path, *, book_id: str, intent_id: str, operator: str, reason: str,
+) -> dict:
+    from .paper_books.external_broker import retry_external_paper_order
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: retry_external_paper_order(
+            conn, book_id=book_id, paper_order_intent_id=intent_id, operator=operator,
+            reason=reason, runtime=runtime, config=config,
+        ),
+    )
+
+
+def external_paper_order_show_cli(db_path: Path, *, book_id: str, client_order_id: str) -> dict:
+    from .paper_books.external_broker import ExternalPaperError, show_external_paper_order
+    try:
+        with session(db_path) as conn:
+            return show_external_paper_order(conn, book_id=book_id, client_order_id=client_order_id)
+    except ExternalPaperError as exc:
+        return {"error": {"code": exc.code, "message": exc.message}}
 
 
 def _build_runtime_client():
@@ -441,10 +535,10 @@ def paper_performance_cli(db_path: Path) -> dict:
 
 def execute_paper(recommendation_id: str, db_path: Path, *, adapter: str = "deterministic") -> dict:
     """Milestone 3/4 CLI entry point: run one frozen recommendation through
-    paper-execution eligibility and intent construction, then either a
-    deterministic fill (`--adapter deterministic`, the default) or a real
-    credentialed paper-broker acknowledgement via the isolated runtime
-    process (`--adapter credentialed`, Milestone 4).
+    paper-execution eligibility and intent construction with the offline
+    deterministic adapter. The former credentialed shortcut is closed in
+    Milestone 11; external paper execution requires the separate explicit
+    preview and submit commands.
 
     The deterministic path uses
     `runtime.deterministic_adapter.DeterministicPaperAdapter`,
@@ -455,9 +549,6 @@ def execute_paper(recommendation_id: str, db_path: Path, *, adapter: str = "dete
     docs/milestone3-lumibot-paper-integration.md). This is disclosed in the
     returned dict's `adapter` field, never presented as a real fill.
 
-    The credentialed path only acknowledges submission (docs/milestone-
-    4.md's asynchronous submit/poll split) — run `sync-paper-orders`
-    afterward to observe fills.
     """
     from datetime import datetime, timezone
     from decimal import Decimal
@@ -479,35 +570,10 @@ def execute_paper(recommendation_id: str, db_path: Path, *, adapter: str = "dete
     now = datetime.now(timezone.utc)
 
     if adapter == "credentialed":
-        from .services.submit_credentialed_paper_order import submit_credentialed_paper_order
-
-        client, _runtime_config = _build_runtime_client()
-        with session(db_path) as conn:
-            try:
-                client.start()
-            except Exception as exc:
-                return {"mode": exec_config.trading_mode, "adapter": "credentialed", "error": f"paper runtime unavailable: {exc}"}
-            try:
-                policy = PaperExecutionEligibilityPolicy(universe=default_universe(), config=exec_config)
-                try:
-                    outcome = submit_credentialed_paper_order(
-                        recommendation_id, conn=conn, execution_config=exec_config, eligibility_policy=policy,
-                        client=client, git_sha=_git_sha(), clock=lambda: now,
-                    )
-                except RecommendationNotFoundError as exc:
-                    return {"mode": exec_config.trading_mode, "adapter": "credentialed", "error": str(exc)}
-            finally:
-                client.shutdown()
-            return {
-                "mode": exec_config.trading_mode,
-                "adapter": "credentialed-alpaca-paper (real broker acknowledgement via isolated runtime process)",
-                "status": outcome.status,
-                "eligibility_reasons": list(outcome.eligibility.reasons) if outcome.eligibility else [],
-                "intent_id": outcome.intent.intent_id if outcome.intent else None,
-                "client_order_id": outcome.submission.client_order_id if outcome.submission else None,
-                "broker_order_id": outcome.submission.broker_order_id if outcome.submission else None,
-                "submission_status": outcome.submission.submission_status if outcome.submission else None,
-            }
+        return {
+            "mode": exec_config.trading_mode, "adapter": "credentialed",
+            "error": "CREDENTIALED_SHORTCUT_DISABLED: use external-paper-preview then external-paper-submit",
+        }
 
     with session(db_path) as conn:
         recommendation = load_recommendation(conn, recommendation_id)
@@ -1923,8 +1989,7 @@ def main(argv: list[str] | None = None) -> int:
     p_execute_paper.add_argument("--recommendation-id", required=True)
     p_execute_paper.add_argument(
         "--adapter", choices=("deterministic", "credentialed"), default="deterministic",
-        help="deterministic (default, offline) or credentialed (Milestone 4: real Alpaca paper "
-             "broker acknowledgement via the isolated runtime process)",
+        help="deterministic (default, offline); credentialed is retained only to return a fail-closed migration error",
     )
 
     sub.add_parser("paper-runtime-health", help="Health-check the isolated LumiBot paper-runtime process (Milestone 4)")
@@ -2241,6 +2306,35 @@ def main(argv: list[str] | None = None) -> int:
     p_recurring_queue.add_argument(
         "--status", choices=("QUEUED", "CLAIMED", "PROCESSED", "FAILED", "CANCELLED"), default=None,
     )
+
+    p_external_account = sub.add_parser("external-paper-account-check", help="Verify the isolated Alpaca paper account")
+    p_external_account.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_preview = sub.add_parser("external-paper-preview", help="Persist an explicit external-paper preview")
+    p_external_preview.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_preview.add_argument("--intent-id", required=True)
+    p_external_preview.add_argument("--operator", required=True)
+    p_external_submit = sub.add_parser("external-paper-submit", help="Explicitly submit a recently previewed limit order")
+    p_external_submit.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_submit.add_argument("--intent-id", required=True)
+    p_external_submit.add_argument("--preview-id", required=True)
+    p_external_submit.add_argument("--operator", required=True)
+    p_external_submit.add_argument("--reason", required=True)
+    p_external_show = sub.add_parser("external-paper-order-show", help="Show bounded local external-order evidence")
+    p_external_show.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_show.add_argument("--client-order-id", required=True)
+    p_external_reconcile = sub.add_parser("external-paper-reconcile", help="Reconcile external broker and book state")
+    p_external_reconcile.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_reconcile.add_argument("--client-order-id")
+    p_external_cancel = sub.add_parser("external-paper-cancel", help="Explicitly cancel an external paper order")
+    p_external_cancel.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_cancel.add_argument("--client-order-id", required=True)
+    p_external_cancel.add_argument("--operator", required=True)
+    p_external_cancel.add_argument("--reason", required=True)
+    p_external_retry = sub.add_parser("external-paper-retry-submit", help="Retry only after authoritative broker NOT_FOUND")
+    p_external_retry.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_retry.add_argument("--intent-id", required=True)
+    p_external_retry.add_argument("--operator", required=True)
+    p_external_retry.add_argument("--reason", required=True)
 
     args = parser.parse_args(argv)
 
@@ -2769,8 +2863,46 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
-    return 1
-
+    if args.command == "external-paper-account-check":
+        cfg = load_config()
+        outcome = external_paper_account_check_cli(cfg.research_database_path, book_id=args.book_id)
+    elif args.command == "external-paper-preview":
+        cfg = load_config()
+        outcome = external_paper_preview_cli(
+            cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id, operator=args.operator,
+        )
+    elif args.command == "external-paper-submit":
+        cfg = load_config()
+        outcome = external_paper_submit_cli(
+            cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
+            preview_id=args.preview_id, operator=args.operator, reason=args.reason,
+        )
+    elif args.command == "external-paper-order-show":
+        cfg = load_config()
+        outcome = external_paper_order_show_cli(
+            cfg.research_database_path, book_id=args.book_id, client_order_id=args.client_order_id,
+        )
+    elif args.command == "external-paper-reconcile":
+        cfg = load_config()
+        outcome = external_paper_reconcile_cli(
+            cfg.research_database_path, book_id=args.book_id, client_order_id=args.client_order_id,
+        )
+    elif args.command == "external-paper-cancel":
+        cfg = load_config()
+        outcome = external_paper_cancel_cli(
+            cfg.research_database_path, book_id=args.book_id, client_order_id=args.client_order_id,
+            operator=args.operator, reason=args.reason,
+        )
+    elif args.command == "external-paper-retry-submit":
+        cfg = load_config()
+        outcome = external_paper_retry_cli(
+            cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
+            operator=args.operator, reason=args.reason,
+        )
+    else:
+        return 1
+    print(json.dumps(outcome, indent=2, default=str))
+    return 0 if "error" not in outcome else 2
 
 if __name__ == "__main__":
     raise SystemExit(main())

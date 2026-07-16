@@ -230,6 +230,7 @@ cp .env.example .env
 | `ALPACA_MARKET_DATA_API_KEY` / `ALPACA_MARKET_DATA_API_SECRET` | Market-data read-only credentials |
 | `ALPACA_API_KEY` / `ALPACA_API_SECRET` | **Paper-runtime process ONLY** — isolated LumiBot process |
 | `ALPACA_IS_PAPER` | Must be exactly `"true"` — anything else fails closed |
+| `ALPACA_BASE_URL` | If set, must be exactly `https://paper-api.alpaca.markets` |
 
 > **Do not set** `REDDIT_USERNAME`/`REDDIT_PASSWORD` — leaving them unset keeps the MCP's write tools inoperable.
 
@@ -336,10 +337,11 @@ python -m trading_research.cli shadow-kill
 
 ```bash
 # Integrate a research cycle into a paper book
-python -m trading_research.cli paper-book-integrate-cycle --book-id BASELINE --cycle-id <id>
+python -m trading_research.cli paper-book-integrate-cycle \
+  --cycle-id <id> --experiment-policy BASELINE_ONLY
 
 # Run position lifecycle (exits, stop-loss, profit targets)
-python -m trading_research.cli paper-book-lifecycle --book-id BASELINE
+python -m trading_research.cli paper-book-lifecycle-run --as-of <ISO-8601>
 
 # Reconcile book state
 python -m trading_research.cli paper-book-reconcile --book-id BASELINE
@@ -352,7 +354,7 @@ python -m trading_research.cli paper-book-reconcile --book-id BASELINE
 python -m trading_research.cli paper-recurring-request-activation \
   --activation-review-id <id> --operator <name> --reason "<reason>"
 python -m trading_research.cli paper-recurring-activate \
-  --request-id <id> --operator <name>
+  --request-event-id <id> --operator <name>
 
 # Deactivate
 python -m trading_research.cli paper-recurring-deactivate \
@@ -360,10 +362,11 @@ python -m trading_research.cli paper-recurring-deactivate \
 
 # Enqueue a cycle for processing
 python -m trading_research.cli paper-recurring-enqueue-cycle \
-  --cycle-id <id> --operator <name>
+  --cycle-id <id> --operator <name> --reason "<reason>"
 
 # Run one scheduler tick (manual invocation)
-python -m trading_research.cli paper-recurring-run-once --now <ISO-8601>
+python -m trading_research.cli paper-recurring-run-once \
+  --now <ISO-8601> --owner-id <unique-owner>
 
 # Show scheduler status
 python -m trading_research.cli paper-recurring-status
@@ -377,15 +380,32 @@ python -m trading_research.cli external-paper-account-check --book-id BASELINE
 
 # Preview a paper order before submission
 python -m trading_research.cli external-paper-preview \
-  --book-id BASELINE --intent-id <id>
+  --book-id BASELINE --intent-id <id> --operator <name>
 
 # Submit (explicit operator command only)
 python -m trading_research.cli external-paper-submit \
-  --book-id BASELINE --intent-id <id>
+  --book-id BASELINE --intent-id <id> --preview-id <id> \
+  --operator <name> --reason "<reason>"
+
+# Inspect or explicitly cancel
+python -m trading_research.cli external-paper-order-show \
+  --book-id BASELINE --client-order-id <id>
+python -m trading_research.cli external-paper-cancel \
+  --book-id BASELINE --client-order-id <id> \
+  --operator <name> --reason "<reason>"
 
 # Reconcile against external broker
 python -m trading_research.cli external-paper-reconcile --book-id BASELINE
+
+# Retry only after reconciliation persisted authoritative NOT_FOUND evidence
+python -m trading_research.cli external-paper-retry-submit \
+  --book-id BASELINE --intent-id <id> --operator <name> --reason "<reason>"
 ```
+
+External paper execution is disabled by default, limit/DAY/whole-share only,
+and restricted to one configured book per paper account. Credentials never
+enable it. The recurring scheduler only queues external-enabled intents as
+`AWAITING_OPERATOR_EXTERNAL_SUBMISSION`; it never submits or cancels them.
 
 ---
 
@@ -592,8 +612,8 @@ All external text (Reddit, news, web) flows through `collection/prompt_injection
 | **9** — Manual paper soak & lifecycle | ✅ | Stop-loss exits, profit targets, holding-period limits, soak reporting |
 | **9.1** — Controlled soak readiness | ✅ | Activation-review evidence, readiness decision |
 | **9.2** — Soak evidence integrity | ✅ | Cross-book verification, evidence provenance |
-| **10** — Recurring local paper scheduler | 🔄 Defined | Controlled recurring scheduler with two-step operator activation |
-| **11** — Alpaca paper boundary | 🔄 Defined | External paper-broker integration (disabled by default, no live path) |
+| **10** — Recurring local paper scheduler | ✅ | Controlled recurring scheduler with two-step operator activation |
+| **11** — Alpaca paper boundary | ✅ | Manual external paper-broker integration (disabled by default, no live path) |
 
 ### Evidence Gate for Real Trading (Phase 4)
 
@@ -626,7 +646,7 @@ pytest -q --tb=short
 
 | Marker | Environment Flag | Description |
 |---|---|---|
-| `paper_broker` | `RUN_PAPER_BROKER_TESTS=true` + Alpaca paper creds | Alpaca paper broker smoke test |
+| `external_paper_broker` | `RUN_EXTERNAL_PAPER_BROKER_TESTS=true` + explicit config + Alpaca paper creds | Alpaca paper broker smoke test |
 | `claude_api` | `RUN_CLAUDE_RESEARCH_TESTS=true` + `ANTHROPIC_API_KEY` | Real Claude API structured-output smoke test |
 | `sec_api` | `RUN_SEC_API_TESTS=true` | Real SEC EDGAR smoke test (no credentials required) |
 | `market_data_api` | `RUN_MARKET_DATA_TESTS=true` + Alpaca creds | Alpaca market-data smoke test |
@@ -635,7 +655,7 @@ pytest -q --tb=short
 
 ### Testing Principles
 
-- **No test ever touches a real broker or Reddit write endpoint.**
+- Default tests never touch a real broker or Reddit write endpoint; real-paper smoke is separately flagged and explicitly opt-in.
 - Every deterministic financial calculation ships with unit tests (boundary cases, property-based checks).
 - Mock adapters (`mcp/mock_adapters.py`) replay recorded fixture JSON — full offline CI.
 - Schema-validation tests: every JSON producer's output validates against its schema.

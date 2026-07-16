@@ -97,6 +97,10 @@ def submit_and_simulate(conn, intent: PaperBookOrderIntent, market: MarketSimula
     `(book_id, paper_order_intent_id)` submission is a no-op), reserves cash
     for BUY orders, simulates a fill, and applies it (positions + cash
     settlement) exactly once. Never applies the same fill twice."""
+    if repo.has_external_execution_evidence(conn, intent.book_id, intent.paper_order_intent_id):
+        raise FillSimulationError(
+            "intent is externally scoped and cannot receive a local simulated fill"
+        )
     inserted = repo.save_order_intent(conn, intent)
 
     if inserted and intent.side == ORDER_SIDE_BUY:
@@ -135,6 +139,8 @@ def cancel_pending_intent(conn, intent: PaperBookOrderIntent, now: datetime) -> 
     """Cancels an order that never crossed (still `PENDING_SUBMISSION`),
     releasing any BUY-side cash reservation. A no-op if the order already
     filled — never cancels a completed fill."""
+    if repo.has_external_execution_evidence(conn, intent.book_id, intent.paper_order_intent_id):
+        raise FillSimulationError("externally scoped intent requires explicit external cancellation")
     existing = repo.load_order_intent(conn, intent.book_id, intent.paper_order_intent_id)
     if existing is None or existing["status"] != INTENT_STATUS_PENDING_SUBMISSION:
         return {"status": existing["status"] if existing else None, "cancelled": False}
@@ -148,6 +154,8 @@ def expire_pending_intent(conn, intent: PaperBookOrderIntent, now: datetime) -> 
     """Expires an order whose `time_in_force` window has elapsed without a
     fill, releasing any BUY-side cash reservation. A no-op if already
     filled/cancelled."""
+    if repo.has_external_execution_evidence(conn, intent.book_id, intent.paper_order_intent_id):
+        raise FillSimulationError("externally scoped intent cannot be expired by local lifecycle")
     existing = repo.load_order_intent(conn, intent.book_id, intent.paper_order_intent_id)
     if existing is None or existing["status"] != INTENT_STATUS_PENDING_SUBMISSION:
         return {"status": existing["status"] if existing else None, "expired": False}

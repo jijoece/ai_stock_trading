@@ -1,4 +1,4 @@
-"""paper-runtime.v1 envelope parsing/serialization (docs/milestone-4.md Step 2).
+"""paper-runtime.v2 envelope parsing/serialization.
 
 JSON Lines over stdin/stdout: exactly one JSON object per line, no pickle,
 no Python object serialization. Strict validation on the way in — unknown
@@ -25,7 +25,18 @@ SUPPORTED_OPERATIONS = (
     "get_account",
     "list_positions",
     "cancel_paper_order",
+    "ACCOUNT_CHECK",
+    "PREVIEW_LIMIT_ORDER",
+    "SUBMIT_LIMIT_ORDER",
+    "GET_ORDER_BY_CLIENT_ID",
+    "GET_ORDER",
+    "CANCEL_ORDER",
+    "LIST_ORDER_FILLS",
+    "GET_POSITIONS",
+    "GET_ACCOUNT_SNAPSHOT",
 )
+
+MAX_REQUEST_BYTES = 65_536
 
 _REQUEST_REQUIRED_FIELDS = frozenset({"protocol_version", "request_id", "operation", "sent_at", "payload"})
 
@@ -71,6 +82,8 @@ def parse_request_line(line: str) -> RequestEnvelope:
     `RuntimeOperationError` (never a bare exception) on any malformed input —
     the dispatcher is responsible for turning that into an error response
     keyed by whatever request_id/operation could be salvaged, or none."""
+    if not isinstance(line, str) or len(line.encode("utf-8")) > MAX_REQUEST_BYTES:
+        raise RuntimeOperationError(ErrorCode.MALFORMED_REQUEST, "request exceeds 65536-byte limit")
     try:
         data = json.loads(line)
     except (json.JSONDecodeError, TypeError) as exc:

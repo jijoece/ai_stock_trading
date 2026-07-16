@@ -103,7 +103,7 @@ def fake_transport_factory(fake: FakeTransport):
 def health_payload(**overrides) -> dict:
     base = {
         "available": True,
-        "protocol_version": "paper-runtime.v1",
+        "protocol_version": "paper-runtime.v2",
         "runtime_version": "fake-runtime-1",
         "lumibot_version": "4.5.74",
         "broker_provider": "alpaca",
@@ -125,8 +125,8 @@ def capabilities_payload(**overrides) -> dict:
             "list_recent_orders", "get_account", "list_positions", "cancel_paper_order",
         ],
         "supported_asset_types": ["equity"],
-        "supported_sides": ["BUY"],
-        "supported_order_types": ["MARKET", "LIMIT"],
+        "supported_sides": ["BUY", "SELL"],
+        "supported_order_types": ["LIMIT"],
         "fractional_shares": False,
         "short_selling": False,
         "options": False,

@@ -19,6 +19,7 @@ DEFAULT_PAPER_RUNTIME_CONFIG_PATH = Path(__file__).resolve().parents[3] / "confi
 
 VALID_BROKER_MODES = ("paper",)
 VALID_TRANSPORTS = ("stdio",)
+ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 
 class PaperRuntimeConfigError(RuntimeError):
@@ -35,6 +36,8 @@ class PaperRuntimeConfig:
 
     broker_provider: str
     broker_mode: str
+    broker_environment: str
+    broker_base_url: str
     real_money_enabled: bool
     allowed_sides: tuple[str, ...]
     allowed_order_types: tuple[str, ...]
@@ -51,6 +54,8 @@ class PaperRuntimeConfig:
     evaluation_horizons_trading_days: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if self.protocol_version != "paper-runtime.v2":
+            raise PaperRuntimeConfigError("paper_runtime.protocol_version must be exactly 'paper-runtime.v2'")
         if self.transport not in VALID_TRANSPORTS:
             raise PaperRuntimeConfigError(f"paper_runtime.transport {self.transport!r} is not supported")
         if not self.command:
@@ -60,6 +65,14 @@ class PaperRuntimeConfig:
                 f"paper_broker.mode {self.broker_mode!r} is not recognized (fail closed — expected "
                 f"one of {VALID_BROKER_MODES})"
             )
+        if self.broker_provider != "alpaca":
+            raise PaperRuntimeConfigError("paper_broker.provider must be 'alpaca'")
+        if self.broker_environment != "paper":
+            raise PaperRuntimeConfigError("paper_broker.environment must be exactly 'paper'")
+        if self.broker_base_url != ALPACA_PAPER_BASE_URL:
+            raise PaperRuntimeConfigError(
+                f"paper_broker.base_url must be exactly {ALPACA_PAPER_BASE_URL!r} — live/HTTP/unknown hosts rejected"
+            )
         if self.real_money_enabled:
             raise PaperRuntimeConfigError("paper_broker.real_money_enabled=true is not permitted — fail closed")
         if self.allow_fractional or self.allow_shorting or self.allow_margin or self.allow_extended_hours:
@@ -67,6 +80,10 @@ class PaperRuntimeConfig:
                 "fractional shares / shorting / margin / extended-hours trading are not permitted "
                 "in this milestone — fail closed"
             )
+        if self.allowed_sides != ("BUY", "SELL"):
+            raise PaperRuntimeConfigError("paper_broker.allowed_sides must be exactly [BUY, SELL]")
+        if self.allowed_order_types != ("LIMIT",):
+            raise PaperRuntimeConfigError("paper_broker.allowed_order_types must be exactly [LIMIT]")
         if self.startup_timeout_seconds <= 0 or self.request_timeout_seconds <= 0:
             raise PaperRuntimeConfigError("timeouts must be positive")
         if self.poll_interval_seconds <= 0 or self.max_poll_attempts <= 0:
@@ -90,11 +107,38 @@ def load_paper_runtime_config(path: str | Path | None = None) -> PaperRuntimeCon
     missing = required_top - raw.keys()
     if missing:
         raise PaperRuntimeConfigError(f"paper runtime config missing keys: {sorted(missing)}")
+    extra = raw.keys() - required_top
+    if extra:
+        raise PaperRuntimeConfigError(f"paper runtime config has unknown keys: {sorted(extra)}")
 
     pr = raw["paper_runtime"] or {}
     pb = raw["paper_broker"] or {}
     om = raw["order_monitoring"] or {}
     ev = raw["evaluation"] or {}
+
+    known_pr = {"protocol_version", "transport", "command", "startup_timeout_seconds", "request_timeout_seconds"}
+    known_pb = {
+        "provider", "mode", "environment", "base_url", "real_money_enabled", "asset_types",
+        "allowed_sides", "allowed_order_types", "allow_fractional", "allow_shorting", "allow_margin",
+        "allow_extended_hours",
+    }
+    known_om = {"poll_interval_seconds", "max_poll_attempts", "stale_order_minutes"}
+    known_ev = {"benchmark", "horizons_trading_days"}
+    for name, section, known in (
+        ("paper_runtime", pr, known_pr), ("paper_broker", pb, known_pb),
+        ("order_monitoring", om, known_om), ("evaluation", ev, known_ev),
+    ):
+        if not isinstance(section, dict):
+            raise PaperRuntimeConfigError(f"{name} must be a mapping")
+        unknown = section.keys() - known
+        if unknown:
+            raise PaperRuntimeConfigError(f"{name} has unknown keys: {sorted(unknown)}")
+
+    for name in ("real_money_enabled", "allow_fractional", "allow_shorting", "allow_margin", "allow_extended_hours"):
+        if type(pb.get(name)) is not bool:
+            raise PaperRuntimeConfigError(f"paper_broker.{name} must be a strict boolean")
+    if pb.get("asset_types") != ["equity"]:
+        raise PaperRuntimeConfigError("paper_broker.asset_types must be exactly [equity]")
 
     try:
         return PaperRuntimeConfig(
@@ -105,13 +149,15 @@ def load_paper_runtime_config(path: str | Path | None = None) -> PaperRuntimeCon
             request_timeout_seconds=float(pr["request_timeout_seconds"]),
             broker_provider=str(pb["provider"]),
             broker_mode=str(pb["mode"]).strip().lower(),
-            real_money_enabled=bool(pb["real_money_enabled"]),
+            broker_environment=str(pb.get("environment", "paper")).strip().lower(),
+            broker_base_url=str(pb.get("base_url", ALPACA_PAPER_BASE_URL)).strip(),
+            real_money_enabled=pb["real_money_enabled"],
             allowed_sides=tuple(pb["allowed_sides"]),
             allowed_order_types=tuple(pb["allowed_order_types"]),
-            allow_fractional=bool(pb["allow_fractional"]),
-            allow_shorting=bool(pb["allow_shorting"]),
-            allow_margin=bool(pb["allow_margin"]),
-            allow_extended_hours=bool(pb["allow_extended_hours"]),
+            allow_fractional=pb["allow_fractional"],
+            allow_shorting=pb["allow_shorting"],
+            allow_margin=pb["allow_margin"],
+            allow_extended_hours=pb["allow_extended_hours"],
             poll_interval_seconds=float(om["poll_interval_seconds"]),
             max_poll_attempts=int(om["max_poll_attempts"]),
             stale_order_minutes=float(om["stale_order_minutes"]),

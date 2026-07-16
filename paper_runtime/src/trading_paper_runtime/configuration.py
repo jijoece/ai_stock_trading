@@ -16,7 +16,9 @@ Hard rules enforced here:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 
 
 class ConfigurationError(RuntimeError):
@@ -26,9 +28,10 @@ class ConfigurationError(RuntimeError):
 @dataclass(frozen=True)
 class RuntimeConfiguration:
     broker_provider: str
-    alpaca_api_key: str | None
-    alpaca_api_secret: str | None
+    alpaca_api_key: str | None = field(repr=False)
+    alpaca_api_secret: str | None = field(repr=False)
     alpaca_is_paper_flag: bool
+    alpaca_base_url: str = ALPACA_PAPER_BASE_URL
 
     @property
     def has_api_key(self) -> bool:
@@ -41,6 +44,10 @@ class RuntimeConfiguration:
     @property
     def has_credentials(self) -> bool:
         return self.has_api_key and self.has_api_secret
+
+    @property
+    def paper_endpoint_configured(self) -> bool:
+        return self.broker_provider == "alpaca" and self.alpaca_base_url == ALPACA_PAPER_BASE_URL
 
 
 def _load_dotenv_if_present() -> None:
@@ -77,4 +84,5 @@ def load_runtime_configuration() -> RuntimeConfiguration:
         alpaca_api_key=os.environ.get("ALPACA_API_KEY") or None,
         alpaca_api_secret=os.environ.get("ALPACA_API_SECRET") or None,
         alpaca_is_paper_flag=is_paper_raw.strip().lower() == "true",
+        alpaca_base_url=os.environ.get("ALPACA_BASE_URL", ALPACA_PAPER_BASE_URL).strip(),
     )

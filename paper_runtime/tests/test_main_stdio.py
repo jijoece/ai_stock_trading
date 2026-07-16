@@ -10,7 +10,7 @@ from trading_paper_runtime.main import run
 def _request_line(operation: str, payload: dict, request_id: str = "req-1") -> str:
     return json.dumps(
         {
-            "protocol_version": "paper-runtime.v1",
+            "protocol_version": "paper-runtime.v2",
             "request_id": request_id,
             "operation": operation,
             "sent_at": "2026-07-12T18:00:00Z",
@@ -56,4 +56,21 @@ def test_stdout_never_contains_a_non_json_line():
 
     for line in stdout.getvalue().splitlines():
         if line.strip():
-            json.loads(line)  # raises if not valid JSON
+                json.loads(line)  # raises if not valid JSON
+
+
+def test_unexpected_runtime_errors_never_return_secret_or_raw_exception(monkeypatch):
+    class ExplodingGateway(DeterministicBrokerGateway):
+        def list_positions(self):
+            raise RuntimeError("sdk failure containing super-secret-value")
+
+    monkeypatch.setenv("ALPACA_API_KEY", "super-secret-value")
+    stdin = io.StringIO(_request_line("GET_POSITIONS", {"book_id": "BASELINE"}) + "\n")
+    stdout = io.StringIO()
+    run(stdin=stdin, stdout=stdout, gateway_factory=lambda config: ExplodingGateway())
+
+    raw = stdout.getvalue()
+    response = json.loads(raw)
+    assert response["success"] is False
+    assert response["error"]["message"] == "unexpected isolated runtime error"
+    assert "super-secret-value" not in raw

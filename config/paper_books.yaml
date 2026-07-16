@@ -63,6 +63,23 @@ paper_books:
     allow_external_paper_broker: false
     allow_live_broker: false        # cannot be set true — config load fails closed
 
+  # Milestone 11: optional manual Alpaca paper-account boundary. These gates
+  # are independent of credentials and of the local recurring scheduler.
+  # A single runtime credential set may serve at most one enabled book.
+  external_broker:
+    enabled: false
+    provider: alpaca_paper
+    allow_order_submission: false
+    enabled_book_ids: []
+    require_explicit_preview: true
+    require_recent_preview_seconds: 300
+    maximum_order_notional_usd: "50.00"
+    permitted_order_types:
+      - limit
+    permitted_time_in_force:
+      - day
+    maximum_retry_attempts: 1
+
   risk:
     max_position_weight: "0.10"
     max_order_notional_usd: "1000.00"

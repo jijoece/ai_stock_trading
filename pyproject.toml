@@ -42,6 +42,7 @@ pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = [
     "paper_broker: opt-in real credentialed paper-broker smoke test (Milestone 4) — requires RUN_PAPER_BROKER_TESTS=true and real Alpaca paper credentials; skipped by default, never run automatically just because credentials happen to be present.",
+    "external_paper_broker: opt-in isolated Alpaca paper-boundary smoke workflow (Milestone 11) — requires RUN_EXTERNAL_PAPER_BROKER_TESTS=true, explicit external configuration, an approved bounded intent, and real Alpaca paper credentials; skipped by default.",
     "claude_api: opt-in real Claude API structured-output smoke test (Milestone 5) — requires RUN_CLAUDE_RESEARCH_TESTS=true and a real ANTHROPIC_API_KEY plus research.model configured; skipped by default, never run automatically just because credentials happen to be present.",
     "sec_api: opt-in real SEC EDGAR smoke test (Milestone 6) — requires RUN_SEC_API_TESTS=true; skipped by default. No credentials are required by SEC EDGAR itself, but this still never runs automatically.",
     "market_data_api: opt-in real Alpaca market-data smoke test (Milestone 6) — requires RUN_MARKET_DATA_TESTS=true and real Alpaca credentials; skipped by default, never run automatically just because credentials happen to be present.",

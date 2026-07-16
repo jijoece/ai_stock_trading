@@ -14,6 +14,7 @@ import subprocess
 import threading
 from typing import Protocol
 
+from . import PROTOCOL_VERSION
 from .errors import (
     RuntimeCapabilityError,
     RuntimeOperationError,
@@ -27,7 +28,11 @@ from .protocol import build_request_line, parse_response_line
 # the caller — never true for submit_order (docs/milestone-4.md Step 6/8:
 # "avoid blind retries for order submission").
 _RETRYABLE_ON_TIMEOUT = frozenset(
-    {"health", "capabilities", "get_order", "list_open_orders", "list_recent_orders", "get_account", "list_positions"}
+    {
+        "health", "capabilities", "get_order", "list_open_orders", "list_recent_orders", "get_account",
+        "list_positions", "ACCOUNT_CHECK", "PREVIEW_LIMIT_ORDER", "GET_ORDER_BY_CLIENT_ID", "GET_ORDER",
+        "LIST_ORDER_FILLS", "GET_POSITIONS", "GET_ACCOUNT_SNAPSHOT",
+    }
 )
 
 
@@ -112,7 +117,7 @@ class SubprocessTransport:
 
 
 class RuntimeClient:
-    """Connects to, health-checks, and speaks paper-runtime.v1 to an
+    """Connects to, health-checks, and speaks paper-runtime.v2 to an
     isolated runtime process. `start()` must succeed (protocol compatible,
     paper mode proven, real-money capability false) before any other
     operation is attempted — there is no degraded/partial mode."""
@@ -147,6 +152,8 @@ class RuntimeClient:
                 f"runtime did not answer a health check within {self._startup_timeout_seconds}s"
             ) from exc
         self.last_health = health
+        if health.get("protocol_version") != PROTOCOL_VERSION:
+            raise RuntimeCapabilityError("runtime health protocol version does not match paper-runtime.v2")
         if not health.get("paper_endpoint_verified"):
             raise RuntimeCapabilityError(
                 "runtime did not verify a paper-trading endpoint — refusing to use it "
@@ -165,17 +172,25 @@ class RuntimeClient:
             raise RuntimeCapabilityError(
                 f"runtime capabilities exceed this milestone's allowed scope: {capabilities!r}"
             )
+        if capabilities.get("supported_order_types") != ["LIMIT"]:
+            raise RuntimeCapabilityError("runtime must expose LIMIT as its only order type")
+        if capabilities.get("supported_sides") != ["BUY", "SELL"]:
+            raise RuntimeCapabilityError("runtime must expose only BUY and closing SELL sides")
 
     def shutdown(self, *, timeout: float = 5.0) -> None:
         if self._transport is not None:
             self._transport.terminate(timeout)
 
     def diagnostics(self) -> list[str]:
-        """Recently captured stderr lines, for logging — never protocol
-        data, never a substitute for a real response."""
+        """Drain stderr without crossing third-party text into the main process.
+
+        LumiBot/SDK diagnostics are not part of the protocol and could contain
+        provider-generated request context, so only a bounded count is exposed.
+        """
         if self._transport is None:
             return []
-        return self._transport.read_stderr()
+        lines = self._transport.read_stderr()
+        return [f"{len(lines)} isolated-runtime stderr line(s) suppressed"] if lines else []
 
     # -- low-level request/response ------------------------------------
 
@@ -250,3 +265,45 @@ class RuntimeClient:
 
     def cancel_paper_order(self, client_order_id: str) -> dict:
         return self._request("cancel_paper_order", {"client_order_id": client_order_id})
+
+    # -- Milestone 11 normalized external-paper operations ----------------
+
+    def account_check(self, book_id: str) -> dict:
+        return self._request("ACCOUNT_CHECK", {"book_id": book_id})
+
+    def preview_limit_order(self, payload: dict) -> dict:
+        return self._request("PREVIEW_LIMIT_ORDER", payload)
+
+    def submit_limit_order(self, payload: dict) -> dict:
+        """Mutation is never retried by this client."""
+        return self._request("SUBMIT_LIMIT_ORDER", payload)
+
+    def get_order_by_client_order_id(self, book_id: str, client_order_id: str) -> dict | None:
+        result = self._request(
+            "GET_ORDER_BY_CLIENT_ID", {"book_id": book_id, "client_order_id": client_order_id},
+        )
+        return result.get("order") if result.get("found") else None
+
+    def get_order_by_broker_order_id(self, book_id: str, broker_order_id: str) -> dict | None:
+        result = self._request("GET_ORDER", {"book_id": book_id, "broker_order_id": broker_order_id})
+        return result.get("order") if result.get("found") else None
+
+    def cancel_external_order(self, book_id: str, client_order_id: str, account_fingerprint: str) -> dict:
+        return self._request(
+            "CANCEL_ORDER",
+            {
+                "book_id": book_id, "client_order_id": client_order_id,
+                "account_fingerprint": account_fingerprint,
+            },
+        )
+
+    def list_order_fills(self, book_id: str, client_order_id: str) -> list[dict]:
+        return self._request(
+            "LIST_ORDER_FILLS", {"book_id": book_id, "client_order_id": client_order_id},
+        )["fills"]
+
+    def get_external_positions(self, book_id: str) -> dict:
+        return self._request("GET_POSITIONS", {"book_id": book_id})
+
+    def get_external_account_snapshot(self, book_id: str) -> dict:
+        return self._request("GET_ACCOUNT_SNAPSHOT", {"book_id": book_id})
