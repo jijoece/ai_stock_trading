@@ -432,10 +432,70 @@ CREATE TABLE IF NOT EXISTS paper_soak_campaign_days (
     PRIMARY KEY (campaign_id, as_of)
 );
 
+CREATE TABLE IF NOT EXISTS paper_soak_campaign_definition_dates (
+    campaign_id TEXT NOT NULL REFERENCES paper_soak_campaigns(campaign_id),
+    as_of TEXT NOT NULL,
+    requested_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle_only INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_id, as_of)
+);
+
+-- Milestone 9.3.1 separates the immutable definition above from resumable
+-- execution attempts. Attempt headers transition RUNNING -> terminal; day
+-- rows are append-only evidence and are never rewritten by continuation.
+CREATE TABLE IF NOT EXISTS paper_soak_campaign_attempts (
+    campaign_attempt_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL REFERENCES paper_soak_campaigns(campaign_id),
+    manifest_hash TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    previous_attempt_id TEXT REFERENCES paper_soak_campaign_attempts(campaign_attempt_id),
+    attempt_number INTEGER NOT NULL,
+    continue_after_blocker INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    first_blocking_date TEXT,
+    first_blocking_status TEXT,
+    failure_code TEXT,
+    failure_stage TEXT,
+    sanitized_message TEXT,
+    operator TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (campaign_id, attempt_number)
+);
+
+CREATE TABLE IF NOT EXISTS paper_soak_campaign_attempt_days (
+    campaign_attempt_id TEXT NOT NULL REFERENCES paper_soak_campaign_attempts(campaign_attempt_id),
+    campaign_id TEXT NOT NULL REFERENCES paper_soak_campaigns(campaign_id),
+    as_of TEXT NOT NULL,
+    requested_cycle_ids_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle_only INTEGER NOT NULL DEFAULT 0,
+    operator_run_id TEXT,
+    lifecycle_run_id TEXT,
+    cross_book_verification_id TEXT,
+    cross_book_verification_status TEXT,
+    controlled_readiness_status TEXT NOT NULL,
+    all_failed_checks_json TEXT NOT NULL DEFAULT '[]',
+    failure_codes_json TEXT NOT NULL DEFAULT '[]',
+    failure_reasons_json TEXT NOT NULL DEFAULT '[]',
+    day_status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (campaign_attempt_id, as_of)
+);
+
 CREATE TABLE IF NOT EXISTS paper_soak_activation_reviews (
     activation_review_id TEXT PRIMARY KEY,
+    activation_review_scope_id TEXT,
     campaign_id TEXT NOT NULL,
+    campaign_attempt_id TEXT,
     campaign_manifest_hash TEXT NOT NULL,
+    config_hash TEXT,
+    evidence_state_hash TEXT,
+    supersedes_activation_review_id TEXT,
+    campaign_start_as_of TEXT,
+    campaign_end_as_of TEXT,
     completed_market_days INTEGER NOT NULL,
     completed_cycles INTEGER NOT NULL,
     provider_provenance_counts_json TEXT NOT NULL,
@@ -568,6 +628,15 @@ CREATE INDEX IF NOT EXISTS idx_paper_book_cross_book_verifications_scope
     ON paper_book_cross_book_verifications(verification_scope_id, as_of, created_at);
 CREATE INDEX IF NOT EXISTS idx_paper_soak_campaign_days_campaign
     ON paper_soak_campaign_days(campaign_id, as_of);
+
+CREATE INDEX IF NOT EXISTS idx_paper_soak_attempts_campaign
+    ON paper_soak_campaign_attempts(campaign_id, attempt_number);
+
+CREATE INDEX IF NOT EXISTS idx_paper_soak_attempt_days_campaign
+    ON paper_soak_campaign_attempt_days(campaign_id, as_of, campaign_attempt_id);
+
+CREATE INDEX IF NOT EXISTS idx_paper_soak_reviews_latest
+    ON paper_soak_activation_reviews(campaign_id, created_at, activation_review_id);
 CREATE INDEX IF NOT EXISTS idx_paper_recurring_activation_created
     ON paper_recurring_activation_events(created_at, activation_event_id);
 CREATE INDEX IF NOT EXISTS idx_paper_recurring_queue_order
@@ -743,6 +812,26 @@ CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_days_no_delete
 BEFORE DELETE ON paper_soak_campaign_days
 BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_days are immutable once persisted'); END;
 
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_definition_dates_no_update
+BEFORE UPDATE ON paper_soak_campaign_definition_dates
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_definition_dates are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_definition_dates_no_delete
+BEFORE DELETE ON paper_soak_campaign_definition_dates
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_definition_dates are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_attempts_no_delete
+BEFORE DELETE ON paper_soak_campaign_attempts
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_attempts cannot be deleted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_attempt_days_no_update
+BEFORE UPDATE ON paper_soak_campaign_attempt_days
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_attempt_days are immutable once persisted'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_soak_campaign_attempt_days_no_delete
+BEFORE DELETE ON paper_soak_campaign_attempt_days
+BEGIN SELECT RAISE(ABORT, 'paper_soak_campaign_attempt_days are immutable once persisted'); END;
+
 CREATE TRIGGER IF NOT EXISTS trg_paper_soak_activation_reviews_no_update
 BEFORE UPDATE ON paper_soak_activation_reviews
 BEGIN SELECT RAISE(ABORT, 'paper_soak_activation_reviews are immutable once persisted'); END;
@@ -782,6 +871,15 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     "paper_book_cross_book_verifications": {
         "verification_scope_id": "TEXT",
         "source_state_hash": "TEXT",
+    },
+    "paper_soak_activation_reviews": {
+        "activation_review_scope_id": "TEXT",
+        "campaign_attempt_id": "TEXT",
+        "config_hash": "TEXT",
+        "evidence_state_hash": "TEXT",
+        "supersedes_activation_review_id": "TEXT",
+        "campaign_start_as_of": "TEXT",
+        "campaign_end_as_of": "TEXT",
     },
     "paper_recurring_cycle_queue": {
         "retry_of_queue_item_id": "TEXT",

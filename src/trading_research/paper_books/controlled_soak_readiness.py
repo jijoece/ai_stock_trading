@@ -192,11 +192,18 @@ def evaluate_controlled_soak_readiness(
     provenance_summary = provider_provenance.compute_real_provider_history(conn, as_of)
     configured_thresholds = shadow_thresholds or shadow_readiness.ReadinessThresholds()
     real_provider_threshold = configured_thresholds.min_real_provider_cycles_for_ready
-    real_provider_history_sufficient = provenance_summary.real_provider_success_cycle_count >= real_provider_threshold
+    real_provider_history_sufficient = (
+        provenance_summary.qualifying_real_provider_cycle_count >= real_provider_threshold
+    )
     add("real_provider_success_cycle_count", classification=CLASSIFICATION_AUTHORITATIVE,
         passed=real_provider_history_sufficient, observed=str(provenance_summary.real_provider_success_cycle_count),
         threshold=str(real_provider_threshold), source="research_cycle_provider_provenance",
-        reason="completed cycles with explicit SUCCEEDED real-provider provenance; cost_usd is never provider identity")
+        reason="informational any-success count; readiness is gated by the stricter qualifying count")
+    add("qualifying_real_provider_cycle_count", classification=CLASSIFICATION_AUTHORITATIVE,
+        passed=real_provider_history_sufficient,
+        observed=str(provenance_summary.qualifying_real_provider_cycle_count),
+        threshold=str(real_provider_threshold), source="research_cycle_provider_provenance",
+        reason="completed real-provider cycles where every observed real-provider outcome succeeded")
     for name in (
         "real_provider_attempt_cycle_count", "real_provider_failure_cycle_count", "partial_provider_cycle_count",
         "fixture_only_cycle_count", "real_evidence_only_cycle_count", "real_claude_only_cycle_count",
@@ -207,7 +214,7 @@ def evaluate_controlled_soak_readiness(
             source="research_cycle_provider_provenance", reason="informational provider-history breakdown")
     if not real_provider_history_sufficient:
         failures["provider_history"] = (STATUS_NOT_READY_PROVIDER_HISTORY,
-            (f"real_provider_success_cycle_count {provenance_summary.real_provider_success_cycle_count} < minimum "
+            (f"qualifying_real_provider_cycle_count {provenance_summary.qualifying_real_provider_cycle_count} < minimum "
              f"{real_provider_threshold} (authoritative provenance, never cost_usd)",))
 
     # Split the legacy cost-derived provider floor out of controlled

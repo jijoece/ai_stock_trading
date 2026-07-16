@@ -42,6 +42,14 @@ class _FakePriceProvider:
         return PricePoint(symbol=symbol, as_of=as_of, close=self.price, source="fixture")
 
 
+class _FuturePriceProvider:
+    def get_close(self, symbol, as_of):
+        return PricePoint(
+            symbol=symbol, as_of=as_of, close=Decimal("155"), source="fixture",
+            available_at=NOW + timedelta(seconds=1),
+        )
+
+
 def _make_evidence_snapshot(symbol: str, close: Decimal, available_at: datetime, as_of: datetime, point_in_time_safe: bool = True):
     source = SourceRecord(
         source_id=f"src-{symbol}", source_type="market", provider="fixture-market", source_locator=None,
@@ -113,6 +121,15 @@ def test_unsafe_source_blocks_complete_valuation(conn):
     )
     assert snap.valuation_status == VALUATION_POINT_IN_TIME_UNSAFE
     assert snap.net_liquidation_value_usd is None
+
+
+def test_historical_close_with_future_availability_fails_closed(conn):
+    cash_ledger.open_book(conn, book_id="BASELINE", starting_cash_usd=Decimal("100000.00"), config_hash="cfg1", clock=lambda: NOW)
+    positions.apply_buy_fill(conn, "BASELINE", "AAPL", "fill1", Decimal("10"), Decimal("150.00"), NOW)
+    snap = valuation.build_portfolio_snapshot(
+        conn, "BASELINE", NOW, price_provider=_FuturePriceProvider(), maximum_price_age_seconds=900,
+    )
+    assert snap.valuation_status == VALUATION_POINT_IN_TIME_UNSAFE
 
 
 def test_current_quote_never_substitutes_for_historical_price(conn):

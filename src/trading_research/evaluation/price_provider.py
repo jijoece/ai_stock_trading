@@ -16,7 +16,7 @@ See docs/milestone4-isolated-paper-broker.md "Known limitations".
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Protocol
 
@@ -27,6 +27,11 @@ class PricePoint:
     as_of: date
     close: Decimal
     source: str
+    available_at: datetime | None = None
+
+    @property
+    def session_date(self) -> date:
+        return self.as_of
 
 
 class PriceProvider(Protocol):
@@ -44,13 +49,19 @@ class DeterministicPriceProvider:
     only way a price becomes available; nothing here fetches, estimates, or
     interpolates a missing price."""
 
-    _prices: dict[tuple[str, date], Decimal] = field(default_factory=dict)
+    _prices: dict[tuple[str, date], tuple[Decimal, datetime | None]] = field(default_factory=dict)
 
-    def register(self, symbol: str, as_of: date, close: Decimal | str | float) -> None:
-        self._prices[(symbol, as_of)] = Decimal(str(close))
+    def register(
+        self, symbol: str, as_of: date, close: Decimal | str | float, *, available_at: datetime | None = None,
+    ) -> None:
+        self._prices[(symbol, as_of)] = (Decimal(str(close)), available_at)
 
     def get_close(self, symbol: str, as_of: date) -> PricePoint | None:
-        close = self._prices.get((symbol, as_of))
-        if close is None:
+        stored = self._prices.get((symbol, as_of))
+        if stored is None:
             return None
-        return PricePoint(symbol=symbol, as_of=as_of, close=close, source="deterministic-fixture")
+        close, available_at = stored
+        return PricePoint(
+            symbol=symbol, as_of=as_of, close=close, source="deterministic-fixture",
+            available_at=available_at,
+        )

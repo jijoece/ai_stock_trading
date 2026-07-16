@@ -2183,14 +2183,23 @@ def main(argv: list[str] | None = None) -> int:
     p_campaign_run.add_argument("--manifest", required=True, type=Path)
     p_campaign_run.add_argument(
         "--continue-on-blocker", action="store_true",
-        help="Explicitly process later manifest dates after a hard blocker",
+        help="Create an explicit continuation attempt after remediation",
     )
+    p_campaign_run.add_argument("--operator")
+    p_campaign_run.add_argument("--reason")
+    p_campaign_resume = sub.add_parser(
+        "paper-soak-campaign-resume", help="Resume an incomplete campaign or create a continuation attempt"
+    )
+    p_campaign_resume.add_argument("--campaign-id", required=True)
+    p_campaign_resume.add_argument("--operator", required=True)
+    p_campaign_resume.add_argument("--reason", required=True)
     p_campaign_show = sub.add_parser("paper-soak-campaign-show", help="Show a persisted soak campaign")
     p_campaign_show.add_argument("--campaign-id", required=True)
     p_activation_review = sub.add_parser(
         "paper-soak-activation-review", help="Show the persisted advisory-only activation review"
     )
     p_activation_review.add_argument("--campaign-id", required=True)
+    p_activation_review.add_argument("--attempt-id")
 
     p_recurring_request = sub.add_parser(
         "paper-recurring-request-activation", help="Request audited local recurring-paper activation"
@@ -2659,7 +2668,17 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         outcome = paper_soak_campaign_run_cli(
             cfg.research_database_path, manifest_path=args.manifest,
-            continue_on_blocker=args.continue_on_blocker,
+            continue_on_blocker=args.continue_on_blocker, operator=args.operator, reason=args.reason,
+        )
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if "error" not in outcome else 2
+
+    if args.command == "paper-soak-campaign-resume":
+        from .paper_books.cli_support import paper_soak_campaign_resume_cli
+        cfg = load_config()
+        outcome = paper_soak_campaign_resume_cli(
+            cfg.research_database_path, campaign_id=args.campaign_id,
+            operator=args.operator, reason=args.reason,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
@@ -2674,7 +2693,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "paper-soak-activation-review":
         from .paper_books.cli_support import paper_soak_activation_review_cli
         cfg = load_config()
-        outcome = paper_soak_activation_review_cli(cfg.research_database_path, campaign_id=args.campaign_id)
+        outcome = paper_soak_activation_review_cli(
+            cfg.research_database_path, campaign_id=args.campaign_id, attempt_id=args.attempt_id,
+        )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 

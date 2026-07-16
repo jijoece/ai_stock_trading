@@ -17,12 +17,20 @@ from .shadow_alerts_schema import apply_shadow_alerts_schema
 from .shadow_operations_schema import apply_shadow_operations_schema
 from .trading_schema import apply_trading_schema
 
+SQLITE_BUSY_TIMEOUT_MS = 5_000
+
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL permits readers during a campaign date write. NORMAL is the
+    # conservative SQLite-recommended WAL tradeoff: atomic/consistent after
+    # application or OS crashes, without FULL's fsync cost on every commit.
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     apply_schema(conn)
     apply_trading_schema(conn)
     apply_execution_schema(conn)

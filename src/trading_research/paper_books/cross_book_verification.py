@@ -30,6 +30,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..storage import paper_books_repositories as pb_repo
+from ..utc import TimestampError, canonical_utc, canonical_utc_iso, parse_aware_utc
 from .config import PaperBooksConfiguration
 
 POLICY_VERSION = "cross-book-verification/v2"
@@ -97,55 +98,80 @@ def _verification_id(scope_id: str, source_state_hash: str, checks: tuple[CrossB
     return f"cbv-{digest}"
 
 
-_STATE_TABLES = (
-    ("paper_books", "created_at"),
-    ("paper_book_risk_decisions", "created_at"),
-    ("paper_book_orders", "as_of"),
-    ("paper_book_fills", "fill_timestamp"),
-    ("paper_book_cash_ledger", "event_timestamp"),
-    ("paper_book_position_lots", "opened_at"),
-    ("paper_book_positions", None),
-    ("paper_book_snapshots", "as_of"),
-    ("paper_book_snapshot_positions", None),
-    ("paper_book_daily_metrics", "window_end"),
-    ("paper_book_corporate_actions_applied", "applied_at"),
-    ("paper_book_experiment_assignments", "as_of"),
-    ("paper_book_exit_decisions", "as_of"),
-    ("paper_book_manual_exit_requests", "requested_at"),
-    ("paper_book_lifecycle_runs", "as_of"),
-    ("paper_book_lifecycle_symbol_results", None),
+_CUTOFF_TABLES = (
+    ("paper_books", "created_at"), ("paper_book_risk_decisions", "created_at"),
+    ("paper_book_orders", "as_of"), ("paper_book_fills", "fill_timestamp"),
+    ("paper_book_cash_ledger", "event_timestamp"), ("paper_book_snapshots", "as_of"),
+    ("paper_book_daily_metrics", "window_end"), ("paper_book_corporate_actions_applied", "applied_at"),
+    ("paper_book_experiment_assignments", "as_of"), ("paper_book_exit_decisions", "as_of"),
+    ("paper_book_manual_exit_requests", "requested_at"), ("paper_book_lifecycle_runs", "as_of"),
     ("paper_book_reconciliations", "as_of"),
 )
 
 
-def source_state_hash(conn, as_of: datetime) -> str:
-    """Hash the bounded source state used by verification, including mutable
-    position/lot state. No verification table is included (avoids recursion)."""
+def _upto(value: str | None, cutoff: datetime) -> bool:
+    if not value:
+        return False
+    try:
+        return parse_aware_utc(value) <= cutoff
+    except TimestampError:
+        return False
+
+
+def source_state_hash(conn, as_of: datetime, book_ids: tuple[str, ...] | None = None) -> str:
+    """Hash only cutoff-bounded rows used by verification.
+
+    Mutable current positions and lot remaining quantities are intentionally
+    absent. Immutable snapshots/fills represent historical holdings.
+    """
+    cutoff = canonical_utc(as_of)
     state: dict[str, list[dict]] = {}
-    for table, cutoff_column in _STATE_TABLES:
-        if cutoff_column:
-            rows = conn.execute(
-                f"SELECT * FROM {table} WHERE {cutoff_column} <= ?", (as_of.isoformat(),)
-            ).fetchall()
-        else:
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
-        normalized_rows = [dict(row) for row in rows]
-        state[table] = sorted(
-            normalized_rows,
-            key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"), default=str),
-        )
+    for table, cutoff_column in _CUTOFF_TABLES:
+        normalized_rows = [
+            dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()
+            if _upto(row[cutoff_column], cutoff)
+        ]
+        if book_ids and normalized_rows and "book_id" in normalized_rows[0]:
+            normalized_rows = [row for row in normalized_rows if row["book_id"] in book_ids]
+        state[table] = sorted(normalized_rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
+    # Child rows inherit their immutable parent's cutoff.
+    state["paper_book_snapshot_positions"] = [
+        dict(row) for row in conn.execute(
+            "SELECT p.*, s.as_of AS parent_as_of FROM paper_book_snapshot_positions p JOIN paper_book_snapshots s "
+            "ON s.book_id=p.book_id AND s.snapshot_id=p.snapshot_id"
+        ).fetchall() if _upto(row["parent_as_of"], cutoff) and (not book_ids or row["book_id"] in book_ids)
+    ]
+    state["paper_book_lifecycle_symbol_results"] = [
+        dict(row) for row in conn.execute(
+            "SELECT r.*, l.as_of FROM paper_book_lifecycle_symbol_results r "
+            "JOIN paper_book_lifecycle_runs l ON l.lifecycle_run_id=r.lifecycle_run_id"
+        ).fetchall() if _upto(row["as_of"], cutoff) and (not book_ids or row["book_id"] in book_ids)
+    ]
+    state["paper_book_position_lot_openings"] = [
+        {key: row[key] for key in ("book_id", "lot_id", "symbol", "opened_at", "quantity", "cost_basis_usd", "opening_fill_id")}
+        for row in conn.execute("SELECT * FROM paper_book_position_lots").fetchall()
+        if _upto(row["opened_at"], cutoff) and (not book_ids or row["book_id"] in book_ids)
+    ]
+    for key in state:
+        state[key] = sorted(state[key], key=lambda row: json.dumps(row, sort_keys=True, default=str))
     return hashlib.sha256(
         json.dumps(state, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
 
 
 def verification_is_stale(conn, verification: dict, as_of: datetime) -> bool:
+    del as_of  # staleness is always evaluated against the verification's frozen cutoff
     stored = verification.get("source_state_hash")
-    return not stored or stored != source_state_hash(conn, as_of)
+    try:
+        cutoff = parse_aware_utc(verification["as_of"])
+    except (KeyError, TimestampError):
+        return True
+    return not stored or stored != source_state_hash(conn, cutoff)
 
 
 def _check_book_and_arm_identity(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
-    books = {b.book_id: b for b in pb_repo.list_books(conn)}
+    cutoff = parse_aware_utc(as_of_iso)
+    books = {b.book_id: b for b in pb_repo.list_books(conn) if canonical_utc(b.created_at) <= cutoff}
     violations = []
     expected_arm = {cfg.baseline.book_id: "BASELINE", cfg.enhanced.book_id: "ENHANCED"}
     for book_id, arm in expected_arm.items():
@@ -174,12 +200,13 @@ def _check_book_and_arm_identity(conn, cfg: PaperBooksConfiguration, as_of_iso: 
 
 
 def _check_orders_arm_matches_book(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    cutoff = parse_aware_utc(as_of_iso)
     books = {b.book_id: b.experiment_arm for b in pb_repo.list_books(conn)}
     violations = []
     total = 0
     for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
         for order in pb_repo.list_order_intents(conn, book_id):
-            if order["created_at"] > as_of_iso:
+            if not _upto(order["created_at"], cutoff):
                 continue
             total += 1
             expected_arm = books.get(book_id)
@@ -198,14 +225,16 @@ def _check_orders_arm_matches_book(conn, cfg: PaperBooksConfiguration, as_of_iso
 
 
 def _check_fills_reference_own_book_order(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    cutoff = parse_aware_utc(as_of_iso)
     violations = []
     total = 0
     for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
         for fill in pb_repo.list_fills(conn, book_id):
-            if fill["fill_timestamp"] > as_of_iso:
+            if not _upto(fill["fill_timestamp"], cutoff):
                 continue
             total += 1
-            if not pb_repo.order_exists(conn, book_id, fill["paper_order_intent_id"]):
+            order = pb_repo.load_order_intent(conn, book_id, fill["paper_order_intent_id"])
+            if order is None or not _upto(order["as_of"], cutoff):
                 violations.append(f"{book_id}/{fill['fill_id']} references order {fill['paper_order_intent_id']!r} not found in this book")
     if total == 0:
         return CrossBookCheck(
@@ -221,13 +250,14 @@ def _check_fills_reference_own_book_order(conn, cfg: PaperBooksConfiguration, as
 
 
 def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    cutoff = parse_aware_utc(as_of_iso)
     book_ids = (cfg.baseline.book_id, cfg.enhanced.book_id)
-    fills_by_book = {b: {f["fill_id"] for f in pb_repo.list_fills(conn, b)} for b in book_ids}
-    orders_by_book = {b: {o["paper_order_intent_id"] for o in pb_repo.list_order_intents(conn, b)} for b in book_ids}
+    fills_by_book = {b: {f["fill_id"] for f in pb_repo.list_fills(conn, b) if _upto(f["fill_timestamp"], cutoff)} for b in book_ids}
+    orders_by_book = {b: {o["paper_order_intent_id"] for o in pb_repo.list_order_intents(conn, b) if _upto(o["as_of"], cutoff)} for b in book_ids}
     actions_by_book = {
         b: {r["action_id"] for r in conn.execute(
-            "SELECT action_id FROM paper_book_corporate_actions_applied WHERE book_id = ?", (b,)
-        ).fetchall()} for b in book_ids
+            "SELECT action_id, applied_at FROM paper_book_corporate_actions_applied WHERE book_id = ?", (b,)
+        ).fetchall() if _upto(r["applied_at"], cutoff)} for b in book_ids
     }
 
     violations = []
@@ -235,7 +265,7 @@ def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_
     for book_id in book_ids:
         other_book = next(b for b in book_ids if b != book_id)
         for entry in pb_repo.list_cash_ledger_entries(conn, book_id):
-            if entry["event_timestamp"] > as_of_iso:
+            if not _upto(entry["event_timestamp"], cutoff):
                 continue
             ref = entry["reference_id"]
             event_type = entry["event_type"]
@@ -256,7 +286,10 @@ def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_
                 foreign = ref in fills_by_book[other_book] or ref in orders_by_book[other_book] or ref in actions_by_book[other_book]
                 detail = f" belongs to {other_book}" if foreign else " does not resolve under the event reference policy"
                 violations.append(f"{book_id}/{entry['ledger_entry_id']} reference_id={ref!r}{detail}")
-    checked = sum(len(pb_repo.list_cash_ledger_entries(conn, b)) for b in book_ids)
+    checked = sum(
+        _upto(entry["event_timestamp"], cutoff)
+        for b in book_ids for entry in pb_repo.list_cash_ledger_entries(conn, b)
+    )
     if checked == 0:
         return CrossBookCheck(
             "cash_ledger_foreign_reference", CHECK_STATUS_NOT_APPLICABLE, None, "0 violations",
@@ -270,71 +303,91 @@ def _check_cash_ledger_foreign_reference(conn, cfg: PaperBooksConfiguration, as_
 
 
 def _check_position_lot_consistency(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
-    del as_of_iso
+    cutoff = parse_aware_utc(as_of_iso)
     violations = []
     total = 0
-    for book in pb_repo.list_books(conn):
-        positions = {p["symbol"]: Decimal(p["quantity"]) for p in pb_repo.list_positions(conn, book.book_id, open_only=False)}
-        lot_quantities: dict[str, Decimal] = {}
-        for lot in pb_repo.list_all_lots(conn, book.book_id):
-            lot_quantities[lot["symbol"]] = lot_quantities.get(lot["symbol"], Decimal("0")) + Decimal(lot["remaining_quantity"])
-        for symbol in sorted(set(positions) | set(lot_quantities)):
+    for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
+        positions: dict[str, Decimal] = {}
+        current_rows = pb_repo.list_positions(conn, book_id, open_only=False)
+        # A current row is usable only if its last mutation is at/before the
+        # cutoff. Otherwise fall back to an immutable campaign snapshot.
+        current_is_cutoff_safe = bool(current_rows) and all(_upto(p["updated_at"], cutoff) for p in current_rows)
+        if current_is_cutoff_safe:
+            positions = {p["symbol"]: Decimal(p["quantity"]) for p in current_rows}
+        fill_quantities: dict[str, Decimal] = {}
+        for fill in pb_repo.list_fills(conn, book_id):
+            if not _upto(fill["fill_timestamp"], cutoff):
+                continue
+            sign = Decimal("1") if fill["side"] == "BUY" else Decimal("-1")
+            fill_quantities[fill["symbol"]] = fill_quantities.get(fill["symbol"], Decimal("0")) + sign * Decimal(fill["fill_quantity"])
+        if not current_is_cutoff_safe:
+            # Fills are immutable and fully cutoff-bounded, so they are the
+            # authoritative historical reconstruction when the one current
+            # position row was mutated after the requested instant.
+            positions = dict(fill_quantities)
+        for symbol in sorted(set(positions) | set(fill_quantities)):
             total += 1
             position_qty = positions.get(symbol, Decimal("0"))
-            lot_qty = lot_quantities.get(symbol, Decimal("0"))
+            lot_qty = fill_quantities.get(symbol, Decimal("0"))
             if position_qty != lot_qty:
-                violations.append(f"{book.book_id}/{symbol} position quantity={position_qty} but open lots={lot_qty}")
+                violations.append(f"{book_id}/{symbol} historical position quantity={position_qty} but cutoff fills={lot_qty}")
     if total == 0:
         return CrossBookCheck(
             "position_lot_consistency", CHECK_STATUS_NOT_APPLICABLE, None, "0 violations",
-            "paper_book_positions, paper_book_position_lots", "no positions or lots persisted",
+            "paper_book_snapshots, paper_book_fills", "historical position reconstruction is unavailable",
         )
     return CrossBookCheck(
         "position_lot_consistency", CHECK_STATUS_FAILED if violations else CHECK_STATUS_PASSED,
-        str(len(violations)), "0 violations", "paper_book_positions, paper_book_position_lots",
-        "; ".join(violations) if violations else f"{total} book/symbol quantity pair(s) reconcile to open lots",
+        str(len(violations)), "0 violations", "paper_book_snapshots, paper_book_fills",
+        "; ".join(violations) if violations else f"{total} book/symbol quantity pair(s) reconcile at the cutoff",
     )
 
 
 def _check_unexpected_book_namespaces(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
-    del as_of_iso
+    cutoff = parse_aware_utc(as_of_iso)
     expected = {cfg.baseline.book_id, cfg.enhanced.book_id}
     tables = (
-        "paper_books", "paper_book_cash_ledger", "paper_book_risk_decisions", "paper_book_orders",
-        "paper_book_fills", "paper_book_positions", "paper_book_position_lots", "paper_book_snapshots",
-        "paper_book_snapshot_positions", "paper_book_reconciliations", "paper_book_daily_metrics",
-        "paper_book_corporate_actions_applied", "paper_book_exit_decisions",
-        "paper_book_manual_exit_requests", "paper_book_lifecycle_symbol_results",
+        ("paper_books", "created_at"), ("paper_book_cash_ledger", "event_timestamp"),
+        ("paper_book_risk_decisions", "created_at"), ("paper_book_orders", "as_of"),
+        ("paper_book_fills", "fill_timestamp"), ("paper_book_positions", "updated_at"),
+        ("paper_book_position_lots", "opened_at"), ("paper_book_snapshots", "as_of"),
+        ("paper_book_reconciliations", "as_of"), ("paper_book_daily_metrics", "window_end"),
+        ("paper_book_corporate_actions_applied", "applied_at"), ("paper_book_exit_decisions", "as_of"),
+        ("paper_book_manual_exit_requests", "requested_at"),
     )
     violations = []
     observed_rows = 0
-    for table in tables:
-        rows = conn.execute(f"SELECT DISTINCT book_id FROM {table} ORDER BY book_id").fetchall()
-        observed_rows += len(rows)
-        for row in rows:
-            if row["book_id"] not in expected:
-                violations.append(f"{table} contains unconfigured book_id {row['book_id']!r}")
+    for table, timestamp_column in tables:
+        rows = [row for row in conn.execute(f"SELECT book_id, {timestamp_column} FROM {table}").fetchall()
+                if _upto(row[timestamp_column], cutoff)]
+        observed = {row["book_id"] for row in rows}
+        observed_rows += len(observed)
+        for book_id in observed:
+            if book_id not in expected:
+                violations.append(f"{table} contains unconfigured book_id {book_id!r}")
     if observed_rows == 0:
         return CrossBookCheck(
             "unexpected_book_namespaces", CHECK_STATUS_NOT_APPLICABLE, None, "0 violations",
-            ", ".join(tables), "no book-scoped rows persisted",
+            ", ".join(table for table, _ in tables), "no cutoff-bounded book-scoped rows persisted",
         )
     return CrossBookCheck(
         "unexpected_book_namespaces", CHECK_STATUS_FAILED if violations else CHECK_STATUS_PASSED,
-        str(len(violations)), "0 violations", ", ".join(tables),
+        str(len(violations)), "0 violations", ", ".join(table for table, _ in tables),
         "; ".join(violations) if violations else "every book-scoped row belongs to a configured book",
     )
 
 
 def _check_lots_reference_own_book_fill(conn, cfg: PaperBooksConfiguration, as_of_iso: str) -> CrossBookCheck:
+    cutoff = parse_aware_utc(as_of_iso)
     violations = []
     total = 0
     for book_id in (cfg.baseline.book_id, cfg.enhanced.book_id):
         for lot in pb_repo.list_all_lots(conn, book_id):
-            if lot["created_at"] > as_of_iso:
+            if not _upto(lot["opened_at"], cutoff):
                 continue
             total += 1
-            if not pb_repo.fill_exists(conn, book_id, lot["opening_fill_id"]):
+            fill = next((f for f in pb_repo.list_fills(conn, book_id) if f["fill_id"] == lot["opening_fill_id"]), None)
+            if fill is None or not _upto(fill["fill_timestamp"], cutoff):
                 violations.append(f"{book_id}/{lot['lot_id']} references fill {lot['opening_fill_id']!r} not found in this book")
     if total == 0:
         return CrossBookCheck(
@@ -432,7 +485,8 @@ def verify_cross_book_integrity(
     overall `PASSED` when at least one check actually observed data and none
     failed (Section 7: "zero violations plus insufficient source data must
     not become PASSED")."""
-    as_of_iso = as_of.isoformat()
+    as_of = canonical_utc(as_of)
+    as_of_iso = canonical_utc_iso(as_of)
     checks = tuple(fn(conn, paper_books_config, as_of_iso) for fn in _CHECK_FUNCTIONS)
     state_hash = source_state_hash(conn, as_of)
     scope_id = _verification_scope_id(as_of, operator_run_id, lifecycle_run_id)

@@ -155,6 +155,25 @@ def test_incomplete_real_claude_is_partial_not_success(conn):
     assert summary.real_provider_success_cycle_count == 0
 
 
+def test_any_real_failure_disqualifies_cycle_despite_another_success(conn):
+    _make_cycle(conn, "mixed-outcome", provider_mode="real")
+    record_cycle_provider_provenance(conn, [
+        evidence_provider_row(
+            cycle_id="mixed-outcome", research_run_id=None, symbol="AAPL", provider_category="market",
+            provider_name="real-market", request_or_source_id="market", status="ok",
+            cycle_provider_mode="real", observed_at=BASE_TIME,
+        ),
+        evidence_provider_row(
+            cycle_id="mixed-outcome", research_run_id=None, symbol="AAPL", provider_category="news",
+            provider_name="real-news", request_or_source_id="news", status="failed",
+            cycle_provider_mode="real", observed_at=BASE_TIME,
+        ),
+    ])
+    summary = compute_real_provider_history(conn, BASE_TIME)
+    assert summary.real_provider_success_cycle_count == 1
+    assert summary.qualifying_real_provider_cycle_count == 0
+
+
 def test_category_totals_reconcile_to_completed_cycles(conn):
     _make_cycle(conn, "known", provider_mode="fixture")
     _make_cycle(conn, "unknown", provider_mode="real")
