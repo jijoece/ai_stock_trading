@@ -63,4 +63,4 @@
 
 ## Final status
 
-- Implementation and final offline verification complete; real-paper smoke not executed; publication pending.
+- Implementation and final offline verification complete; real-paper smoke not executed; branch pushed and draft PR created.
