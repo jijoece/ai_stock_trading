@@ -27,13 +27,14 @@ not been exercised against a live paper-broker connection — see
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 
 from .configuration import RuntimeConfiguration
 from .errors import ErrorCode, RuntimeOperationError
-from .models import AccountSnapshotPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
+from .models import AccountSnapshotPayload, FillPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
 
 # Alpaca (alpaca-py) raw order statuses -> internal runtime status
 # (docs/milestone-4.md Step 8). Fail closed on anything not explicitly
@@ -47,8 +48,8 @@ _ALPACA_STATUS_MAP: dict[str, str] = {
     "filled": "FILLED",
     "done_for_day": "CANCELLED",
     "canceled": "CANCELLED",
-    "expired": "CANCELLED",
-    "pending_cancel": "ACCEPTED",
+    "expired": "EXPIRED",
+    "pending_cancel": "CANCEL_REQUESTED",
     "stopped": "ERROR",
     "rejected": "REJECTED",
     "suspended": "ERROR",
@@ -99,6 +100,9 @@ class LumiBotAlpacaPaperGateway:
         if not self.config.alpaca_is_paper_flag:
             self._init_error = "ALPACA_IS_PAPER is not exactly 'true' — refusing to assume paper mode"
             return
+        if not self.config.paper_endpoint_configured:
+            self._init_error = "Alpaca base URL is not the exact paper endpoint"
+            return
 
         try:
             from lumibot.brokers import Alpaca
@@ -113,8 +117,8 @@ class LumiBotAlpacaPaperGateway:
                 broker_config, connect_stream=False, start_orders_thread=False,
             )
             self._api = self._broker.api
-        except Exception as exc:  # broker construction/auth failures must not crash health checks
-            self._init_error = f"failed to construct Alpaca broker: {exc}"
+        except Exception:  # broker construction/auth failures must not crash health checks
+            self._init_error = "failed to construct Alpaca broker"
             self._broker = None
             self._api = None
             return
@@ -128,9 +132,7 @@ class LumiBotAlpacaPaperGateway:
             from alpaca.common.enums import BaseURL
 
             base_url = getattr(self._api, "_base_url", None)
-            return base_url == BaseURL.TRADING_PAPER or str(base_url).startswith(
-                "https://paper-api.alpaca.markets"
-            )
+            return base_url == BaseURL.TRADING_PAPER or str(base_url).rstrip("/") == self.config.alpaca_base_url
         except Exception:
             return False
 
@@ -144,6 +146,15 @@ class LumiBotAlpacaPaperGateway:
                 self._init_error or "Alpaca paper broker connection is not verified",
             )
 
+    def account_fingerprint(self) -> str:
+        self._require_verified()
+        try:
+            account = self._api.get_account()
+            account_id = str(account.id)
+        except Exception as exc:
+            raise RuntimeOperationError(ErrorCode.BROKER_ERROR, "account verification failed") from exc
+        return "acct_" + hashlib.sha256(f"alpaca-paper:{account_id}".encode()).hexdigest()[:32]
+
     def _validate_asset(self, symbol: str) -> None:
         # Genuine LumiBot entity construction — validates the symbol against
         # LumiBot's own Asset model before anything is sent to Alpaca.
@@ -156,7 +167,7 @@ class LumiBotAlpacaPaperGateway:
         self._validate_asset(intent.symbol)
 
         from alpaca.trading.enums import OrderSide, TimeInForce
-        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        from alpaca.trading.requests import LimitOrderRequest
 
         client_order_id = intent.idempotency_key
 
@@ -165,13 +176,11 @@ class LumiBotAlpacaPaperGateway:
             return existing  # idempotent replay — never resubmit (docs/milestone-4.md Step 8)
 
         common_kwargs = dict(
-            symbol=intent.symbol, qty=intent.quantity, side=OrderSide.BUY,
+            symbol=intent.symbol, qty=intent.quantity,
+            side=OrderSide.BUY if intent.side == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY, client_order_id=client_order_id,
         )
-        if intent.order_type == "LIMIT":
-            order_request = LimitOrderRequest(limit_price=float(intent.limit_price), **common_kwargs)
-        else:
-            order_request = MarketOrderRequest(**common_kwargs)
+        order_request = LimitOrderRequest(limit_price=float(intent.limit_price), **common_kwargs)
 
         try:
             order = self._api.submit_order(order_data=order_request)
@@ -184,7 +193,7 @@ class LumiBotAlpacaPaperGateway:
                 return recovered
             raise RuntimeOperationError(
                 ErrorCode.SUBMISSION_UNKNOWN,
-                f"submit_order outcome is unknown (broker call raised {exc!r}); "
+                "submit_order outcome is unknown after the broker call; "
                 "query get_order with the same client_order_id before retrying — do not resubmit",
                 retryable=False,
             ) from exc
@@ -196,11 +205,56 @@ class LumiBotAlpacaPaperGateway:
         try:
             order = self._api.get_order_by_client_id(client_order_id)
         except Exception as exc:
-            message = str(exc).lower()
-            if "404" in message or "not found" in message:
+            if _is_authoritative_not_found(exc):
                 return None
-            raise RuntimeOperationError(ErrorCode.BROKER_ERROR, f"get_order failed: {exc}") from exc
+            raise RuntimeOperationError(ErrorCode.BROKER_ERROR, "get_order failed") from exc
         return self._order_to_snapshot(order)
+
+    def get_order_by_broker_id(self, broker_order_id: str) -> OrderSnapshotPayload | None:
+        self._require_verified()
+        try:
+            order = self._api.get_order_by_id(broker_order_id)
+        except Exception as exc:
+            if _is_authoritative_not_found(exc):
+                return None
+            raise RuntimeOperationError(ErrorCode.BROKER_ERROR, "get_order_by_id failed") from exc
+        return self._order_to_snapshot(order)
+
+    def list_order_fills(self, client_order_id: str) -> list[FillPayload]:
+        self._require_verified()
+        order = self.get_order(client_order_id)
+        if order is None:
+            raise RuntimeOperationError(ErrorCode.UNKNOWN_ORDER, f"no known order for {client_order_id!r}")
+        activities_api = getattr(self._api, "get_account_activities", None)
+        if activities_api is None:
+            if not order.filled_quantity or not order.average_fill_price or not order.broker_order_id:
+                return []
+            return [FillPayload(
+                fill_id=f"alpaca-cumulative-{order.broker_order_id}-{order.filled_quantity}",
+                broker_order_id=order.broker_order_id, client_order_id=client_order_id,
+                book_id=order.book_id or "", symbol=order.symbol or "", side=order.side or "",
+                quantity=str(order.filled_quantity), price=order.average_fill_price,
+                filled_at=order.updated_at, account_fingerprint=self.account_fingerprint(),
+            )]
+        try:
+            activities = activities_api(activity_types=["FILL"])
+        except Exception as exc:
+            raise RuntimeOperationError(ErrorCode.BROKER_ERROR, "list fills failed") from exc
+        fingerprint = self.account_fingerprint()
+        result = []
+        for activity in activities:
+            if str(getattr(activity, "order_id", "")) != str(order.broker_order_id):
+                continue
+            result.append(FillPayload(
+                fill_id=str(getattr(activity, "id", "")), broker_order_id=str(order.broker_order_id),
+                client_order_id=client_order_id, book_id=order.book_id or "",
+                symbol=str(getattr(activity, "symbol", order.symbol or "")),
+                side=str(getattr(activity, "side", order.side or "")).upper(),
+                quantity=str(getattr(activity, "qty", "0")), price=str(getattr(activity, "price", "0")),
+                filled_at=str(getattr(activity, "transaction_time", order.updated_at)),
+                account_fingerprint=fingerprint,
+            ))
+        return result
 
     def list_open_orders(self) -> list[OrderSnapshotPayload]:
         self._require_verified()
@@ -252,9 +306,15 @@ class LumiBotAlpacaPaperGateway:
             try:
                 self._api.cancel_order_by_id(existing.broker_order_id)
             except Exception as exc:
-                raise RuntimeOperationError(ErrorCode.BROKER_ERROR, f"cancel_order failed: {exc}") from exc
+                raise RuntimeOperationError(ErrorCode.BROKER_ERROR, "cancel_order failed") from exc
         updated = self.get_order(client_order_id)
-        return updated if updated is not None else existing
+        result = updated if updated is not None else existing
+        if result.status in ("ACCEPTED", "SUBMITTED"):
+            result = replace(
+                result, status="CANCEL_REQUESTED",
+                raw_broker_status=f"cancel_requested:{result.raw_broker_status or 'unknown'}",
+            )
+        return result
 
     def _order_to_snapshot(self, order: object) -> OrderSnapshotPayload:
         raw_status = getattr(order.status, "value", order.status)
@@ -269,4 +329,27 @@ class LumiBotAlpacaPaperGateway:
             filled_quantity=filled_qty, average_fill_price=avg_price,
             submitted_at=str(order.submitted_at) if getattr(order, "submitted_at", None) else now,
             updated_at=str(order.updated_at) if getattr(order, "updated_at", None) else now,
+            book_id=_book_from_client_order_id(str(order.client_order_id)),
+            symbol=str(getattr(order, "symbol", "")) or None,
+            side=str(getattr(getattr(order, "side", None), "value", getattr(order, "side", ""))).upper() or None,
+            limit_price=str(getattr(order, "limit_price", "")) or None,
+            time_in_force=str(getattr(getattr(order, "time_in_force", None), "value", "day")).upper(),
+            account_fingerprint=self.account_fingerprint(),
         )
+
+
+def _book_from_client_order_id(client_order_id: str) -> str | None:
+    if client_order_id.startswith("epb-baseline-"):
+        return "BASELINE"
+    if client_order_id.startswith("epb-enhanced-"):
+        return "ENHANCED"
+    return None
+
+
+def _is_authoritative_not_found(exc: Exception) -> bool:
+    """Only an explicit HTTP 404 is authoritative broker absence."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    return status == 404

@@ -95,7 +95,7 @@ def cash_ledger_entry_exists(conn: sqlite3.Connection, book_id: str, idempotency
     return row is not None
 
 
-def save_cash_ledger_entry(conn: sqlite3.Connection, entry) -> bool:
+def save_cash_ledger_entry(conn: sqlite3.Connection, entry, *, commit: bool = True) -> bool:
     """Insert one append-only ledger entry. Returns False (no-op) if the
     (book_id, idempotency_key) pair already exists — idempotent settlement."""
     if cash_ledger_entry_exists(conn, entry.book_id, entry.idempotency_key):
@@ -110,7 +110,7 @@ def save_cash_ledger_entry(conn: sqlite3.Connection, entry) -> bool:
             getattr(entry, "symbol", None), entry.reference_id, entry.operator, entry.reason, _ts(entry.event_timestamp),
         ),
     )
-    conn.commit()
+    _commit_if(conn, commit)
     return True
 
 
@@ -231,7 +231,7 @@ def fill_exists(conn: sqlite3.Connection, book_id: str, fill_id: str) -> bool:
     return row is not None
 
 
-def save_fill(conn: sqlite3.Connection, fill: dict) -> bool:
+def save_fill(conn: sqlite3.Connection, fill: dict, *, commit: bool = True) -> bool:
     if fill_exists(conn, fill["book_id"], fill["fill_id"]):
         return False
     conn.execute(
@@ -245,7 +245,7 @@ def save_fill(conn: sqlite3.Connection, fill: dict) -> bool:
             _ts(fill["fill_timestamp"]), fill["simulation_rule_version"], _ts(fill["fill_timestamp"]),
         ),
     )
-    conn.commit()
+    _commit_if(conn, commit)
     return True
 
 
@@ -267,7 +267,9 @@ def list_fills_for_intent(conn: sqlite3.Connection, book_id: str, paper_order_in
 # -- positions and lots -------------------------------------------------------
 
 
-def upsert_position(conn: sqlite3.Connection, book_id: str, symbol: str, fields: dict) -> None:
+def upsert_position(
+    conn: sqlite3.Connection, book_id: str, symbol: str, fields: dict, *, commit: bool = True,
+) -> None:
     existing = conn.execute(
         "SELECT 1 FROM paper_book_positions WHERE book_id = ? AND symbol = ?", (book_id, symbol)
     ).fetchone()
@@ -300,7 +302,7 @@ def upsert_position(conn: sqlite3.Connection, book_id: str, symbol: str, fields:
                 book_id, symbol,
             ),
         )
-    conn.commit()
+    _commit_if(conn, commit)
 
 
 def load_position(conn: sqlite3.Connection, book_id: str, symbol: str) -> dict | None:
@@ -320,7 +322,7 @@ def list_positions(conn: sqlite3.Connection, book_id: str, *, open_only: bool = 
     return result
 
 
-def save_lot(conn: sqlite3.Connection, lot: dict) -> None:
+def save_lot(conn: sqlite3.Connection, lot: dict, *, commit: bool = True) -> None:
     existing = conn.execute(
         "SELECT 1 FROM paper_book_position_lots WHERE book_id = ? AND lot_id = ?",
         (lot["book_id"], lot["lot_id"]),
@@ -337,15 +339,18 @@ def save_lot(conn: sqlite3.Connection, lot: dict) -> None:
             None, _ts(lot["opened_at"]),
         ),
     )
-    conn.commit()
+    _commit_if(conn, commit)
 
 
-def update_lot_remaining(conn: sqlite3.Connection, book_id: str, lot_id: str, remaining_quantity: Decimal, closed_at: datetime | None) -> None:
+def update_lot_remaining(
+    conn: sqlite3.Connection, book_id: str, lot_id: str, remaining_quantity: Decimal,
+    closed_at: datetime | None, *, commit: bool = True,
+) -> None:
     conn.execute(
         "UPDATE paper_book_position_lots SET remaining_quantity = ?, closed_at = ? WHERE book_id = ? AND lot_id = ?",
         (str(remaining_quantity), _ts(closed_at) if closed_at else None, book_id, lot_id),
     )
-    conn.commit()
+    _commit_if(conn, commit)
 
 
 def list_open_lots(conn: sqlite3.Connection, book_id: str, symbol: str) -> list[dict]:
@@ -1408,3 +1413,179 @@ def list_recurring_scheduler_runs(conn: sqlite3.Connection, limit: int = 20) -> 
         "SELECT * FROM paper_recurring_scheduler_runs ORDER BY intended_at DESC LIMIT ?", (max(1, min(limit, 200)),)
     ).fetchall()
     return [_recurring_run_row(row) for row in rows]
+
+
+# -- Milestone 11 external paper broker ---------------------------------------
+
+
+def save_external_preview(conn: sqlite3.Connection, preview: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_order_previews "
+        "(preview_id, paper_order_intent_id, payload_hash, book_id, client_order_id, account_fingerprint, "
+        "previewed_at, expires_at, operator, result, reasons_json, config_hash, policy_version) "
+        "VALUES (:preview_id, :paper_order_intent_id, :payload_hash, :book_id, :client_order_id, "
+        ":account_fingerprint, :previewed_at, :expires_at, :operator, :result, :reasons_json, "
+        ":config_hash, :policy_version)",
+        {**preview, "reasons_json": json.dumps(list(preview.get("reasons", ())), sort_keys=True)},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def load_external_preview(conn: sqlite3.Connection, preview_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM paper_external_order_previews WHERE preview_id = ?", (preview_id,)).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["reasons"] = tuple(json.loads(result.pop("reasons_json")))
+    return result
+
+
+def save_external_order_event(conn: sqlite3.Connection, event: dict, *, commit: bool = True) -> bool:
+    columns = (
+        "external_order_event_id", "external_order_scope_id", "book_id", "paper_order_intent_id",
+        "client_order_id", "broker_order_id", "account_fingerprint", "previous_state", "new_state",
+        "payload_hash", "quantity", "limit_price", "operator", "reason", "runtime_request_id",
+        "error_code", "created_at", "policy_version", "config_hash", "attempt_number",
+    )
+    cursor = conn.execute(
+        f"INSERT OR IGNORE INTO paper_external_order_events ({', '.join(columns)}) "
+        f"VALUES ({', '.join(':' + column for column in columns)})",
+        {**event, "quantity": str(event["quantity"]), "limit_price": str(event["limit_price"])},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def list_external_order_events(
+    conn: sqlite3.Connection, *, book_id: str | None = None, client_order_id: str | None = None,
+    paper_order_intent_id: str | None = None,
+) -> list[dict]:
+    clauses, params = [], []
+    for column, value in (
+        ("book_id", book_id), ("client_order_id", client_order_id),
+        ("paper_order_intent_id", paper_order_intent_id),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    query = "SELECT * FROM paper_external_order_events"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY created_at, rowid"
+    return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def load_latest_external_order_event(conn: sqlite3.Connection, book_id: str, client_order_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_external_order_events WHERE book_id = ? AND client_order_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, client_order_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def save_external_broker_fill(conn: sqlite3.Connection, fill: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_broker_fills "
+        "(external_fill_id, book_id, paper_order_intent_id, client_order_id, broker_order_id, "
+        "account_fingerprint, symbol, side, quantity, price, filled_at, payload_hash, created_at) "
+        "VALUES (:external_fill_id, :book_id, :paper_order_intent_id, :client_order_id, :broker_order_id, "
+        ":account_fingerprint, :symbol, :side, :quantity, :price, :filled_at, :payload_hash, :created_at)",
+        {**fill, "quantity": str(fill["quantity"]), "price": str(fill["price"])},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def list_external_broker_fills(conn: sqlite3.Connection, book_id: str, client_order_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_external_broker_fills WHERE book_id = ? AND client_order_id = ? "
+        "ORDER BY filled_at, external_fill_id", (book_id, client_order_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_external_lookup(conn: sqlite3.Connection, lookup: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_order_lookups "
+        "(lookup_id, book_id, paper_order_intent_id, client_order_id, account_fingerprint, result, "
+        "authoritative, runtime_request_id, created_at) VALUES (:lookup_id, :book_id, "
+        ":paper_order_intent_id, :client_order_id, :account_fingerprint, :result, :authoritative, "
+        ":runtime_request_id, :created_at)", lookup,
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def load_latest_external_lookup(conn: sqlite3.Connection, book_id: str, client_order_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_external_order_lookups WHERE book_id = ? AND client_order_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, client_order_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def save_external_reconciliation(conn: sqlite3.Connection, record: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_reconciliations "
+        "(reconciliation_id, book_id, paper_order_intent_id, client_order_id, account_fingerprint, "
+        "status, statuses_json, details_json, critical, created_at, policy_version, config_hash) "
+        "VALUES (:reconciliation_id, :book_id, :paper_order_intent_id, :client_order_id, "
+        ":account_fingerprint, :status, :statuses_json, :details_json, :critical, :created_at, "
+        ":policy_version, :config_hash)",
+        {
+            **record, "statuses_json": json.dumps(list(record["statuses"]), sort_keys=True),
+            "details_json": json.dumps(record.get("details", {}), sort_keys=True),
+        },
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def list_external_reconciliations(
+    conn: sqlite3.Connection, book_id: str, client_order_id: str | None = None,
+) -> list[dict]:
+    query = "SELECT * FROM paper_external_reconciliations WHERE book_id = ?"
+    params: list[object] = [book_id]
+    if client_order_id is not None:
+        query += " AND client_order_id = ?"
+        params.append(client_order_id)
+    query += " ORDER BY created_at, rowid"
+    result = []
+    for row in conn.execute(query, params).fetchall():
+        item = dict(row)
+        item["statuses"] = tuple(json.loads(item.pop("statuses_json")))
+        item["details"] = json.loads(item.pop("details_json"))
+        result.append(item)
+    return result
+
+
+def enqueue_external_submission(
+    conn: sqlite3.Connection, *, queue_id: str, book_id: str, paper_order_intent_id: str,
+    source: str, created_at: str,
+) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_submission_queue "
+        "(queue_id, book_id, paper_order_intent_id, status, source, created_at) "
+        "VALUES (?, ?, ?, 'AWAITING_OPERATOR_EXTERNAL_SUBMISSION', ?, ?)",
+        (queue_id, book_id, paper_order_intent_id, source, created_at),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def has_external_execution_evidence(
+    conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str,
+) -> bool:
+    """True once an intent has crossed into the external-paper namespace."""
+    for table in (
+        "paper_external_order_previews", "paper_external_order_events",
+        "paper_external_broker_fills", "paper_external_submission_queue",
+    ):
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE book_id = ? AND paper_order_intent_id = ? LIMIT 1",
+            (book_id, paper_order_intent_id),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False

@@ -8,7 +8,7 @@ from trading_research.runtime.paper_runtime_config import (
 VALID_YAML = """
 version: 1
 paper_runtime:
-  protocol_version: paper-runtime.v1
+  protocol_version: paper-runtime.v2
   transport: stdio
   command: [python3, -m, trading_paper_runtime]
   startup_timeout_seconds: 15
@@ -16,10 +16,12 @@ paper_runtime:
 paper_broker:
   provider: alpaca
   mode: paper
+  environment: paper
+  base_url: https://paper-api.alpaca.markets
   real_money_enabled: false
   asset_types: [equity]
-  allowed_sides: [BUY]
-  allowed_order_types: [LIMIT, MARKET]
+  allowed_sides: [BUY, SELL]
+  allowed_order_types: [LIMIT]
   allow_fractional: false
   allow_shorting: false
   allow_margin: false
@@ -63,6 +65,28 @@ def test_unrecognized_broker_mode_fails_closed(tmp_path):
 def test_real_money_enabled_true_fails_closed(tmp_path):
     path = _write(tmp_path, VALID_YAML.replace("real_money_enabled: false", "real_money_enabled: true"))
     with pytest.raises(PaperRuntimeConfigError):
+        load_paper_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.alpaca.markets", "https://broker-api.alpaca.markets",
+        "http://paper-api.alpaca.markets", "http://localhost:8000",
+    ],
+)
+def test_non_paper_base_urls_fail_closed(tmp_path, url):
+    path = _write(
+        tmp_path,
+        VALID_YAML.replace("https://paper-api.alpaca.markets", url),
+    )
+    with pytest.raises(PaperRuntimeConfigError, match="base_url"):
+        load_paper_runtime_config(path)
+
+
+def test_runtime_config_booleans_are_strict(tmp_path):
+    path = _write(tmp_path, VALID_YAML.replace("allow_margin: false", "allow_margin: 'false'"))
+    with pytest.raises(PaperRuntimeConfigError, match="strict boolean"):
         load_paper_runtime_config(path)
 
 

@@ -25,6 +25,16 @@ def test_missing_credentials_fails_closed():
     assert gateway._init_error is not None
 
 
+def test_runtime_configuration_repr_never_contains_credentials():
+    config = RuntimeConfiguration(
+        broker_provider="alpaca", alpaca_api_key="key-secret", alpaca_api_secret="value-secret",
+        alpaca_is_paper_flag=True,
+    )
+    rendered = repr(config)
+    assert "key-secret" not in rendered
+    assert "value-secret" not in rendered
+
+
 def test_missing_explicit_paper_flag_fails_closed_even_with_credentials():
     config = RuntimeConfiguration(
         broker_provider="alpaca", alpaca_api_key="fake-key", alpaca_api_secret="fake-secret",
@@ -45,7 +55,7 @@ def test_submit_order_refuses_when_not_verified():
     gateway = LumiBotAlpacaPaperGateway(config=config)
     intent = OrderIntentPayload(
         intent_id="intent-1", recommendation_id="rec-1", symbol="AAPL", side="BUY", quantity=1,
-        order_type="MARKET", limit_price=None, reference_price="150.00",
+        order_type="LIMIT", limit_price="150.00", reference_price="150.00",
         expires_at="2099-01-01T00:00:00+00:00", idempotency_key="intent-1",
     )
     with pytest.raises(RuntimeOperationError) as exc:

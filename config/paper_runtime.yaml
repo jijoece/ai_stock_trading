@@ -9,7 +9,7 @@
 version: 1
 
 paper_runtime:
-  protocol_version: paper-runtime.v1
+  protocol_version: paper-runtime.v2
   transport: stdio
   command:
     - python3
@@ -21,14 +21,16 @@ paper_runtime:
 paper_broker:
   provider: alpaca
   mode: paper                 # only "paper" is implemented; anything else fails closed
+  environment: paper
+  base_url: https://paper-api.alpaca.markets
   real_money_enabled: false   # hard-coded off for this milestone
   asset_types:
     - equity
   allowed_sides:
     - BUY
+    - SELL
   allowed_order_types:
     - LIMIT
-    - MARKET
   allow_fractional: false
   allow_shorting: false
   allow_margin: false

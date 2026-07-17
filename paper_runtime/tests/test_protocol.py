@@ -34,7 +34,7 @@ def test_parse_valid_request():
 
 def test_rejects_unknown_protocol_version():
     with pytest.raises(RuntimeOperationError) as exc:
-        parse_request_line(json.dumps(_valid_request(protocol_version="paper-runtime.v2")))
+        parse_request_line(json.dumps(_valid_request(protocol_version="paper-runtime.v1")))
     assert exc.value.code == ErrorCode.UNKNOWN_PROTOCOL_VERSION
 
 
@@ -70,6 +70,12 @@ def test_rejects_non_dict_payload():
     with pytest.raises(RuntimeOperationError) as exc:
         parse_request_line(json.dumps(request))
     assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD
+
+
+def test_rejects_oversized_request():
+    with pytest.raises(RuntimeOperationError) as exc:
+        parse_request_line("{" + "x" * 70_000 + "}")
+    assert exc.value.code == ErrorCode.MALFORMED_REQUEST
 
 
 def test_success_response_echoes_request_id_and_operation():

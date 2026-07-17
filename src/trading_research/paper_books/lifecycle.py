@@ -181,6 +181,22 @@ def _process_pending_orders(
     pending = [o for o in repo.list_order_intents(conn, book_id) if o["status"] == INTENT_STATUS_PENDING_SUBMISSION]
     for row in pending:
         intent = _row_to_intent(row)
+        if cfg.external_broker.enabled and book_id in cfg.external_broker.enabled_book_ids:
+            repo.enqueue_external_submission(
+                conn,
+                queue_id="peqs_" + hashlib.sha256(
+                    f"{book_id}:{intent.paper_order_intent_id}:lifecycle".encode()
+                ).hexdigest()[:40],
+                book_id=book_id, paper_order_intent_id=intent.paper_order_intent_id,
+                source="RECURRING_LOCAL_PAPER", created_at=clock().isoformat(),
+            )
+            _save_symbol_result(
+                conn, lifecycle_run_id=lifecycle_run_id, book_id=book_id, symbol=intent.symbol,
+                stage=STAGE_PENDING_ORDER, outcome=PENDING_OUTCOME_STILL_PENDING,
+                reasons=("AWAITING_OPERATOR_EXTERNAL_SUBMISSION; lifecycle made no broker mutation",),
+                paper_order_intent_id=intent.paper_order_intent_id, clock=clock,
+            )
+            continue
         age_market_days = market_days_held(intent.created_at.date(), as_of.date())
         if age_market_days >= cfg.lifecycle.pending_orders.expire_after_market_days:
             execution.expire_pending_intent(conn, intent, clock())
@@ -339,6 +355,22 @@ def _evaluate_exits(
             notional_usd=notional, time_in_force="DAY", as_of=as_of, risk_decision_id=exit_decision_id,
             portfolio_snapshot_id=snap.snapshot_id, config_hash=cfg.config_hash, created_at=now,
         )
+        if cfg.external_broker.enabled and book_id in cfg.external_broker.enabled_book_ids:
+            repo.save_order_intent(conn, intent)
+            repo.enqueue_external_submission(
+                conn,
+                queue_id="peqs_" + hashlib.sha256(f"{book_id}:{intent_id}:exit".encode()).hexdigest()[:40],
+                book_id=book_id, paper_order_intent_id=intent_id,
+                source="RECURRING_LOCAL_PAPER", created_at=now.isoformat(),
+            )
+            orders_created += 1
+            _save_symbol_result(
+                conn, lifecycle_run_id=lifecycle_run_id, book_id=book_id, symbol=symbol, stage=STAGE_EXIT,
+                outcome=EXIT_OUTCOME_ORDER_CREATED,
+                reasons=("AWAITING_OPERATOR_EXTERNAL_SUBMISSION; lifecycle made no broker mutation",),
+                exit_decision_id=exit_decision_id, paper_order_intent_id=intent_id, clock=clock,
+            )
+            continue
         market_input = _build_market_simulation_input(price_selection)
         if market_input is None:
             repo.save_order_intent(conn, intent)

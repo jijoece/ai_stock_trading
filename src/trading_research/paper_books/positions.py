@@ -17,7 +17,8 @@ class InsufficientPositionError(RuntimeError):
 
 
 def apply_buy_fill(
-    conn, book_id: str, symbol: str, fill_id: str, quantity: Decimal, fill_price: Decimal, now: datetime
+    conn, book_id: str, symbol: str, fill_id: str, quantity: Decimal, fill_price: Decimal, now: datetime,
+    *, commit: bool = True,
 ) -> None:
     """Creates exactly one new lot (lot_id derived from fill_id, so a
     duplicate fill can never create a second lot) and updates the book's
@@ -34,7 +35,7 @@ def apply_buy_fill(
         "book_id": book_id, "lot_id": lot_id, "symbol": symbol, "opened_at": now,
         "quantity": quantity, "remaining_quantity": quantity, "cost_basis_usd": cost_basis_usd,
         "opening_fill_id": fill_id,
-    })
+    }, commit=commit)
 
     existing = repo.load_position(conn, book_id, symbol)
     if existing is None:
@@ -42,7 +43,7 @@ def apply_buy_fill(
             "quantity": quantity, "available_quantity": quantity, "reserved_quantity": Decimal("0"),
             "average_cost_usd": fill_price, "realized_pnl_usd": Decimal("0"), "fees_usd": Decimal("0"),
             "updated_at": now.isoformat(),
-        })
+        }, commit=commit)
     else:
         old_qty = Decimal(existing["quantity"])
         old_avg = Decimal(existing["average_cost_usd"])
@@ -53,11 +54,12 @@ def apply_buy_fill(
             "reserved_quantity": Decimal(existing["reserved_quantity"]), "average_cost_usd": new_avg,
             "realized_pnl_usd": Decimal(existing["realized_pnl_usd"]), "fees_usd": Decimal(existing["fees_usd"]),
             "updated_at": now.isoformat(),
-        })
+        }, commit=commit)
 
 
 def apply_sell_fill(
-    conn, book_id: str, symbol: str, fill_id: str, quantity: Decimal, fill_price: Decimal, now: datetime
+    conn, book_id: str, symbol: str, fill_id: str, quantity: Decimal, fill_price: Decimal, now: datetime,
+    *, commit: bool = True,
 ) -> Decimal:
     """Consumes open lots oldest-first (FIFO). Returns the realized P&L
     (price-basis only; fees/slippage are tracked separately in the cash
@@ -85,7 +87,8 @@ def apply_sell_fill(
         realized_pnl += (fill_price - cost_per_share) * consumed
         new_remaining = lot_remaining - consumed
         repo.update_lot_remaining(
-            conn, book_id, lot["lot_id"], new_remaining, closed_at=now if new_remaining == 0 else None
+            conn, book_id, lot["lot_id"], new_remaining,
+            closed_at=now if new_remaining == 0 else None, commit=commit,
         )
         remaining_to_sell -= consumed
 
@@ -97,7 +100,7 @@ def apply_sell_fill(
         "reserved_quantity": Decimal(existing["reserved_quantity"]),
         "average_cost_usd": Decimal(existing["average_cost_usd"]) if new_qty > 0 else Decimal("0"),
         "realized_pnl_usd": new_realized, "fees_usd": Decimal(existing["fees_usd"]), "updated_at": now.isoformat(),
-    })
+    }, commit=commit)
     return realized_pnl
 
 

@@ -1,5 +1,5 @@
 """Framework-neutral payload models for the isolated runtime side of the
-paper-runtime.v1 protocol (docs/milestone-4.md Step 3).
+paper-runtime.v2 protocol (docs/milestone-11-alpaca-paper-boundary.md).
 
 These are plain dataclasses over JSON-safe primitives (str/int/bool/None) —
 Decimals and datetimes cross the wire as strings, never as Python objects.
@@ -14,8 +14,8 @@ from decimal import Decimal, InvalidOperation
 
 from .errors import ErrorCode, RuntimeOperationError
 
-ORDER_TYPES = ("MARKET", "LIMIT")
-SIDES = ("BUY",)
+ORDER_TYPES = ("LIMIT",)
+SIDES = ("BUY", "SELL")
 ASSET_TYPES = ("equity",)
 
 # Runtime-side submission/order states (docs/milestone-4.md Step 8).
@@ -26,6 +26,7 @@ SUBMISSION_STATES = (
     "ACCEPTED",
     "PARTIALLY_FILLED",
     "FILLED",
+    "CANCEL_REQUESTED",
     "CANCELLED",
     "REJECTED",
     "ERROR",
@@ -81,6 +82,10 @@ class OrderIntentPayload:
         missing = required - set(data.keys())
         if missing:
             raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"submit_order payload missing: {sorted(missing)}")
+        allowed = required | {"asset_type", "book_id"}
+        extra = set(data.keys()) - allowed
+        if extra:
+            raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"submit_order payload has unexpected fields: {sorted(extra)}")
         return cls(
             intent_id=data["intent_id"], recommendation_id=data["recommendation_id"], symbol=data["symbol"],
             side=data["side"], quantity=data["quantity"], order_type=data["order_type"],
@@ -103,12 +108,9 @@ class OrderIntentPayload:
         _require(self.order_type in ORDER_TYPES, f"order_type must be one of {ORDER_TYPES} — got {self.order_type!r}")
         reference_price = _parse_decimal(self.reference_price, "reference_price")
         _require(reference_price > 0, "reference_price must be positive")
-        if self.order_type == "LIMIT":
-            _require(self.limit_price is not None, "LIMIT orders require limit_price")
-            limit_price = _parse_decimal(self.limit_price, "limit_price")
-            _require(limit_price > 0, "limit_price must be positive")
-        else:
-            _require(self.limit_price is None, "MARKET orders must not carry a limit_price")
+        _require(self.limit_price is not None, "LIMIT orders require limit_price")
+        limit_price = _parse_decimal(self.limit_price, "limit_price")
+        _require(limit_price > 0, "limit_price must be positive")
         expires_at = _parse_dt(self.expires_at, "expires_at")
         _require(now < expires_at, f"intent expired at {expires_at.isoformat()} (now={now.isoformat()})")
 
@@ -125,6 +127,12 @@ class OrderSnapshotPayload:
     average_fill_price: str | None
     submitted_at: str
     updated_at: str
+    book_id: str | None = None
+    symbol: str | None = None
+    side: str | None = None
+    limit_price: str | None = None
+    time_in_force: str = "DAY"
+    account_fingerprint: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -133,6 +141,32 @@ class OrderSnapshotPayload:
             "raw_broker_status": self.raw_broker_status, "quantity": self.quantity,
             "filled_quantity": self.filled_quantity, "average_fill_price": self.average_fill_price,
             "submitted_at": self.submitted_at, "updated_at": self.updated_at,
+            "book_id": self.book_id, "symbol": self.symbol, "side": self.side,
+            "limit_price": self.limit_price, "time_in_force": self.time_in_force,
+            "account_fingerprint": self.account_fingerprint,
+        }
+
+
+@dataclass(frozen=True)
+class FillPayload:
+    fill_id: str
+    broker_order_id: str
+    client_order_id: str
+    book_id: str
+    symbol: str
+    side: str
+    quantity: str
+    price: str
+    filled_at: str
+    account_fingerprint: str
+
+    def to_dict(self) -> dict:
+        return {
+            "fill_id": self.fill_id, "broker_order_id": self.broker_order_id,
+            "client_order_id": self.client_order_id, "book_id": self.book_id,
+            "symbol": self.symbol, "side": self.side, "quantity": self.quantity,
+            "price": self.price, "filled_at": self.filled_at,
+            "account_fingerprint": self.account_fingerprint,
         }
 
 

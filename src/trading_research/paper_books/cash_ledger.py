@@ -83,72 +83,80 @@ def available_cash(conn, book_id: str) -> Decimal:
     return settled_cash(conn, book_id) - reserved_cash(conn, book_id)
 
 
-def reserve_for_order(conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime) -> bool:
+def reserve_for_order(
+    conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime,
+    *, commit: bool = True,
+) -> bool:
+    idem = f"reserve:{paper_order_intent_id}"
+    if repo.cash_ledger_entry_exists(conn, book_id, idem):
+        return False
     if notional_usd > available_cash(conn, book_id):
         raise InsufficientCashError(
             f"book {book_id}: cannot reserve {notional_usd} — only {available_cash(conn, book_id)} available"
         )
-    idem = f"reserve:{paper_order_intent_id}"
     entry = CashLedgerEntry(
         book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_BUY_RESERVATION,
         amount_usd=notional_usd, event_timestamp=now, idempotency_key=idem, reference_id=paper_order_intent_id,
     )
-    return repo.save_cash_ledger_entry(conn, entry)
+    return repo.save_cash_ledger_entry(conn, entry, commit=commit)
 
 
 def release_reservation(
-    conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime, *, reason: str = "released"
+    conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime,
+    *, reason: str = "released", commit: bool = True,
 ) -> bool:
     idem = f"release:{paper_order_intent_id}:{reason}"
     entry = CashLedgerEntry(
         book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_ORDER_RELEASE,
         amount_usd=-notional_usd, event_timestamp=now, idempotency_key=idem, reference_id=paper_order_intent_id,
     )
-    return repo.save_cash_ledger_entry(conn, entry)
+    return repo.save_cash_ledger_entry(conn, entry, commit=commit)
 
 
 def settle_buy(
-    conn, book_id: str, fill_id: str, cost_usd: Decimal, fees_usd: Decimal, slippage_usd: Decimal, now: datetime
+    conn, book_id: str, fill_id: str, cost_usd: Decimal, fees_usd: Decimal, slippage_usd: Decimal,
+    now: datetime, *, commit: bool = True,
 ) -> None:
     idem = f"settle:{fill_id}"
     repo.save_cash_ledger_entry(conn, CashLedgerEntry(
         book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_BUY_SETTLEMENT,
         amount_usd=-cost_usd, event_timestamp=now, idempotency_key=idem, reference_id=fill_id,
-    ))
+    ), commit=commit)
     if fees_usd:
         fee_idem = f"fee:{fill_id}"
         repo.save_cash_ledger_entry(conn, CashLedgerEntry(
             book_id=book_id, ledger_entry_id=fee_idem, event_type=CASH_EVENT_FEE,
             amount_usd=-fees_usd, event_timestamp=now, idempotency_key=fee_idem, reference_id=fill_id,
-        ))
+        ), commit=commit)
     if slippage_usd:
         slip_idem = f"slippage:{fill_id}"
         repo.save_cash_ledger_entry(conn, CashLedgerEntry(
             book_id=book_id, ledger_entry_id=slip_idem, event_type=CASH_EVENT_SLIPPAGE,
             amount_usd=-slippage_usd, event_timestamp=now, idempotency_key=slip_idem, reference_id=fill_id,
-        ))
+        ), commit=commit)
 
 
 def settle_sell(
-    conn, book_id: str, fill_id: str, proceeds_usd: Decimal, fees_usd: Decimal, slippage_usd: Decimal, now: datetime
+    conn, book_id: str, fill_id: str, proceeds_usd: Decimal, fees_usd: Decimal, slippage_usd: Decimal,
+    now: datetime, *, commit: bool = True,
 ) -> None:
     idem = f"settle:{fill_id}"
     repo.save_cash_ledger_entry(conn, CashLedgerEntry(
         book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_SELL_SETTLEMENT,
         amount_usd=proceeds_usd, event_timestamp=now, idempotency_key=idem, reference_id=fill_id,
-    ))
+    ), commit=commit)
     if fees_usd:
         fee_idem = f"fee:{fill_id}"
         repo.save_cash_ledger_entry(conn, CashLedgerEntry(
             book_id=book_id, ledger_entry_id=fee_idem, event_type=CASH_EVENT_FEE,
             amount_usd=-fees_usd, event_timestamp=now, idempotency_key=fee_idem, reference_id=fill_id,
-        ))
+        ), commit=commit)
     if slippage_usd:
         slip_idem = f"slippage:{fill_id}"
         repo.save_cash_ledger_entry(conn, CashLedgerEntry(
             book_id=book_id, ledger_entry_id=slip_idem, event_type=CASH_EVENT_SLIPPAGE,
             amount_usd=-slippage_usd, event_timestamp=now, idempotency_key=slip_idem, reference_id=fill_id,
-        ))
+        ), commit=commit)
 
 
 def credit_dividend(conn, book_id: str, action_id: str, symbol: str, amount_usd: Decimal, now: datetime) -> bool:

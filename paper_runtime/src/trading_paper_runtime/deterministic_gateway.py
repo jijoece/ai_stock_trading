@@ -14,9 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+import hashlib
 
 from .errors import ErrorCode, RuntimeOperationError
-from .models import AccountSnapshotPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
+from .models import AccountSnapshotPayload, FillPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
 
 
 def _now_iso() -> str:
@@ -39,14 +40,19 @@ class DeterministicBrokerGateway:
 
     _orders: dict[str, OrderSnapshotPayload] = field(default_factory=dict)
     _order_symbol: dict[str, str] = field(default_factory=dict)
+    _order_side: dict[str, str] = field(default_factory=dict)
     _intent_fingerprint: dict[str, tuple] = field(default_factory=dict)
     _scripts: dict[str, _ScriptedOutcome] = field(default_factory=dict)
     _positions: dict[str, PositionSnapshotPayload] = field(default_factory=dict)
-    _applied_fill_orders: set = field(default_factory=set)
+    _fills: dict[str, list[FillPayload]] = field(default_factory=dict)
+    _cash: Decimal | None = None
     submit_calls: list = field(default_factory=list)
 
     def is_paper_mode_verified(self) -> bool:
         return True
+
+    def account_fingerprint(self) -> str:
+        return "acct_" + hashlib.sha256(b"deterministic-alpaca-paper-account").hexdigest()[:32]
 
     def script_fill(
         self, client_order_id: str, *, status: str, filled_quantity: int,
@@ -78,9 +84,12 @@ class DeterministicBrokerGateway:
             broker_order_id=f"det-broker-{intent.idempotency_key}", status="ACCEPTED",
             raw_broker_status="new", quantity=intent.quantity, filled_quantity=0,
             average_fill_price=None, submitted_at=now, updated_at=now,
+            book_id=intent.book_id, symbol=intent.symbol, side=intent.side,
+            limit_price=intent.limit_price, account_fingerprint=self.account_fingerprint(),
         )
         self._orders[intent.idempotency_key] = snapshot
         self._order_symbol[intent.idempotency_key] = intent.symbol
+        self._order_side[intent.idempotency_key] = intent.side
         self._intent_fingerprint[intent.idempotency_key] = fingerprint
         return snapshot
 
@@ -97,19 +106,47 @@ class DeterministicBrokerGateway:
             raw_broker_status=script.raw_broker_status, quantity=existing.quantity,
             filled_quantity=script.filled_quantity, average_fill_price=script.average_fill_price,
             submitted_at=existing.submitted_at, updated_at=_now_iso(),
+            book_id=existing.book_id, symbol=existing.symbol, side=existing.side,
+            limit_price=existing.limit_price, time_in_force=existing.time_in_force,
+            account_fingerprint=self.account_fingerprint(),
         )
-        already_applied = client_order_id in self._applied_fill_orders
+        delta = updated.filled_quantity - existing.filled_quantity
         self._orders[client_order_id] = updated
-        if updated.filled_quantity > 0 and updated.average_fill_price and not already_applied:
+        if delta > 0 and updated.average_fill_price:
             symbol = self._order_symbol[client_order_id]
-            self._apply_position(symbol, updated.filled_quantity, updated.average_fill_price)
-            self._applied_fill_orders.add(client_order_id)
+            side = self._order_side[client_order_id]
+            self._apply_position(symbol, side, delta, updated.average_fill_price)
+            broker_id = updated.broker_order_id or client_order_id
+            fill = FillPayload(
+                fill_id=f"det-fill-{client_order_id}-{updated.filled_quantity}",
+                broker_order_id=broker_id, client_order_id=client_order_id,
+                book_id=updated.book_id or "", symbol=symbol, side=side,
+                quantity=str(delta), price=updated.average_fill_price,
+                filled_at=updated.updated_at, account_fingerprint=self.account_fingerprint(),
+            )
+            self._fills.setdefault(client_order_id, []).append(fill)
         return updated
 
-    def _apply_position(self, symbol: str, qty: int, price: str) -> None:
+    def _apply_position(self, symbol: str, side: str, qty: int, price: str) -> None:
         # Minimal long-only average-cost position model, for reconciliation
         # tests only — not a general ledger.
         existing = self._positions.get(symbol)
+        self._cash = Decimal(self.starting_cash) if self._cash is None else self._cash
+        value = Decimal(price) * qty
+        if side == "SELL":
+            if existing is None or Decimal(existing.quantity) < qty:
+                raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "sell exceeds confirmed long position")
+            new_qty = Decimal(existing.quantity) - qty
+            self._cash += value
+            if new_qty == 0:
+                self._positions.pop(symbol, None)
+            else:
+                self._positions[symbol] = PositionSnapshotPayload(
+                    symbol=symbol, quantity=str(new_qty), average_entry_price=existing.average_entry_price,
+                    market_value=str(new_qty * Decimal(existing.average_entry_price)), as_of=_now_iso(),
+                )
+            return
+        self._cash -= value
         if existing is None:
             self._positions[symbol] = PositionSnapshotPayload(
                 symbol=symbol, quantity=str(qty), average_entry_price=price,
@@ -125,6 +162,13 @@ class DeterministicBrokerGateway:
             market_value=str(new_qty * new_avg), as_of=_now_iso(),
         )
 
+    def get_order_by_broker_id(self, broker_order_id: str) -> OrderSnapshotPayload | None:
+        return next((order for order in self._orders.values() if order.broker_order_id == broker_order_id), None)
+
+    def list_order_fills(self, client_order_id: str) -> list[FillPayload]:
+        self.get_order(client_order_id)
+        return list(self._fills.get(client_order_id, ()))
+
     def list_open_orders(self) -> list[OrderSnapshotPayload]:
         return [
             self.get_order(coid) for coid, o in list(self._orders.items())
@@ -136,7 +180,7 @@ class DeterministicBrokerGateway:
         return [self.get_order(o.client_order_id) for o in ordered[:limit]]
 
     def get_account(self) -> AccountSnapshotPayload:
-        cash = Decimal(self.starting_cash)
+        cash = Decimal(self.starting_cash) if self._cash is None else self._cash
         return AccountSnapshotPayload(
             cash=str(cash), equity=str(cash), buying_power=str(cash), currency="USD", as_of=_now_iso(),
         )
@@ -156,6 +200,9 @@ class DeterministicBrokerGateway:
             raw_broker_status="canceled", quantity=existing.quantity,
             filled_quantity=existing.filled_quantity, average_fill_price=existing.average_fill_price,
             submitted_at=existing.submitted_at, updated_at=_now_iso(),
+            book_id=existing.book_id, symbol=existing.symbol, side=existing.side,
+            limit_price=existing.limit_price, time_in_force=existing.time_in_force,
+            account_fingerprint=self.account_fingerprint(),
         )
         self._orders[client_order_id] = updated
         self._scripts.pop(client_order_id, None)

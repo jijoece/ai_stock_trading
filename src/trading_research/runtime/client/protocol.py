@@ -1,4 +1,4 @@
-"""Main-process side of the paper-runtime.v1 envelope contract
+"""Main-process side of the paper-runtime.v2 envelope contract
 (docs/milestone-4.md Step 2/6).
 
 Independently implemented from `paper_runtime.protocol` — see that module's
@@ -18,6 +18,7 @@ from .errors import ProtocolViolationError
 _RESPONSE_REQUIRED_FIELDS = frozenset(
     {"protocol_version", "request_id", "operation", "runtime_version", "success", "retryable", "error", "payload"}
 )
+MAX_RESPONSE_BYTES = 65_536
 
 
 def new_request_id() -> str:
@@ -44,6 +45,8 @@ def parse_response_line(raw_line: str, *, expected_request_id: str, expected_ope
     a request_id/operation that doesn't match what was sent (docs/milestone-
     4.md: "reject ... responses with mismatched request IDs" / "responses
     that do not match the requested operation")."""
+    if not isinstance(raw_line, str) or len(raw_line.encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise ProtocolViolationError("runtime response exceeds 65536-byte limit")
     try:
         data = json.loads(raw_line)
     except (json.JSONDecodeError, TypeError) as exc:

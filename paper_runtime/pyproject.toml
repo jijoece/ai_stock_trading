@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "trading-paper-runtime"
 version = "0.1.0"
-description = "Isolated LumiBot/Alpaca paper-broker runtime process (Milestone 4). Speaks paper-runtime.v1 JSON Lines over stdin/stdout to the main trading-desk process; never imported by it."
+description = "Isolated LumiBot/Alpaca paper-broker runtime process. Speaks paper-runtime.v2 JSON Lines over stdin/stdout to the main trading-desk process; never imported by it."
 requires-python = ">=3.10"
 dependencies = [
     "lumibot==4.5.74",

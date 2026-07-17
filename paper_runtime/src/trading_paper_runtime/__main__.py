@@ -6,7 +6,7 @@ import sys
 # imports `lumibot` at module scope to read its `__version__` for `health`,
 # and LumiBot itself prints an unguarded startup banner directly to stdout
 # the moment it is imported (confirmed via manual smoke test: "LumiBot
-# v4.5.74 starting"). stdout is reserved exclusively for paper-runtime.v1
+# v4.5.74 starting"). stdout is reserved exclusively for paper-runtime.v2
 # JSON Lines responses, so the *real* stdout is captured here, before any
 # other import runs, and handed to `run()` explicitly — `sys.stdout` itself
 # is then redirected to stderr so no later import or log call can pollute

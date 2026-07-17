@@ -51,6 +51,9 @@ def test_shipped_config_loads_and_is_disabled_by_default():
     assert cfg.execution.allow_external_paper_broker is False
     assert cfg.soak_campaign.enabled is False
     assert cfg.recurring.enabled is False
+    assert cfg.external_broker.enabled is False
+    assert cfg.external_broker.allow_order_submission is False
+    assert cfg.external_broker.enabled_book_ids == ()
 
 
 def test_valid_config_round_trips(tmp_path):
@@ -123,6 +126,55 @@ def test_external_paper_broker_provider_requires_explicit_allow(tmp_path):
     path = _write(tmp_path, data)
     with pytest.raises(PaperBooksConfigError):
         load_paper_books_config(path)
+
+
+def test_external_broker_strict_boolean_and_single_book_isolation(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["external_broker"] = {
+        "enabled": "true", "provider": "alpaca_paper", "allow_order_submission": False,
+        "enabled_book_ids": [], "require_explicit_preview": True,
+        "require_recent_preview_seconds": 300, "maximum_order_notional_usd": "50",
+        "permitted_order_types": ["limit"], "permitted_time_in_force": ["day"],
+    }
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+    data["paper_books"]["external_broker"]["enabled"] = True
+    data["paper_books"]["external_broker"]["allow_order_submission"] = True
+    data["paper_books"]["external_broker"]["enabled_book_ids"] = ["BASELINE", "ENHANCED"]
+    with pytest.raises(PaperBooksConfigError, match="at most one book"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_external_broker_requires_exactly_one_book_and_preview_when_enabled(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["external_broker"] = {
+        "enabled": True, "provider": "alpaca_paper", "allow_order_submission": False,
+        "enabled_book_ids": [], "require_explicit_preview": True,
+        "require_recent_preview_seconds": 300, "maximum_order_notional_usd": "50",
+        "permitted_order_types": ["limit"], "permitted_time_in_force": ["day"],
+    }
+    with pytest.raises(PaperBooksConfigError, match="exactly one"):
+        load_paper_books_config(_write(tmp_path, data))
+
+    data["paper_books"]["external_broker"]["enabled_book_ids"] = ["BASELINE"]
+    data["paper_books"]["external_broker"]["require_explicit_preview"] = False
+    with pytest.raises(PaperBooksConfigError, match="must be true"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_external_broker_keeps_legacy_recurring_execution_disconnected(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["external_broker"] = {
+        "enabled": True, "provider": "alpaca_paper", "allow_order_submission": False,
+        "enabled_book_ids": ["BASELINE"], "require_explicit_preview": True,
+        "require_recent_preview_seconds": 300, "maximum_order_notional_usd": "50",
+        "permitted_order_types": ["limit"], "permitted_time_in_force": ["day"],
+    }
+    data["paper_books"]["execution"]["provider"] = "external_paper_broker"
+    data["paper_books"]["execution"]["allow_external_paper_broker"] = True
+    with pytest.raises(PaperBooksConfigError, match="recurring execution stays disconnected"):
+        load_paper_books_config(_write(tmp_path, data))
 
 
 def test_negative_starting_cash_fails_closed(tmp_path):

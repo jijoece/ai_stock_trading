@@ -1,9 +1,9 @@
 """Real market-data client against Alpaca's data plane (docs/milestone-6.md
-Step 7). Reuses the same `ALPACA_API_KEY`/`ALPACA_API_SECRET` credentials the
-isolated paper-broker runtime uses (Milestone 4) — but this client calls
-`data.alpaca.markets` directly over HTTPS from the *main* process. It does
-**not** import LumiBot or alpaca-py, so the Milestone 3/4 process-isolation
-invariant ("main application does not import LumiBot") is unaffected.
+Step 7). Uses the separate `ALPACA_MARKET_DATA_API_KEY` /
+`ALPACA_MARKET_DATA_API_SECRET` credential names and calls
+`data.alpaca.markets` directly over HTTPS from the *main* process. Paper-order
+credentials remain exclusive to the isolated runtime. This client does not
+import LumiBot or alpaca-py.
 
 Adjustment is always explicit: `adjustment="raw"` (default) returns
 unadjusted OHLCV and is recorded as `PriceBar.adjusted=False`;
@@ -49,7 +49,8 @@ class AlpacaMarketDataClient:
         with a higher-tier subscription explicitly overrides it."""
         if not api_key or not api_secret:
             raise ProviderConfigurationError(
-                "AlpacaMarketDataClient requires ALPACA_API_KEY and ALPACA_API_SECRET"
+                "AlpacaMarketDataClient requires ALPACA_MARKET_DATA_API_KEY and "
+                "ALPACA_MARKET_DATA_API_SECRET"
             )
         if feed not in ("iex", "sip"):
             raise ProviderConfigurationError(f"unknown feed {feed!r} — fails closed")

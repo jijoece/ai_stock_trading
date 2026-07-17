@@ -20,6 +20,7 @@ import pytest
 
 from trading_research.paper_books.config import (
     ExecutionSection,
+    ExternalBrokerSection,
     PaperBookDefinition,
     PaperBooksConfiguration,
     RiskSection,
@@ -30,6 +31,7 @@ from trading_research.paper_books.scheduled_integration import (
     MARKET_SIMULATION_SOURCE_OBSERVED,
     MARKET_SIMULATION_SOURCE_SIMULATED,
     OUTCOME_EXECUTED,
+    OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION,
     OUTCOME_INTENT_CREATED_PENDING_FILL,
     OUTCOME_REJECTED_BY_RISK,
     OUTCOME_SKIPPED_BOOK_DISABLED,
@@ -77,6 +79,7 @@ def _config(
     *, enabled=True, scheduled_integration_enabled=True, baseline_enabled=True, enhanced_enabled=True,
     baseline_cash=Decimal("100000.00"), enhanced_cash=Decimal("100000.00"),
     max_position_weight=Decimal("0.50"), max_order_notional_usd=Decimal("100000.00"),
+    external_book_ids=(),
 ) -> PaperBooksConfiguration:
     return PaperBooksConfiguration(
         version=1, enabled=enabled,
@@ -91,6 +94,10 @@ def _config(
         ),
         valuation=ValuationSection(price_source="evidence_snapshot", maximum_price_age_seconds=900, missing_price_policy="MARK_UNVALUED"),
         scheduled_integration=ScheduledIntegrationSection(enabled=scheduled_integration_enabled),
+        external_broker=ExternalBrokerSection(
+            bool(external_book_ids), "alpaca_paper", bool(external_book_ids), tuple(external_book_ids), True, 300,
+            Decimal("100000.00"), ("limit",), ("day",), 1,
+        ),
         config_hash="test-config-hash", raw={},
     )
 
@@ -242,6 +249,24 @@ def test_baseline_and_enhanced_recommendations_found(conn):
     assert outcomes["ENHANCED"].recommendation_id == "rec-e2"
     assert outcomes["BASELINE"].outcome in (OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL)
     assert outcomes["ENHANCED"].outcome in (OUTCOME_EXECUTED, OUTCOME_INTENT_CREATED_PENDING_FILL)
+
+
+def test_external_enabled_book_is_queued_without_local_fill_or_runtime_mutation(conn):
+    _setup_cycle(
+        conn, cycle_id="external-queue", symbol="AAPL",
+        baseline_payload=_rec_payload("rec-external", "AAPL"), enhanced_payload=None,
+    )
+    result = integrate_scheduled_cycle_into_paper_books(
+        conn, cycle_id="external-queue", experiment_policy="BASELINE_ONLY",
+        paper_books_config=_config(external_book_ids=("BASELINE",)), clock=lambda: AS_OF,
+    )
+    outcome = _outcomes_by_arm(result)["BASELINE"]
+    assert outcome.outcome == OUTCOME_AWAITING_OPERATOR_EXTERNAL_SUBMISSION
+    assert conn.execute("SELECT COUNT(*) FROM paper_book_fills WHERE book_id='BASELINE'").fetchone()[0] == 0
+    queued = conn.execute(
+        "SELECT status FROM paper_external_submission_queue WHERE book_id='BASELINE'"
+    ).fetchone()
+    assert queued["status"] == "AWAITING_OPERATOR_EXTERNAL_SUBMISSION"
 
 
 def test_missing_baseline_recommendation(conn):

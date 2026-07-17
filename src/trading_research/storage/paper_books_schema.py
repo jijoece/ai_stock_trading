@@ -597,6 +597,101 @@ CREATE TABLE IF NOT EXISTS paper_recurring_scheduler_runs (
     created_at TEXT NOT NULL,
     UNIQUE (intended_schedule_id)
 );
+
+-- Milestone 11: immutable manual external-paper evidence. None of these
+-- tables contains credentials, authorization headers, raw account IDs, or
+-- broker response bodies.
+CREATE TABLE IF NOT EXISTS paper_external_order_previews (
+    preview_id TEXT PRIMARY KEY,
+    paper_order_intent_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    client_order_id TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    previewed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    result TEXT NOT NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    config_hash TEXT NOT NULL,
+    policy_version TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_order_events (
+    external_order_event_id TEXT PRIMARY KEY,
+    external_order_scope_id TEXT NOT NULL,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    broker_order_id TEXT,
+    account_fingerprint TEXT NOT NULL,
+    previous_state TEXT NOT NULL,
+    new_state TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    limit_price TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    runtime_request_id TEXT,
+    error_code TEXT,
+    created_at TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_broker_fills (
+    external_fill_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    broker_order_id TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    price TEXT NOT NULL,
+    filled_at TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_order_lookups (
+    lookup_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT NOT NULL,
+    client_order_id TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    result TEXT NOT NULL,
+    authoritative INTEGER NOT NULL,
+    runtime_request_id TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT,
+    client_order_id TEXT,
+    account_fingerprint TEXT,
+    status TEXT NOT NULL,
+    statuses_json TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    critical INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_submission_queue (
+    queue_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (book_id, paper_order_intent_id)
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -646,6 +741,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_recurring_queue_active_cycle
     WHERE status IN ('QUEUED', 'CLAIMED');
 CREATE INDEX IF NOT EXISTS idx_paper_recurring_runs_schedule
     ON paper_recurring_scheduler_runs(intended_schedule_id, status);
+CREATE INDEX IF NOT EXISTS idx_paper_external_events_client
+    ON paper_external_order_events(book_id, client_order_id, created_at, external_order_event_id);
+CREATE INDEX IF NOT EXISTS idx_paper_external_previews_intent
+    ON paper_external_order_previews(book_id, paper_order_intent_id, previewed_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_fills_order
+    ON paper_external_broker_fills(book_id, client_order_id, filled_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_reconciliations_order
+    ON paper_external_reconciliations(book_id, client_order_id, created_at);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -856,6 +959,40 @@ BEGIN SELECT RAISE(ABORT, 'terminal paper recurring scheduler runs are immutable
 CREATE TRIGGER IF NOT EXISTS trg_paper_recurring_scheduler_runs_no_delete
 BEFORE DELETE ON paper_recurring_scheduler_runs
 BEGIN SELECT RAISE(ABORT, 'paper recurring scheduler runs are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_previews_no_update
+BEFORE UPDATE ON paper_external_order_previews
+BEGIN SELECT RAISE(ABORT, 'paper external previews are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_previews_no_delete
+BEFORE DELETE ON paper_external_order_previews
+BEGIN SELECT RAISE(ABORT, 'paper external previews are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_events_no_update
+BEFORE UPDATE ON paper_external_order_events
+BEGIN SELECT RAISE(ABORT, 'paper external order events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_events_no_delete
+BEFORE DELETE ON paper_external_order_events
+BEGIN SELECT RAISE(ABORT, 'paper external order events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_fills_no_update
+BEFORE UPDATE ON paper_external_broker_fills
+BEGIN SELECT RAISE(ABORT, 'paper external broker fills are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_fills_no_delete
+BEFORE DELETE ON paper_external_broker_fills
+BEGIN SELECT RAISE(ABORT, 'paper external broker fills are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_update
+BEFORE UPDATE ON paper_external_order_lookups
+BEGIN SELECT RAISE(ABORT, 'paper external order lookups are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_delete
+BEFORE DELETE ON paper_external_order_lookups
+BEGIN SELECT RAISE(ABORT, 'paper external order lookups are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_reconciliations_no_update
+BEFORE UPDATE ON paper_external_reconciliations
+BEGIN SELECT RAISE(ABORT, 'paper external reconciliations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_reconciliations_no_delete
+BEFORE DELETE ON paper_external_reconciliations
+BEGIN SELECT RAISE(ABORT, 'paper external reconciliations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_queue_no_delete
+BEFORE DELETE ON paper_external_submission_queue
+BEGIN SELECT RAISE(ABORT, 'paper external submission queue is auditable'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing

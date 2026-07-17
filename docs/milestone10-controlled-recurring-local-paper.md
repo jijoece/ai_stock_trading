@@ -1083,6 +1083,19 @@ Milestone 10 is complete when:
 
 ---
 
+## Milestone 11 external-paper boundary
+
+Milestone 10 remains a local-simulation scheduler. When Milestone 11 marks a
+book as externally enabled, scheduled integration persists its approved intent
+in `paper_external_submission_queue` with
+`AWAITING_OPERATOR_EXTERNAL_SUBMISSION`. The scheduler and lifecycle never
+invoke `SUBMIT_LIMIT_ORDER` or `CANCEL_ORDER`. A human must later run the
+separate external account check, preview, and submit commands. This preserves
+the activation, queue, lease, and scheduler-run evidence described above while
+preventing automatic Alpaca paper-account mutation.
+
+---
+
 # Final response
 
 Keep the final response concise.

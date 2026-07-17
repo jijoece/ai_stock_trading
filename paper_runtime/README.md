@@ -5,11 +5,11 @@ trading-desk environment. It owns the LumiBot dependency tree and the only
 credentialed connection to a paper broker (Alpaca paper by default). The
 main process (`trading_research`) never imports anything from this package
 and never imports `lumibot` — it talks to this process over a small,
-versioned JSON Lines protocol on stdin/stdout (`paper-runtime.v1`).
+versioned JSON Lines protocol on stdin/stdout (`paper-runtime.v2`).
 
-See `docs/milestone4-isolated-paper-broker.md` and
-`docs/adr/0002-isolated-lumibot-runtime.md` in the main repository for the
-full design.
+See `docs/milestone4-isolated-paper-broker.md`,
+`docs/milestone11-isolated-alpaca-paper-broker.md`, and the associated ADRs
+in the main repository for the full design.
 
 ## Install (isolated environment)
 
@@ -40,6 +40,9 @@ load) — see the main repo's `.env.example`:
   `cancel_paper_order`. `health` and `capabilities` still respond (with
   boolean credential-presence flags only) even when credentials are
   missing or invalid, so the main process can detect the condition.
+* `ALPACA_BASE_URL` — optional assertion; if present it must be exactly
+  `https://paper-api.alpaca.markets`. Live, HTTP, localhost, and proxy URLs
+  fail closed.
 
 ## Offline testing
 

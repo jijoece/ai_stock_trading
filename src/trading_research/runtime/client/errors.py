@@ -37,7 +37,7 @@ class RuntimeRequestTimeoutError(RuntimeClientError):
 
 
 class ProtocolViolationError(RuntimeClientError):
-    """The runtime's response violated the paper-runtime.v1 contract: non-JSON
+    """The runtime's response violated the paper-runtime.v2 contract: non-JSON
     stdout, an unknown protocol_version, a mismatched request_id/operation,
     or a malformed envelope shape. The client must reject these outright
     rather than attempt best-effort recovery."""
