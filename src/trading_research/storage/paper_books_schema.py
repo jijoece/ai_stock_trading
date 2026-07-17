@@ -637,7 +637,8 @@ CREATE TABLE IF NOT EXISTS paper_external_order_events (
     created_at TEXT NOT NULL,
     policy_version TEXT NOT NULL,
     config_hash TEXT NOT NULL,
-    attempt_number INTEGER NOT NULL DEFAULT 0
+    attempt_number INTEGER NOT NULL DEFAULT 0,
+    scope_sequence INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS paper_external_broker_fills (
@@ -665,7 +666,13 @@ CREATE TABLE IF NOT EXISTS paper_external_order_lookups (
     result TEXT NOT NULL,
     authoritative INTEGER NOT NULL,
     runtime_request_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    attempt_number INTEGER,
+    ambiguous_event_id TEXT,
+    payload_hash TEXT,
+    lookup_started_at TEXT,
+    lookup_completed_at TEXT,
+    consumed_by_retry_event_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_external_reconciliations (
@@ -691,6 +698,35 @@ CREATE TABLE IF NOT EXISTS paper_external_submission_queue (
     source TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE (book_id, paper_order_intent_id)
+);
+
+-- Milestone 11.1: append-only share-reservation evidence for external
+-- closing SELL orders (Part 3). paper_book_positions.reserved_quantity is
+-- the derived running total; these rows are the audit trail behind it.
+CREATE TABLE IF NOT EXISTS paper_external_position_reservation_events (
+    reservation_event_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    paper_order_intent_id TEXT NOT NULL,
+    client_order_id TEXT,
+    quantity TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    operator TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_external_order_leases (
+    lease_key TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    client_order_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    status TEXT NOT NULL
 );
 """
 
@@ -743,12 +779,25 @@ CREATE INDEX IF NOT EXISTS idx_paper_recurring_runs_schedule
     ON paper_recurring_scheduler_runs(intended_schedule_id, status);
 CREATE INDEX IF NOT EXISTS idx_paper_external_events_client
     ON paper_external_order_events(book_id, client_order_id, created_at, external_order_event_id);
+-- Part 7: no two events may claim the same previous_state as concurrent
+-- children -- a monotonic per-scope sequence number with this uniqueness
+-- constraint rejects a forked chain at the database level even if the
+-- order-scope lease (Part 6) were somehow bypassed. NULLs (pre-upgrade rows)
+-- are not compared for uniqueness by SQLite, so this is safe on upgrade.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_paper_external_events_scope_sequence
+    ON paper_external_order_events(book_id, client_order_id, scope_sequence);
 CREATE INDEX IF NOT EXISTS idx_paper_external_previews_intent
     ON paper_external_order_previews(book_id, paper_order_intent_id, previewed_at);
 CREATE INDEX IF NOT EXISTS idx_paper_external_fills_order
     ON paper_external_broker_fills(book_id, client_order_id, filled_at);
 CREATE INDEX IF NOT EXISTS idx_paper_external_reconciliations_order
     ON paper_external_reconciliations(book_id, client_order_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_reservation_events_intent
+    ON paper_external_position_reservation_events(book_id, paper_order_intent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_reservation_events_symbol
+    ON paper_external_position_reservation_events(book_id, symbol, created_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_order_leases_client_order
+    ON paper_external_order_leases(book_id, client_order_id);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -978,9 +1027,13 @@ BEGIN SELECT RAISE(ABORT, 'paper external broker fills are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_fills_no_delete
 BEFORE DELETE ON paper_external_broker_fills
 BEGIN SELECT RAISE(ABORT, 'paper external broker fills are immutable'); END;
+-- Every field is immutable except the one-time transition of
+-- consumed_by_retry_event_id from NULL to a retry event ID (Part 5: a
+-- consumed lookup can never be reused to authorize another retry).
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_update
 BEFORE UPDATE ON paper_external_order_lookups
-BEGIN SELECT RAISE(ABORT, 'paper external order lookups are immutable'); END;
+WHEN OLD.consumed_by_retry_event_id IS NOT NULL
+BEGIN SELECT RAISE(ABORT, 'paper external order lookup consumption is recorded once'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_delete
 BEFORE DELETE ON paper_external_order_lookups
 BEGIN SELECT RAISE(ABORT, 'paper external order lookups are immutable'); END;
@@ -993,6 +1046,18 @@ BEGIN SELECT RAISE(ABORT, 'paper external reconciliations are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_queue_no_delete
 BEFORE DELETE ON paper_external_submission_queue
 BEGIN SELECT RAISE(ABORT, 'paper external submission queue is auditable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_reservation_events_no_update
+BEFORE UPDATE ON paper_external_position_reservation_events
+BEGIN SELECT RAISE(ABORT, 'paper external position reservation events are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_reservation_events_no_delete
+BEFORE DELETE ON paper_external_position_reservation_events
+BEGIN SELECT RAISE(ABORT, 'paper external position reservation events are append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_order_leases_no_delete
+BEFORE DELETE ON paper_external_order_leases
+BEGIN SELECT RAISE(ABORT, 'paper external order leases are auditable'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing
@@ -1020,6 +1085,17 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     },
     "paper_recurring_cycle_queue": {
         "retry_of_queue_item_id": "TEXT",
+    },
+    "paper_external_order_events": {
+        "scope_sequence": "INTEGER",
+    },
+    "paper_external_order_lookups": {
+        "attempt_number": "INTEGER",
+        "ambiguous_event_id": "TEXT",
+        "payload_hash": "TEXT",
+        "lookup_started_at": "TEXT",
+        "lookup_completed_at": "TEXT",
+        "consumed_by_retry_event_id": "TEXT",
     },
 }
 

@@ -225,3 +225,48 @@ def test_v2_preview_rejects_unknown_fields_and_market_shape():
     with pytest.raises(RuntimeOperationError) as exc:
         dispatcher.handle(_request("PREVIEW_LIMIT_ORDER", payload))
     assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD
+
+
+def test_v2_list_recent_orders_is_bounded_paper_scoped_and_reuses_gateway():
+    gateway = DeterministicBrokerGateway()
+    dispatcher = Dispatcher(gateway=gateway, config=CONFIG)
+    account = dispatcher.handle(_request("ACCOUNT_CHECK", {"book_id": "BASELINE"}))
+    payload = _external_payload(account_fingerprint=account["account_fingerprint"])
+    dispatcher.handle(_request("SUBMIT_LIMIT_ORDER", payload))
+    result = dispatcher.handle(_request("LIST_RECENT_ORDERS", {"book_id": "BASELINE", "limit": 10}))
+    assert [o["client_order_id"] for o in result["orders"]] == [payload["client_order_id"]]
+    assert all(o["provider"] == "alpaca_paper" and o["environment"] == "paper" for o in result["orders"])
+    with pytest.raises(RuntimeOperationError) as exc:
+        dispatcher.handle(_request("LIST_RECENT_ORDERS", {"book_id": "BASELINE", "limit": 0}))
+    assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD
+    with pytest.raises(RuntimeOperationError) as exc:
+        dispatcher.handle(_request("LIST_RECENT_ORDERS", {"book_id": "BASELINE", "limit": 500}))
+    assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD
+
+
+def test_confirmed_long_rejects_fractional_broker_position_quantity():
+    from trading_paper_runtime.models import PositionSnapshotPayload
+
+    gateway = DeterministicBrokerGateway()
+    gateway._positions["AAPL"] = PositionSnapshotPayload(
+        symbol="AAPL", quantity="10.5", average_entry_price="100", market_value="1050", as_of="2026-01-01T00:00:00+00:00",
+    )
+    dispatcher = Dispatcher(gateway=gateway, config=CONFIG)
+    account = dispatcher.handle(_request("ACCOUNT_CHECK", {"book_id": "BASELINE"}))
+    payload = _external_payload(
+        account_fingerprint=account["account_fingerprint"], side="SELL", quantity=5,
+    )
+    with pytest.raises(RuntimeOperationError) as exc:
+        dispatcher.handle(_request("PREVIEW_LIMIT_ORDER", payload))
+    assert exc.value.code == ErrorCode.MALFORMED_PAYLOAD
+
+
+def test_v2_list_recent_orders_requires_paper_mode():
+    class _UnverifiedGateway(DeterministicBrokerGateway):
+        def is_paper_mode_verified(self) -> bool:
+            return False
+
+    dispatcher = Dispatcher(gateway=_UnverifiedGateway(), config=CONFIG)
+    with pytest.raises(RuntimeOperationError) as exc:
+        dispatcher.handle(_request("LIST_RECENT_ORDERS", {"book_id": "BASELINE", "limit": 10}))
+    assert exc.value.code == ErrorCode.NOT_PAPER_MODE

@@ -16,6 +16,15 @@ In `config/paper_runtime.yaml`, keep provider `alpaca`, environment/mode
 runtime requires `ALPACA_IS_PAPER=true` plus paper credentials. Credentials
 alone enable nothing.
 
+Credentials reach the isolated runtime process only two ways (Milestone
+11.1): (a) set `ALPACA_API_KEY`/`ALPACA_API_SECRET`/`ALPACA_IS_PAPER`/
+`ALPACA_BASE_URL`/`PAPER_BROKER_PROVIDER` directly in the environment that
+launches the CLI — the main process passes these specific names through
+verbatim, never parsing them; or (b) set `PAPER_RUNTIME_ENV_FILE` to a
+dedicated, Alpaca-only dotenv file stored outside this repository — the
+runtime loads exactly that file and never scans the filesystem for one. Do
+not rely on this repository's own `.env`; the runtime does not discover it.
+
 ## Account check, preview, submit
 
 ```bash
@@ -35,6 +44,19 @@ Inspect bounded local evidence:
 python -m trading_research.cli external-paper-order-show \
   --book-id BASELINE --client-order-id <client-order-id>
 ```
+
+Show the submission queue's live, derived status (Milestone 11.1; read-only,
+no runtime client or credentials needed):
+
+```bash
+python -m trading_research.cli external-paper-queue-show --book-id BASELINE
+```
+
+Each row shows the queue's client order ID and current status —
+`AWAITING_OPERATOR_EXTERNAL_SUBMISSION`, `PREVIEWED`, `SUBMISSION_REQUESTED`,
+`SUBMITTED`, `PARTIALLY_FILLED`, `FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`,
+`UNKNOWN_REQUIRES_RECONCILIATION`, or `BLOCKED_BY_RECONCILIATION` — derived
+fresh from the order-event chain every call, never a stale stored value.
 
 ## Reconcile ambiguity or drift
 
@@ -57,6 +79,12 @@ python -m trading_research.cli external-paper-retry-submit \
 Account, namespace, order, fill, cash, or position mismatches are critical and
 block later external submission. Correct the external condition, then rerun
 reconciliation. Do not edit historical events, fills, or reconciliations.
+
+An authoritative `NOT_FOUND` lookup authorizes exactly one retry of the exact
+ambiguous attempt it was taken against (Milestone 11.1): it is consumed the
+moment the retry is submitted, and a stale or mismatched lookup (wrong
+attempt, wrong payload, already consumed) is rejected — a fresh reconciliation
+is required before another retry.
 
 ## Explicit cancellation
 

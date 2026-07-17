@@ -68,3 +68,54 @@ reconciliation replaces it as current evidence.
 The offline main and runtime test suites make no broker or network calls. Real
 paper smoke remains opt-in via `RUN_EXTERNAL_PAPER_BROKER_TESTS=true` plus all
 configuration, endpoint, credential, one-book, and explicit-command gates.
+
+## Milestone 11.1 corrections
+
+A follow-up review found and fixed several gaps in the mechanisms described
+above; the full account is in
+[`milestone11-1-external-paper-safety-closure.md`](milestone11-1-external-paper-safety-closure.md).
+In summary:
+
+- **BUY cash reservations** now release only as fills are durably applied
+  locally (per-fill, plus a final sweep once fully filled) — a broker
+  `FILLED` response with a temporarily empty fills list no longer releases
+  cash on trust.
+- **External closing SELLs now reserve shares** before submission
+  (`paper_external_position_reservation_events` + `paper_book_positions
+  .reserved_quantity`), symmetric with the BUY cash reservation; a second
+  SELL cannot reserve or submit the same shares, and lifecycle exit
+  evaluation now recognizes an unresolved external SELL (not just a local
+  `PENDING_SUBMISSION` row).
+- **Every order mutation (preview/submit/retry/cancel/reconcile) is now
+  serialized by an order-scope lease** (`paper_external_order_leases`,
+  keyed by `book_id + client_order_id`), and the event chain carries a
+  monotonic `scope_sequence` with a uniqueness constraint as a
+  database-level backstop against a forked chain.
+- **Ambiguous-retry `NOT_FOUND` evidence is now single-use and attempt-scoped**:
+  a lookup only authorizes a retry of the exact ambiguous event it was
+  taken against, and is consumed on use.
+- **Reconciliation never exits without persisting evidence**: fill
+  application, order/response validation, and the broker positions/account
+  comparison are all wrapped so any failure — malformed data, an
+  unexpected exception, a numeric conversion error — persists a critical,
+  precisely-coded record (`MALFORMED_BROKER_ORDER`,
+  `MALFORMED_BROKER_FILL`, `FILL_APPLICATION_FAILED`,
+  `RECONCILIATION_INTERNAL_ERROR`, `RESERVATION_MISMATCH`/
+  `SHARE_RESERVATION_MISMATCH`, `FROZEN_INTENT_MISMATCH`) rather than a
+  bare `UNKNOWN` or an uncaught exception.
+- **`BROKER_ORDER_DUPLICATE` is now a real check**, comparing recent
+  broker orders (a new bounded, paper-only `LIST_RECENT_ORDERS` runtime
+  operation reusing the existing gateway capability) against the frozen
+  intent.
+- **The isolated runtime no longer discovers the main repository's `.env`**
+  via an upward filesystem search; it loads credentials only from an
+  explicitly-named `PAPER_RUNTIME_ENV_FILE` (or a verbatim, allowlisted
+  subprocess-environment pass-through), never scanning parent directories.
+- **The external submission queue status is now derived live** from the
+  order-event chain (`AWAITING_OPERATOR_EXTERNAL_SUBMISSION` through
+  terminal states, plus `BLOCKED_BY_RECONCILIATION`) instead of a
+  write-once column that silently never updated after submission.
+
+Recurring activation, notional recomputation, timestamp validation, strict
+configuration booleans, and non-finite/fractional broker-value rejection
+were also corrected — see the closure doc for the complete list.

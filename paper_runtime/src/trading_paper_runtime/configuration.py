@@ -51,25 +51,31 @@ class RuntimeConfiguration:
 
 
 def _load_dotenv_if_present() -> None:
-    """Best-effort `.env` discovery, searching from the current working
-    directory upward — mirrors the main project's own
-    `trading_research.config.load_config` behavior (and LumiBot's own
-    `lumibot.credentials` dotenv auto-discovery, which runs too late for
-    this function's purposes if `.env` hasn't been loaded already: LumiBot
-    is imported lazily, inside gateway construction, *after*
-    `load_runtime_configuration()` has already read `os.environ`). Never
-    overrides a variable already set in the real environment
-    (`override=False`) and never raises if `python-dotenv` or a `.env` file
-    is unavailable — environment variables set directly (e.g. by a real
-    deployment's secret manager) always take precedence.
+    """Loads credentials only from a dotenv file the operator explicitly
+    named via `PAPER_RUNTIME_ENV_FILE` — never by scanning the filesystem.
+
+    This process is spawned with a minimal, explicitly-constructed
+    environment (see `cli.py::_paper_runtime_command_env`) and a `cwd` of
+    the main repository root (so relative script invocation keeps working).
+    An earlier version called `find_dotenv(usecwd=True)`, which searches
+    *upward from cwd* — that silently discovered and loaded the main
+    repository's own `.env` (Anthropic/Reddit/Robinhood/database secrets,
+    none of which this runtime should ever see) purely because this
+    process's cwd happens to be the repo root. `PAPER_RUNTIME_ENV_FILE`
+    must name one dedicated, Alpaca-only file outside the repository (or be
+    left unset, in which case credentials come only from the subprocess
+    environment / a deployment secret manager). Never overrides a variable
+    already set in the real environment (`override=False`); never raises if
+    `python-dotenv` or the named file is unavailable.
     """
+    explicit_path = os.environ.get("PAPER_RUNTIME_ENV_FILE")
+    if not explicit_path:
+        return
     try:
-        from dotenv import find_dotenv, load_dotenv
+        from dotenv import load_dotenv
     except ImportError:
         return
-    path = find_dotenv(usecwd=True)
-    if path:
-        load_dotenv(path, override=False)
+    load_dotenv(explicit_path, override=False)
 
 
 def load_runtime_configuration() -> RuntimeConfiguration:

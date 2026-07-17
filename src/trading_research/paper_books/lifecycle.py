@@ -46,7 +46,7 @@ from typing import Any, Callable
 
 from ..storage import paper_books_repositories as repo
 from ..storage import trading_repositories as trading_repo
-from . import cash_ledger, execution, metrics as metrics_module, reconciliation, valuation
+from . import cash_ledger, execution, metrics as metrics_module, positions, reconciliation, valuation
 from .config import PaperBooksConfiguration
 from .exit_policy import (
     DECISION_EXIT_MANUAL_REQUEST,
@@ -249,11 +249,35 @@ def _process_pending_orders(
     return filled, expired
 
 
+_UNRESOLVED_EXTERNAL_SELL_STATES = frozenset({
+    "SUBMISSION_REQUESTED", "SUBMITTED", "PARTIALLY_FILLED", "CANCEL_REQUESTED",
+    "UNKNOWN_REQUIRES_RECONCILIATION",
+})
+
+
 def _has_unresolved_pending_sell(conn, book_id: str, symbol: str) -> bool:
-    return any(
-        o["symbol"] == symbol and o["side"] == ORDER_SIDE_SELL and o["status"] == INTENT_STATUS_PENDING_SUBMISSION
-        for o in repo.list_order_intents(conn, book_id)
-    )
+    """True if a local pending-submission SELL exists, or an external order for
+    this book/symbol is in a state that has not yet resolved to a terminal
+    outcome with its reservation released. A terminal FILLED/CANCELLED/
+    REJECTED/EXPIRED order no longer blocks once its share reservation is
+    resolved (Part 3/4): checking the reservation directly, rather than only
+    the broker state, keeps this in sync even if release lags a state
+    transition by one reconciliation cycle."""
+    for o in repo.list_order_intents(conn, book_id):
+        if o["symbol"] != symbol or o["side"] != ORDER_SIDE_SELL:
+            continue
+        if o["status"] == INTENT_STATUS_PENDING_SUBMISSION:
+            return True
+        event = repo.load_latest_external_order_event_for_intent(conn, book_id, o["paper_order_intent_id"])
+        if event is None:
+            continue
+        state = event["new_state"]
+        if state in _UNRESOLVED_EXTERNAL_SELL_STATES:
+            return True
+        if state == "PREVIEWED" or state in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
+            if positions.remaining_share_reservation(conn, book_id, o["paper_order_intent_id"]) > 0:
+                return True
+    return False
 
 
 def _evaluate_exits(
