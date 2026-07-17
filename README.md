@@ -400,7 +400,15 @@ python -m trading_research.cli external-paper-reconcile --book-id BASELINE
 # Retry only after reconciliation persisted authoritative NOT_FOUND evidence
 python -m trading_research.cli external-paper-retry-submit \
   --book-id BASELINE --intent-id <id> --operator <name> --reason "<reason>"
+
+# Show the submission queue's live, derived status (Milestone 11.1; read-only)
+python -m trading_research.cli external-paper-queue-show --book-id BASELINE
 ```
+
+See `docs/milestone11-1-external-paper-safety-closure.md` for the Milestone
+11.1 corrective safety fixes (reservation lifecycle, order-scope leasing,
+duplicate-order detection, credential isolation, and more) applied on top of
+this integration.
 
 External paper execution is disabled by default, limit/DAY/whole-share only,
 and restricted to one configured book per paper account. Credentials never

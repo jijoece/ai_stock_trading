@@ -224,6 +224,58 @@ def test_soak_campaign_unknown_key_fails_closed(tmp_path):
         load_paper_books_config(_write(tmp_path, data))
 
 
+@pytest.mark.parametrize("value", ["false", 0, 1, "true"])
+@pytest.mark.parametrize("path", [
+    ("enabled",),
+    ("books", "baseline", "enabled"),
+    ("books", "enhanced", "enabled"),
+    ("execution", "allow_external_paper_broker"),
+    ("execution", "allow_live_broker"),
+])
+def test_execution_sensitive_booleans_reject_non_bool_types(tmp_path, path, value):
+    data = _valid_config()
+    target = data["paper_books"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_real_yaml_booleans_are_accepted_for_every_execution_sensitive_field(tmp_path):
+    data = _valid_config()
+    cfg = load_paper_books_config(_write(tmp_path, data))
+    assert cfg.enabled is False
+    assert cfg.baseline.enabled is True
+    assert cfg.enhanced.enabled is False
+    assert cfg.execution.allow_external_paper_broker is False
+    assert cfg.execution.allow_live_broker is False
+
+
+@pytest.mark.parametrize("value", ["false", 0])
+def test_scheduled_integration_enabled_rejects_non_bool_types(tmp_path, value):
+    data = _valid_config()
+    data["paper_books"]["scheduled_integration"] = {"enabled": value}
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+@pytest.mark.parametrize("value", ["false", 0])
+@pytest.mark.parametrize("field", ["enabled", "exit_on_recommendation_reversal"])
+def test_lifecycle_exit_booleans_reject_non_bool_types(tmp_path, field, value):
+    data = _valid_config()
+    data["paper_books"]["lifecycle"] = {"enabled": True, "exits": {field: value}}
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
+def test_lifecycle_enabled_rejects_non_bool_types(tmp_path):
+    data = _valid_config()
+    data["paper_books"]["lifecycle"] = {"enabled": "false"}
+    with pytest.raises(PaperBooksConfigError, match="must be a boolean"):
+        load_paper_books_config(_write(tmp_path, data))
+
+
 def test_soak_campaign_booleans_are_strict(tmp_path):
     data = _valid_config()
     data["paper_books"]["soak_campaign"] = {"enabled": "false"}

@@ -236,11 +236,19 @@ def _paper_runtime_command_env() -> dict:
     imports lumibot itself)."""
     import os
 
-    # Deliberately do not copy the parent environment: in particular the
-    # main process never reads or forwards Alpaca credential variables.
-    # The isolated runtime loads credentials itself (or a deployment uses a
-    # credential-injecting runtime command).
-    env = {key: os.environ[key] for key in ("PATH", "PYTHONPATH") if key in os.environ}
+    # Deliberately do not copy the parent environment wholesale — only this
+    # exact allowlist crosses the subprocess boundary. ALPACA_* values (if
+    # present) are passed through verbatim, never parsed or acted on by this
+    # process (that's what "the main process does not read credential
+    # values" means): every other application secret (Anthropic, Reddit,
+    # Robinhood, MCP, database) is excluded by construction. PAPER_RUNTIME_
+    # ENV_FILE is not a secret itself — it is only a path telling the runtime
+    # process which dedicated, Alpaca-only dotenv file to load on its own.
+    _ALLOWED_KEYS = (
+        "PATH", "PYTHONPATH", "ALPACA_API_KEY", "ALPACA_API_SECRET", "ALPACA_IS_PAPER",
+        "ALPACA_BASE_URL", "PAPER_BROKER_PROVIDER", "PAPER_RUNTIME_ENV_FILE",
+    )
+    env = {key: os.environ[key] for key in _ALLOWED_KEYS if key in os.environ}
     paper_runtime_src = REPO_ROOT / "paper_runtime" / "src"
     if paper_runtime_src.is_dir():
         existing = env.get("PYTHONPATH", "")
@@ -248,8 +256,36 @@ def _paper_runtime_command_env() -> dict:
     return env
 
 
-def _external_paper_cli(db_path: Path, operation) -> dict:
+def _bounded_message(message: object, limit: int = 500) -> str:
+    text = str(message)
+    return text if len(text) <= limit else text[:limit] + "...(truncated)"
+
+
+def _sanitized_cli_error(exc: Exception) -> dict:
+    """Part 17: never return `str(exc)` for an unexpected failure — a raw
+    exception can carry a filesystem path, subprocess detail, or other
+    internal information the CLI must not surface. Known, already-sanitized
+    domain error types (ExternalPaperError, RuntimeOperationError, which
+    carries the isolated runtime's own curated code/message) are passed
+    through (bounded); anything else collapses to one stable generic code
+    and message, never the exception's own text.
+    """
     from .paper_books.external_broker import ExternalPaperError
+    from .runtime.client.errors import RuntimeClientError, RuntimeOperationError
+
+    if isinstance(exc, ExternalPaperError):
+        return {"code": exc.code, "message": _bounded_message(exc.message)}
+    if isinstance(exc, RuntimeOperationError):
+        return {"code": exc.code, "message": _bounded_message(exc.message)}
+    if isinstance(exc, RuntimeClientError):
+        return {
+            "code": type(exc).__name__.upper(),
+            "message": "the isolated paper runtime process is unavailable or did not respond in time",
+        }
+    return {"code": "EXTERNAL_RUNTIME_ERROR", "message": "an unexpected internal error occurred"}
+
+
+def _external_paper_cli(db_path: Path, operation) -> dict:
     from .paper_books.config import load_paper_books_config
 
     client, _runtime_config = _build_runtime_client()
@@ -257,10 +293,8 @@ def _external_paper_cli(db_path: Path, operation) -> dict:
         client.start()
         with session(db_path) as conn:
             return operation(conn, client, load_paper_books_config())
-    except ExternalPaperError as exc:
-        return {"error": {"code": exc.code, "message": exc.message}}
     except Exception as exc:
-        return {"error": {"code": getattr(exc, "code", "EXTERNAL_RUNTIME_ERROR"), "message": str(exc)}}
+        return {"error": _sanitized_cli_error(exc)}
     finally:
         client.shutdown()
 
@@ -330,12 +364,22 @@ def external_paper_retry_cli(
 
 
 def external_paper_order_show_cli(db_path: Path, *, book_id: str, client_order_id: str) -> dict:
-    from .paper_books.external_broker import ExternalPaperError, show_external_paper_order
+    from .paper_books.external_broker import show_external_paper_order
     try:
         with session(db_path) as conn:
             return show_external_paper_order(conn, book_id=book_id, client_order_id=client_order_id)
-    except ExternalPaperError as exc:
-        return {"error": {"code": exc.code, "message": exc.message}}
+    except Exception as exc:
+        return {"error": _sanitized_cli_error(exc)}
+
+
+def external_paper_queue_show_cli(db_path: Path, *, book_id: str) -> dict:
+    """Read-only queue display — no runtime client, no lease, no mutation."""
+    from .paper_books.external_broker import list_external_submission_queue_view
+    try:
+        with session(db_path) as conn:
+            return {"book_id": book_id, "queue": list_external_submission_queue_view(conn, book_id=book_id)}
+    except Exception as exc:
+        return {"error": _sanitized_cli_error(exc)}
 
 
 def _build_runtime_client():
@@ -2335,6 +2379,10 @@ def main(argv: list[str] | None = None) -> int:
     p_external_retry.add_argument("--intent-id", required=True)
     p_external_retry.add_argument("--operator", required=True)
     p_external_retry.add_argument("--reason", required=True)
+    p_external_queue = sub.add_parser(
+        "external-paper-queue-show", help="Show the external submission queue's derived status (read-only)",
+    )
+    p_external_queue.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
 
     args = parser.parse_args(argv)
 
@@ -2899,6 +2947,9 @@ def main(argv: list[str] | None = None) -> int:
             cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
             operator=args.operator, reason=args.reason,
         )
+    elif args.command == "external-paper-queue-show":
+        cfg = load_config()
+        outcome = external_paper_queue_show_cli(cfg.research_database_path, book_id=args.book_id)
     else:
         return 1
     print(json.dumps(outcome, indent=2, default=str))

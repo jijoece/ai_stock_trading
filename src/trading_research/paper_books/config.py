@@ -477,17 +477,21 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             _require_no_unknown_keys(section, {"enabled", "book_id", "starting_cash_usd"}, f"books.{name}")
 
         baseline = PaperBookDefinition(
-            enabled=bool(baseline_raw["enabled"]), book_id=str(baseline_raw["book_id"]),
+            enabled=_strict_bool(baseline_raw["enabled"], "books.baseline.enabled"),
+            book_id=str(baseline_raw["book_id"]),
             starting_cash_usd=_decimal(baseline_raw["starting_cash_usd"], "books.baseline.starting_cash_usd"),
         )
         enhanced = PaperBookDefinition(
-            enabled=bool(enhanced_raw["enabled"]), book_id=str(enhanced_raw["book_id"]),
+            enabled=_strict_bool(enhanced_raw["enabled"], "books.enhanced.enabled"),
+            book_id=str(enhanced_raw["book_id"]),
             starting_cash_usd=_decimal(enhanced_raw["starting_cash_usd"], "books.enhanced.starting_cash_usd"),
         )
         execution_section = ExecutionSection(
             provider=str(execution["provider"]),
-            allow_external_paper_broker=bool(execution["allow_external_paper_broker"]),
-            allow_live_broker=bool(execution["allow_live_broker"]),
+            allow_external_paper_broker=_strict_bool(
+                execution["allow_external_paper_broker"], "execution.allow_external_paper_broker",
+            ),
+            allow_live_broker=_strict_bool(execution["allow_live_broker"], "execution.allow_live_broker"),
         )
         risk_section = RiskSection(
             max_position_weight=_decimal(risk["max_position_weight"], "risk.max_position_weight"),
@@ -511,7 +515,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             raise PaperBooksConfigError("paper_books.scheduled_integration must be a mapping")
         _require_no_unknown_keys(scheduled_integration_raw, {"enabled"}, "scheduled_integration")
         scheduled_integration_section = ScheduledIntegrationSection(
-            enabled=bool(scheduled_integration_raw.get("enabled", False)),
+            enabled=_strict_bool(scheduled_integration_raw.get("enabled", False), "scheduled_integration.enabled"),
         )
 
         lifecycle_raw = pb.get("lifecycle", {})
@@ -539,13 +543,16 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             "lifecycle.exits",
         )
         exits_section = ExitsSection(
-            enabled=bool(exits_raw.get("enabled", False)),
+            enabled=_strict_bool(exits_raw.get("enabled", False), "lifecycle.exits.enabled"),
             stop_loss_percent=_decimal(exits_raw.get("stop_loss_percent", "0.08"), "lifecycle.exits.stop_loss_percent"),
             profit_target_percent=_decimal(
                 exits_raw.get("profit_target_percent", "0.15"), "lifecycle.exits.profit_target_percent"
             ),
             maximum_holding_market_days=int(exits_raw.get("maximum_holding_market_days", 20)),
-            exit_on_recommendation_reversal=bool(exits_raw.get("exit_on_recommendation_reversal", True)),
+            exit_on_recommendation_reversal=_strict_bool(
+                exits_raw.get("exit_on_recommendation_reversal", True),
+                "lifecycle.exits.exit_on_recommendation_reversal",
+            ),
         )
 
         soak_raw = lifecycle_raw.get("soak", {})
@@ -558,7 +565,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         )
 
         lifecycle_section = LifecycleSection(
-            enabled=bool(lifecycle_raw.get("enabled", False)),
+            enabled=_strict_bool(lifecycle_raw.get("enabled", False), "lifecycle.enabled"),
             pending_orders=pending_orders_section, exits=exits_section, soak=soak_section,
         )
 
@@ -692,7 +699,8 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         raise PaperBooksConfigError(f"invalid paper-books config value: {exc}") from exc
 
     return PaperBooksConfiguration(
-        version=raw.get("version", 1), enabled=bool(pb["enabled"]), baseline=baseline, enhanced=enhanced,
+        version=raw.get("version", 1), enabled=_strict_bool(pb["enabled"], "paper_books.enabled"),
+        baseline=baseline, enhanced=enhanced,
         execution=execution_section, risk=risk_section, valuation=valuation_section,
         scheduled_integration=scheduled_integration_section, lifecycle=lifecycle_section, soak_campaign=campaign_section,
         recurring=recurring_section, external_broker=external_broker_section,

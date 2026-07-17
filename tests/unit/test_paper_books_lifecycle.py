@@ -26,6 +26,7 @@ from trading_research.paper_books.lifecycle import (
     LifecycleError,
     PENDING_OUTCOME_EXPIRED,
     PENDING_OUTCOME_FILLED,
+    _has_unresolved_pending_sell,
     run_paper_book_lifecycle,
 )
 from trading_research.paper_books.models import PaperBookOrderIntent
@@ -336,6 +337,57 @@ def test_no_exit_evaluated_while_a_prior_exit_order_is_still_pending(conn):
         # an already-outstanding SELL.
         sell_orders_after = [o for o in repo.list_order_intents(conn, "BASELINE") if o["side"] == "SELL"]
         assert len(sell_orders_after) == 1
+
+
+def _seed_external_sell_intent(conn, *, book_id="BASELINE", symbol="AAPL", quantity="10", status="SUBMITTED"):
+    quantity = Decimal(quantity)
+    cash_ledger.open_book(conn, book_id=book_id, starting_cash_usd=Decimal("100000"), config_hash="lifecycle-test-hash", clock=lambda: DAY1)
+    intent = PaperBookOrderIntent(
+        paper_order_intent_id=f"external-sell-{status.lower()}", book_id=book_id, experiment_arm=book_id,
+        cycle_id="exit-cycle", recommendation_id="rec-exit", symbol=symbol, side="SELL",
+        order_type="LIMIT", quantity=quantity, limit_price=Decimal("100"),
+        notional_usd=quantity * Decimal("100"), time_in_force="DAY", as_of=DAY2,
+        risk_decision_id="risk-exit", portfolio_snapshot_id="snap-exit", config_hash="lifecycle-test-hash",
+        created_at=DAY2, status=status,
+    )
+    repo.save_order_intent(conn, intent)
+    return intent.paper_order_intent_id
+
+
+def _seed_external_order_event(conn, *, book_id, paper_order_intent_id, new_state):
+    repo.save_external_order_event(conn, {
+        "external_order_event_id": f"evt-{paper_order_intent_id}-{new_state}",
+        "external_order_scope_id": f"scope-{paper_order_intent_id}", "book_id": book_id,
+        "paper_order_intent_id": paper_order_intent_id, "client_order_id": f"epb-{book_id.lower()}-{paper_order_intent_id}",
+        "broker_order_id": "broker-1", "account_fingerprint": "acct_test", "previous_state": "SUBMITTED",
+        "new_state": new_state, "payload_hash": "hash", "quantity": Decimal("10"), "limit_price": Decimal("100"),
+        "operator": "alice", "reason": "test", "runtime_request_id": None, "error_code": None,
+        "created_at": DAY2.isoformat(), "policy_version": "v1", "config_hash": "lifecycle-test-hash",
+        "attempt_number": 0, "scope_sequence": 0,
+    })
+
+
+def test_unresolved_external_sell_blocks_new_exit_intent(conn):
+    intent_id = _seed_external_sell_intent(conn, status="SUBMITTED")
+    _seed_external_order_event(conn, book_id="BASELINE", paper_order_intent_id=intent_id, new_state="SUBMITTED")
+    assert _has_unresolved_pending_sell(conn, "BASELINE", "AAPL") is True
+
+
+def test_terminal_external_sell_with_released_reservation_does_not_block(conn):
+    intent_id = _seed_external_sell_intent(conn, status="CANCELLED")
+    _seed_external_order_event(conn, book_id="BASELINE", paper_order_intent_id=intent_id, new_state="CANCELLED")
+    assert _has_unresolved_pending_sell(conn, "BASELINE", "AAPL") is False
+
+
+def test_terminal_external_sell_with_unreleased_reservation_still_blocks(conn):
+    intent_id = _seed_external_sell_intent(conn, status="CANCELLED")
+    _seed_external_order_event(conn, book_id="BASELINE", paper_order_intent_id=intent_id, new_state="CANCELLED")
+    repo.save_external_position_reservation_event(conn, {
+        "reservation_event_id": f"reserve:{intent_id}", "book_id": "BASELINE", "symbol": "AAPL",
+        "paper_order_intent_id": intent_id, "client_order_id": "cid", "quantity": Decimal("10"),
+        "event_type": "RESERVED", "operator": None, "reason": "test", "created_at": DAY2.isoformat(),
+    })
+    assert _has_unresolved_pending_sell(conn, "BASELINE", "AAPL") is True
 
 
 # --- isolation / disabled exits ----------------------------------------------

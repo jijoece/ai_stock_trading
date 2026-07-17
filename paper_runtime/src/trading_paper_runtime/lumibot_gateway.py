@@ -34,7 +34,10 @@ import hashlib
 
 from .configuration import RuntimeConfiguration
 from .errors import ErrorCode, RuntimeOperationError
-from .models import AccountSnapshotPayload, FillPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload
+from .models import (
+    AccountSnapshotPayload, FillPayload, OrderIntentPayload, OrderSnapshotPayload, PositionSnapshotPayload,
+    _parse_exact_int,
+)
 
 # Alpaca (alpaca-py) raw order statuses -> internal runtime status
 # (docs/milestone-4.md Step 8). Fail closed on anything not explicitly
@@ -319,13 +322,14 @@ class LumiBotAlpacaPaperGateway:
     def _order_to_snapshot(self, order: object) -> OrderSnapshotPayload:
         raw_status = getattr(order.status, "value", order.status)
         status = _map_status(raw_status)
-        filled_qty = int(Decimal(str(order.filled_qty or 0)))
+        filled_qty = _parse_exact_int(order.filled_qty or 0, "broker order filled_qty")
         avg_price = str(order.filled_avg_price) if getattr(order, "filled_avg_price", None) else None
         now = datetime.now(timezone.utc).isoformat()
         return OrderSnapshotPayload(
             intent_id=str(order.client_order_id), client_order_id=str(order.client_order_id),
             broker_order_id=str(order.id) if getattr(order, "id", None) else None,
-            status=status, raw_broker_status=str(raw_status), quantity=int(Decimal(str(order.qty or 0))),
+            status=status, raw_broker_status=str(raw_status),
+            quantity=_parse_exact_int(order.qty or 0, "broker order quantity"),
             filled_quantity=filled_qty, average_fill_price=avg_price,
             submitted_at=str(order.submitted_at) if getattr(order, "submitted_at", None) else now,
             updated_at=str(order.updated_at) if getattr(order, "updated_at", None) else now,

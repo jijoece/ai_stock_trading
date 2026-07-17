@@ -16,7 +16,7 @@ from . import PROTOCOL_VERSION, RUNTIME_VERSION
 from .broker_gateway import BrokerGateway
 from .configuration import RuntimeConfiguration
 from .errors import ErrorCode, RuntimeOperationError
-from .models import CapabilitiesPayload, HealthPayload, OrderIntentPayload
+from .models import CapabilitiesPayload, HealthPayload, OrderIntentPayload, _parse_exact_int
 from .protocol import RequestEnvelope
 
 try:
@@ -206,9 +206,26 @@ class Dispatcher:
         )
         return result
 
+    def _op_LIST_RECENT_ORDERS(self, payload: dict) -> dict:
+        """Bounded, read-only, paper-endpoint-only: reuses the existing
+        `list_recent_orders` gateway capability (Milestone 4) rather than
+        adding a second broker call path. Never mutates. Scope filtering
+        (which of these belong to `book_id`) is the caller's job — this only
+        bounds the result count and normalizes the wire shape."""
+        self._require_paper_verified()
+        _require_exact_fields(payload, {"book_id", "limit"})
+        _require_book_id(payload)
+        limit = payload["limit"]
+        if not isinstance(limit, int) or isinstance(limit, bool) or not (0 < limit <= 200):
+            raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, "limit must be a positive int <= 200")
+        return {"orders": [_external_order_dict(o) for o in self._gateway.list_recent_orders(limit)]}
+
     def _validate_confirmed_long(self, symbol: str, quantity: int) -> None:
         position = next((p for p in self._gateway.list_positions() if p.symbol == symbol), None)
-        if position is None or int(float(position.quantity)) < quantity:
+        if position is None:
+            raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "SELL exceeds confirmed broker long position")
+        confirmed = _parse_exact_int(position.quantity, "broker position quantity")
+        if confirmed < quantity:
             raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "SELL exceeds confirmed broker long position")
 
 

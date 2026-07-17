@@ -1446,7 +1446,7 @@ def save_external_order_event(conn: sqlite3.Connection, event: dict, *, commit: 
         "external_order_event_id", "external_order_scope_id", "book_id", "paper_order_intent_id",
         "client_order_id", "broker_order_id", "account_fingerprint", "previous_state", "new_state",
         "payload_hash", "quantity", "limit_price", "operator", "reason", "runtime_request_id",
-        "error_code", "created_at", "policy_version", "config_hash", "attempt_number",
+        "error_code", "created_at", "policy_version", "config_hash", "attempt_number", "scope_sequence",
     )
     cursor = conn.execute(
         f"INSERT OR IGNORE INTO paper_external_order_events ({', '.join(columns)}) "
@@ -1484,6 +1484,18 @@ def load_latest_external_order_event(conn: sqlite3.Connection, book_id: str, cli
     return dict(row) if row else None
 
 
+def load_latest_external_order_event_for_intent(
+    conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str,
+) -> dict | None:
+    """`client_order_id` is deterministically derived from intent fields, so
+    one intent maps to exactly one external order-event chain."""
+    row = conn.execute(
+        "SELECT * FROM paper_external_order_events WHERE book_id = ? AND paper_order_intent_id = ? "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, paper_order_intent_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def save_external_broker_fill(conn: sqlite3.Connection, fill: dict, *, commit: bool = True) -> bool:
     cursor = conn.execute(
         "INSERT OR IGNORE INTO paper_external_broker_fills "
@@ -1509,9 +1521,15 @@ def save_external_lookup(conn: sqlite3.Connection, lookup: dict, *, commit: bool
     cursor = conn.execute(
         "INSERT OR IGNORE INTO paper_external_order_lookups "
         "(lookup_id, book_id, paper_order_intent_id, client_order_id, account_fingerprint, result, "
-        "authoritative, runtime_request_id, created_at) VALUES (:lookup_id, :book_id, "
-        ":paper_order_intent_id, :client_order_id, :account_fingerprint, :result, :authoritative, "
-        ":runtime_request_id, :created_at)", lookup,
+        "authoritative, runtime_request_id, created_at, attempt_number, ambiguous_event_id, payload_hash, "
+        "lookup_started_at, lookup_completed_at, consumed_by_retry_event_id) "
+        "VALUES (:lookup_id, :book_id, :paper_order_intent_id, :client_order_id, :account_fingerprint, "
+        ":result, :authoritative, :runtime_request_id, :created_at, :attempt_number, :ambiguous_event_id, "
+        ":payload_hash, :lookup_started_at, :lookup_completed_at, :consumed_by_retry_event_id)",
+        {
+            "consumed_by_retry_event_id": None, "attempt_number": None, "ambiguous_event_id": None,
+            "payload_hash": None, "lookup_started_at": None, "lookup_completed_at": None, **lookup,
+        },
     )
     _commit_if(conn, commit)
     return cursor.rowcount > 0
@@ -1523,6 +1541,19 @@ def load_latest_external_lookup(conn: sqlite3.Connection, book_id: str, client_o
         "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, client_order_id),
     ).fetchone()
     return dict(row) if row else None
+
+
+def consume_external_lookup(conn: sqlite3.Connection, lookup_id: str, retry_event_id: str) -> bool:
+    """One-time transition of `consumed_by_retry_event_id` from NULL. The
+    trigger `trg_paper_external_lookups_no_update` aborts any further update
+    once set, so a consumed lookup can never authorize a second retry."""
+    cursor = conn.execute(
+        "UPDATE paper_external_order_lookups SET consumed_by_retry_event_id = ? "
+        "WHERE lookup_id = ? AND consumed_by_retry_event_id IS NULL",
+        (retry_event_id, lookup_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def save_external_reconciliation(conn: sqlite3.Connection, record: dict, *, commit: bool = True) -> bool:
@@ -1574,6 +1605,14 @@ def enqueue_external_submission(
     return cursor.rowcount > 0
 
 
+def list_external_submission_queue(conn: sqlite3.Connection, book_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_external_submission_queue WHERE book_id = ? ORDER BY created_at, queue_id",
+        (book_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def has_external_execution_evidence(
     conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str,
 ) -> bool:
@@ -1589,3 +1628,67 @@ def has_external_execution_evidence(
         if row is not None:
             return True
     return False
+
+
+# -- Milestone 11.1: external share reservations and order-scope leases ------
+
+
+def save_external_position_reservation_event(conn: sqlite3.Connection, event: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_position_reservation_events "
+        "(reservation_event_id, book_id, symbol, paper_order_intent_id, client_order_id, quantity, "
+        "event_type, operator, reason, created_at) "
+        "VALUES (:reservation_event_id, :book_id, :symbol, :paper_order_intent_id, :client_order_id, "
+        ":quantity, :event_type, :operator, :reason, :created_at)",
+        {**event, "quantity": str(event["quantity"])},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def list_external_position_reservation_events(
+    conn: sqlite3.Connection, *, book_id: str, paper_order_intent_id: str,
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_external_position_reservation_events "
+        "WHERE book_id = ? AND paper_order_intent_id = ? ORDER BY created_at, reservation_event_id",
+        (book_id, paper_order_intent_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def acquire_external_order_lease(
+    conn: sqlite3.Connection, *, lease_key: str, book_id: str, client_order_id: str, owner_id: str,
+    operation: str, now: str, expires_at: str,
+) -> bool:
+    cursor = conn.execute(
+        "INSERT INTO paper_external_order_leases "
+        "(lease_key, book_id, client_order_id, owner_id, operation, acquired_at, heartbeat_at, "
+        "expires_at, released_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE') "
+        "ON CONFLICT(lease_key) DO UPDATE SET "
+        "owner_id = excluded.owner_id, operation = excluded.operation, acquired_at = excluded.acquired_at, "
+        "heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at, released_at = NULL, "
+        "status = 'ACTIVE' "
+        "WHERE paper_external_order_leases.status <> 'ACTIVE' OR paper_external_order_leases.expires_at <= ?",
+        (lease_key, book_id, client_order_id, owner_id, operation, now, now, expires_at, now),
+    )
+    _commit_if(conn, True)
+    return cursor.rowcount > 0
+
+
+def load_external_order_lease(conn: sqlite3.Connection, lease_key: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_external_order_leases WHERE lease_key = ?", (lease_key,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def release_external_order_lease(conn: sqlite3.Connection, *, lease_key: str, owner_id: str, now: str) -> bool:
+    cursor = conn.execute(
+        "UPDATE paper_external_order_leases SET status = 'RELEASED', released_at = ? "
+        "WHERE lease_key = ? AND owner_id = ? AND status = 'ACTIVE'",
+        (now, lease_key, owner_id),
+    )
+    conn.commit()
+    return cursor.rowcount > 0

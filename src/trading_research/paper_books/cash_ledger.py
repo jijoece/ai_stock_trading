@@ -113,6 +113,69 @@ def release_reservation(
     return repo.save_cash_ledger_entry(conn, entry, commit=commit)
 
 
+def remaining_buy_reservation(conn, book_id: str, paper_order_intent_id: str) -> Decimal:
+    """Original reserved amount minus every release event recorded so far for this intent.
+
+    Reservation and release are both append-only ledger events keyed by
+    ``reference_id``; this never inspects settlement events directly so it
+    stays correct even if a caller releases in several partial steps.
+    """
+    reserved = Decimal("0")
+    released = Decimal("0")
+    for e in repo.list_cash_ledger_entries(conn, book_id):
+        if e.get("reference_id") != paper_order_intent_id:
+            continue
+        if e["event_type"] == CASH_EVENT_BUY_RESERVATION:
+            reserved += Decimal(e["amount_usd"])
+        elif e["event_type"] == CASH_EVENT_ORDER_RELEASE:
+            released += -Decimal(e["amount_usd"])
+    return reserved - released
+
+
+def release_settled_buy_reservation(
+    conn, book_id: str, paper_order_intent_id: str, fill_id: str, notional_usd: Decimal, now: datetime,
+    *, commit: bool = True,
+) -> bool:
+    """Release the portion of the reservation attributable to one durably-applied BUY fill.
+
+    Keyed per ``fill_id`` so repeated fill application (idempotent replay,
+    reconciliation) never double-releases; the amount released is clamped to
+    whatever remains reserved so a malformed or oversized fill can never
+    drive the reservation, and therefore available cash, negative.
+    """
+    remaining = remaining_buy_reservation(conn, book_id, paper_order_intent_id)
+    if remaining <= 0:
+        return False
+    amount = notional_usd if notional_usd < remaining else remaining
+    idem = f"release:{paper_order_intent_id}:fill:{fill_id}"
+    entry = CashLedgerEntry(
+        book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_ORDER_RELEASE,
+        amount_usd=-amount, event_timestamp=now, idempotency_key=idem, reference_id=paper_order_intent_id,
+    )
+    return repo.save_cash_ledger_entry(conn, entry, commit=commit)
+
+
+def release_remaining_buy_reservation(
+    conn, book_id: str, paper_order_intent_id: str, now: datetime, *, release_event_id: str, commit: bool = True,
+) -> bool:
+    """Release exactly what remains reserved once an order will receive no more fills.
+
+    Safe to call repeatedly with the same ``release_event_id`` (e.g. once per
+    terminal broker state observed) — the idempotency key is stable, so a
+    second call after the reservation is already fully released is a no-op,
+    and the released amount can never exceed the original reservation.
+    """
+    remaining = remaining_buy_reservation(conn, book_id, paper_order_intent_id)
+    if remaining <= 0:
+        return False
+    idem = f"release:{paper_order_intent_id}:{release_event_id}"
+    entry = CashLedgerEntry(
+        book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_ORDER_RELEASE,
+        amount_usd=-remaining, event_timestamp=now, idempotency_key=idem, reference_id=paper_order_intent_id,
+    )
+    return repo.save_cash_ledger_entry(conn, entry, commit=commit)
+
+
 def settle_buy(
     conn, book_id: str, fill_id: str, cost_usd: Decimal, fees_usd: Decimal, slippage_usd: Decimal,
     now: datetime, *, commit: bool = True,

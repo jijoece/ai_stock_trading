@@ -59,18 +59,29 @@ def apply_buy_fill(
 
 def apply_sell_fill(
     conn, book_id: str, symbol: str, fill_id: str, quantity: Decimal, fill_price: Decimal, now: datetime,
-    *, commit: bool = True,
+    *, commit: bool = True, already_reserved: bool = False,
 ) -> Decimal:
     """Consumes open lots oldest-first (FIFO). Returns the realized P&L
     (price-basis only; fees/slippage are tracked separately in the cash
     ledger and the position's own `fees_usd` aggregate — see
     docs/adr/0006...md). Raises `InsufficientPositionError` rather than ever
-    allowing a sell quantity greater than the book's available position."""
+    allowing a sell quantity greater than the book's confirmed long position.
+
+    `already_reserved=True` (external order fills, Part 3): the caller
+    already atomically reserved these shares before submission, which
+    lowered `available_quantity` at reservation time — checking
+    `available_quantity` again here would double-count that same
+    reservation and wrongly reject the fill it was reserved for. The
+    confirmed `quantity` remains the ceiling either way, so a true oversell
+    (selling more than the book actually holds) is still impossible.
+    """
     existing = repo.load_position(conn, book_id, symbol)
-    available = Decimal(existing["available_quantity"]) if existing else Decimal("0")
-    if quantity > available:
+    ceiling = Decimal(
+        (existing["quantity"] if already_reserved else existing["available_quantity"]) if existing else "0"
+    )
+    if quantity > ceiling:
         raise InsufficientPositionError(
-            f"book {book_id} symbol {symbol}: cannot sell {quantity} — only {available} available"
+            f"book {book_id} symbol {symbol}: cannot sell {quantity} — only {ceiling} available"
         )
 
     open_lots = repo.list_open_lots(conn, book_id, symbol)
@@ -136,3 +147,137 @@ def _iso(value: str):
     from datetime import timezone
     dt = datetime.fromisoformat(value)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+_RESERVATION_EVENT = "RESERVED"
+_CONSUMED_EVENT = "CONSUMED_BY_FILL"
+_RELEASE_EVENTS = ("RELEASED_CANCELLED", "RELEASED_REJECTED", "RELEASED_EXPIRED")
+_MANUAL_CORRECTION_EVENT = "MANUAL_CORRECTION"
+
+
+def _write_position_reservation(conn, book_id: str, symbol: str, *, delta_reserved: Decimal, now, commit: bool) -> None:
+    """Adjust reserved_quantity/available_quantity by `delta_reserved`, keeping
+    quantity - reserved_quantity == available_quantity at every write."""
+    position = repo.load_position(conn, book_id, symbol)
+    repo.upsert_position(conn, book_id, symbol, {
+        "quantity": Decimal(position["quantity"]),
+        "available_quantity": Decimal(position["available_quantity"]) - delta_reserved,
+        "reserved_quantity": Decimal(position["reserved_quantity"]) + delta_reserved,
+        "average_cost_usd": Decimal(position["average_cost_usd"]),
+        "realized_pnl_usd": Decimal(position["realized_pnl_usd"]), "fees_usd": Decimal(position["fees_usd"]),
+        "updated_at": now.isoformat(),
+    }, commit=commit)
+
+
+def remaining_share_reservation(conn, book_id: str, paper_order_intent_id: str) -> Decimal:
+    """Original reserved quantity minus every consume/release event recorded for this intent."""
+    reserved = Decimal("0")
+    resolved = Decimal("0")
+    for e in repo.list_external_position_reservation_events(
+        conn, book_id=book_id, paper_order_intent_id=paper_order_intent_id
+    ):
+        if e["event_type"] == _RESERVATION_EVENT:
+            reserved += Decimal(e["quantity"])
+        elif e["event_type"] == _CONSUMED_EVENT or e["event_type"] in _RELEASE_EVENTS:
+            resolved += Decimal(e["quantity"])
+        elif e["event_type"] == _MANUAL_CORRECTION_EVENT:
+            reserved += Decimal(e["quantity"])
+    return reserved - resolved
+
+
+def reserve_shares_for_sell(
+    conn, book_id: str, symbol: str, paper_order_intent_id: str, client_order_id: str, quantity: Decimal, now,
+    *, commit: bool = True,
+) -> bool:
+    """Atomically reserve `quantity` shares for an external closing SELL before submission.
+
+    Fails closed (`InsufficientPositionError`) if fewer shares are
+    confirmed-and-unreserved than requested — this is what prevents a second
+    SELL from reserving or submitting the same shares."""
+    idem = f"reserve:{paper_order_intent_id}"
+    if repo.list_external_position_reservation_events(
+        conn, book_id=book_id, paper_order_intent_id=paper_order_intent_id
+    ):
+        return False
+    position = repo.load_position(conn, book_id, symbol)
+    available = Decimal(position["available_quantity"]) if position else Decimal("0")
+    if quantity > available:
+        raise InsufficientPositionError(
+            f"book {book_id} symbol {symbol}: cannot reserve {quantity} shares for SELL — only {available} available"
+        )
+    inserted = repo.save_external_position_reservation_event(conn, {
+        "reservation_event_id": idem, "book_id": book_id, "symbol": symbol,
+        "paper_order_intent_id": paper_order_intent_id, "client_order_id": client_order_id,
+        "quantity": quantity, "event_type": _RESERVATION_EVENT, "operator": None,
+        "reason": "external closing SELL submission", "created_at": now.isoformat(),
+    }, commit=commit)
+    if inserted:
+        _write_position_reservation(conn, book_id, symbol, delta_reserved=quantity, now=now, commit=commit)
+    return inserted
+
+
+def consume_share_reservation_for_fill(
+    conn, book_id: str, symbol: str, paper_order_intent_id: str, fill_id: str, quantity: Decimal, now,
+    *, commit: bool = True,
+) -> bool:
+    """Consume the reservation attributable to one durably-applied SELL fill.
+
+    Keyed per `fill_id` so idempotent replay never double-consumes; clamped
+    to whatever remains reserved so a malformed fill can never drive the
+    reservation negative."""
+    remaining = remaining_share_reservation(conn, book_id, paper_order_intent_id)
+    if remaining <= 0:
+        return False
+    amount = quantity if quantity < remaining else remaining
+    inserted = repo.save_external_position_reservation_event(conn, {
+        "reservation_event_id": f"consume:{paper_order_intent_id}:fill:{fill_id}",
+        "book_id": book_id, "symbol": symbol, "paper_order_intent_id": paper_order_intent_id,
+        "client_order_id": None, "quantity": amount, "event_type": _CONSUMED_EVENT,
+        "operator": None, "reason": "SELL fill applied", "created_at": now.isoformat(),
+    }, commit=commit)
+    if inserted:
+        _write_position_reservation(conn, book_id, symbol, delta_reserved=-amount, now=now, commit=commit)
+    return inserted
+
+
+def release_remaining_share_reservation(
+    conn, book_id: str, symbol: str, paper_order_intent_id: str, now, *, release_event_id: str, event_type: str,
+    commit: bool = True,
+) -> bool:
+    """Release exactly what remains reserved once an order will receive no more fills.
+
+    Idempotent per `release_event_id`: a second call after the reservation is
+    already fully released is a no-op, so the released total can never
+    exceed the original reservation."""
+    remaining = remaining_share_reservation(conn, book_id, paper_order_intent_id)
+    if remaining <= 0:
+        return False
+    inserted = repo.save_external_position_reservation_event(conn, {
+        "reservation_event_id": f"release:{paper_order_intent_id}:{release_event_id}",
+        "book_id": book_id, "symbol": symbol, "paper_order_intent_id": paper_order_intent_id,
+        "client_order_id": None, "quantity": remaining, "event_type": event_type,
+        "operator": None, "reason": "unresolved external SELL reservation released", "created_at": now.isoformat(),
+    }, commit=commit)
+    if inserted:
+        _write_position_reservation(conn, book_id, symbol, delta_reserved=-remaining, now=now, commit=commit)
+    return inserted
+
+
+def manual_correct_share_reservation(
+    conn, book_id: str, symbol: str, paper_order_intent_id: str, delta_quantity: Decimal, now,
+    *, operator: str, reason: str, commit: bool = True,
+) -> bool:
+    """Explicit, audited operator correction of reservation drift. Never used
+    by application code — every call site must be an audited operator action."""
+    if not operator or not reason:
+        raise ValueError("manual_correct_share_reservation requires a non-empty operator and reason")
+    idem = f"manual:{paper_order_intent_id}:{now.isoformat()}"
+    inserted = repo.save_external_position_reservation_event(conn, {
+        "reservation_event_id": idem, "book_id": book_id, "symbol": symbol,
+        "paper_order_intent_id": paper_order_intent_id, "client_order_id": None,
+        "quantity": delta_quantity, "event_type": _MANUAL_CORRECTION_EVENT,
+        "operator": operator, "reason": reason, "created_at": now.isoformat(),
+    }, commit=commit)
+    if inserted:
+        _write_position_reservation(conn, book_id, symbol, delta_reserved=delta_quantity, now=now, commit=commit)
+    return inserted

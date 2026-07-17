@@ -30,8 +30,7 @@ to stdout, stderr, or logs.
 
 ## Credentials
 
-Read only from environment variables (or a `.env` file LumiBot itself may
-load) — see the main repo's `.env.example`:
+Read only from environment variables — see the main repo's `.env.example`:
 
 * `ALPACA_API_KEY`
 * `ALPACA_API_SECRET`
@@ -43,6 +42,17 @@ load) — see the main repo's `.env.example`:
 * `ALPACA_BASE_URL` — optional assertion; if present it must be exactly
   `https://paper-api.alpaca.markets`. Live, HTTP, localhost, and proxy URLs
   fail closed.
+
+**Dotenv loading (Milestone 11.1).** This process does **not** search the
+filesystem for a `.env` file — an earlier version called
+`find_dotenv(usecwd=True)`, which (since this process is spawned with its
+cwd set to the main repository root) silently discovered and loaded the
+*main repository's own* `.env`, including secrets this isolated process has
+no business seeing (Anthropic/Reddit/Robinhood/database credentials). If you
+need file-based credential injection instead of setting the environment
+variables above directly, set `PAPER_RUNTIME_ENV_FILE` to the path of one
+dedicated, Alpaca-only dotenv file stored outside the main repository; only
+that exact file is loaded, and only if named explicitly.
 
 ## Offline testing
 

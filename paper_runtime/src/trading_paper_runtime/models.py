@@ -40,9 +40,27 @@ def _require(condition: bool, message: str) -> None:
 
 def _parse_decimal(value: str, name: str) -> Decimal:
     try:
-        return Decimal(value)
+        parsed = Decimal(value)
     except (InvalidOperation, TypeError) as exc:
         raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"{name} is not a valid decimal string: {value!r}") from exc
+    if not parsed.is_finite():
+        raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"{name} must be a finite decimal value, got {value!r}")
+    return parsed
+
+
+def _parse_exact_int(value: object, name: str) -> int:
+    """Part 13: never truncate through `int(float(...))` or `int(Decimal(...))`
+    — a broker-reported quantity must be an exact whole number or this fails
+    closed, rather than silently rounding a fractional or non-finite value."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError) as exc:
+        raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"{name} is not a valid number: {value!r}") from exc
+    if not parsed.is_finite():
+        raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"{name} must be finite, got {value!r}")
+    if parsed != parsed.to_integral_value():
+        raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, f"{name} must be a whole number, got {value!r}")
+    return int(parsed)
 
 
 def _parse_dt(value: str, name: str) -> datetime:

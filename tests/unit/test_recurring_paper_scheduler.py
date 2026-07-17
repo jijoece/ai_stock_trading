@@ -59,7 +59,36 @@ def cfg(*, enabled=True, maximum_cycles=2, scheduled=True) -> PaperBooksConfigur
     )
 
 
-def ready_review(conn, config):
+def _save_campaign(conn, campaign_id, *, manifest_hash="manifest", config_hash="campaign-config"):
+    if repo.load_soak_campaign(conn, campaign_id) is None:
+        repo.save_soak_campaign(conn, {
+            "campaign_id": campaign_id, "manifest_hash": manifest_hash, "config_hash": config_hash,
+            "start_as_of": REVIEW_TIME, "end_as_of": REVIEW_TIME, "requested_date_count": 1,
+            "requested_cycle_count": 1, "status": "DEFINED",
+            "first_blocking_date": None, "first_blocking_status": None, "created_at": REVIEW_TIME,
+        })
+
+
+def _save_attempt(
+    conn, attempt_id, campaign_id, *, status, manifest_hash="manifest", config_hash="attempt-config",
+    attempt_number=1, previous_attempt_id=None,
+):
+    repo.save_soak_campaign_attempt(conn, {
+        "campaign_attempt_id": attempt_id, "campaign_id": campaign_id,
+        "manifest_hash": manifest_hash, "config_hash": config_hash,
+        "previous_attempt_id": previous_attempt_id, "attempt_number": attempt_number, "continue_after_blocker": False,
+        "status": status, "started_at": REVIEW_TIME,
+        "completed_at": REVIEW_TIME, "first_blocking_date": None, "first_blocking_status": None,
+        "failure_code": None, "failure_stage": None, "sanitized_message": None,
+        "operator": None, "reason": None, "created_at": REVIEW_TIME,
+    })
+
+
+def ready_review(
+    conn, config, *, campaign_id="ready-campaign", attempt_id="ready-attempt", review_id="ready-review",
+    attempt_status=None, supersedes=None, attempt_campaign_id=None, config_hash="attempt-config",
+    create_attempt=True, attempt_number=1, previous_attempt_id=None,
+):
     for book in (config.baseline, config.enhanced):
         cash_ledger.open_book(
             conn, book_id=book.book_id, starting_cash_usd=book.starting_cash_usd,
@@ -68,14 +97,17 @@ def ready_review(conn, config):
     verification = verify_cross_book_integrity(conn, as_of=REVIEW_TIME, paper_books_config=config)
     assert verification.status == "PASSED"
     persist_verification(conn, verification, operator_run_id=None, lifecycle_run_id=None, created_at=REVIEW_TIME)
-    repo.save_soak_campaign(conn, {
-        "campaign_id": "ready-campaign", "manifest_hash": "manifest", "config_hash": "campaign-config",
-        "start_as_of": REVIEW_TIME, "end_as_of": REVIEW_TIME, "requested_date_count": 1,
-        "requested_cycle_count": 1, "status": "COMPLETED_READY_FOR_REVIEW",
-        "first_blocking_date": None, "first_blocking_status": None, "created_at": REVIEW_TIME,
-    })
+    _save_campaign(conn, campaign_id)
+    if create_attempt:
+        _save_attempt(
+            conn, attempt_id, attempt_campaign_id or campaign_id,
+            status=attempt_status or campaign_mod.CAMPAIGN_COMPLETED_READY, config_hash=config_hash,
+            attempt_number=attempt_number, previous_attempt_id=previous_attempt_id,
+        )
     record = {
-        "activation_review_id": "ready-review", "campaign_id": "ready-campaign",
+        "activation_review_id": review_id, "campaign_id": campaign_id,
+        "campaign_attempt_id": attempt_id, "config_hash": config_hash,
+        "supersedes_activation_review_id": supersedes,
         "campaign_manifest_hash": "manifest", "completed_market_days": 1, "completed_cycles": 1,
         "provider_provenance_counts": {}, "provider_success_counts": {"real_provider_success_cycles": 1},
         "cross_book_verification_history": [{
@@ -142,6 +174,67 @@ def test_missing_and_stale_activation_reviews_fail(conn):
         rs.request_recurring_activation(
             conn, activation_review_id="ready-review", operator="a", reason="r",
             paper_books_config=config, now=stale_now,
+        )
+
+
+def test_definition_may_remain_defined_while_terminal_attempt_activates(conn):
+    config = cfg()
+    activate_ready(conn, config)
+    campaign = repo.load_soak_campaign(conn, "ready-campaign")
+    assert campaign["status"] == "DEFINED"
+    attempt = repo.load_soak_campaign_attempt(conn, "ready-attempt")
+    assert attempt["status"] == campaign_mod.CAMPAIGN_COMPLETED_READY
+
+
+def test_activation_rejects_review_with_missing_attempt(conn):
+    config = cfg()
+    ready_review(conn, config, create_attempt=False)
+    with pytest.raises(rs.RecurringPaperError, match="unknown campaign attempt"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="ready-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+        )
+
+
+def test_activation_rejects_running_attempt(conn):
+    config = cfg()
+    ready_review(conn, config, attempt_status=campaign_mod.ATTEMPT_RUNNING)
+    with pytest.raises(rs.RecurringPaperError, match="campaign attempt status"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="ready-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+        )
+
+
+def test_activation_rejects_superseded_review(conn):
+    config = cfg()
+    ready_review(conn, config)
+    ready_review(
+        conn, config, attempt_id="ready-attempt-2", review_id="newer-review",
+        supersedes="ready-review", create_attempt=True, attempt_number=2,
+        previous_attempt_id="ready-attempt",
+    )
+    with pytest.raises(rs.RecurringPaperError, match="superseded"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="ready-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+        )
+    request = rs.request_recurring_activation(
+        conn, activation_review_id="newer-review", operator="a", reason="r",
+        paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+    )
+    assert request["activation_review_id"] == "newer-review"
+
+
+def test_activation_rejects_cross_campaign_attempt(conn):
+    config = cfg()
+    ready_review(conn, config, create_attempt=False)
+    _save_campaign(conn, "other-campaign")
+    _save_attempt(conn, "ready-attempt", "other-campaign", status=campaign_mod.CAMPAIGN_COMPLETED_READY)
+    with pytest.raises(rs.RecurringPaperError, match="does not belong to the review's campaign"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="ready-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
         )
 
 
@@ -250,6 +343,22 @@ def make_scheduler_ready(monkeypatch):
         rs, "compute_real_provider_history",
         lambda *a, **k: SimpleNamespace(real_provider_success_cycle_count=1),
     )
+
+
+def test_recurring_scheduler_module_never_imports_the_external_broker():
+    """Part 19 integration scenario (activation -> recurring cycle -> queue
+    only, no broker mutation): structurally, `recurring_scheduler.py` cannot
+    submit or cancel externally because it never imports `external_broker`
+    at all — enforced here so a future change can't silently wire it in.
+    The runtime behavior half of this scenario (an externally-enabled
+    book's pending order lands in the queue table, not a broker call) is
+    covered by
+    test_paper_books_scheduled_integration.py::test_external_enabled_book_is_queued_without_local_fill_or_runtime_mutation.
+    """
+    import inspect
+
+    source = inspect.getsource(rs)
+    assert "external_broker" not in source
 
 
 def test_scheduler_lifecycle_only_persists_and_replays_idempotently(conn, monkeypatch):
