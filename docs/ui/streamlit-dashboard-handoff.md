@@ -4,7 +4,8 @@
 
 - Starting commit: `5af1923e1d468c84b819d6a30eebed82937ae7f3`
 - Current branch: `agent/milestone-13-risk-controls`
-- Working tree at start: `docs/milestones/20-ui.md` was already untracked.
+- Working tree at Phase 3 start: Phase 1-2 dashboard changes were present;
+  `docs/milestones/20-ui.md` was already untracked.
 - Python version: `3.14.5rc1` (`.venv/bin/python`)
 - Database configuration source: `src/trading_research/config.py` reads
   `RESEARCH_DATABASE_PATH`, defaulting under `RESEARCH_DATA_DIR` to
@@ -67,47 +68,102 @@ All contracts are immutable frozen dataclasses in
 
 | View | Service | Status |
 |---|---|---|
-| `DashboardOverview` | `overview_service` | Contract complete; service is Phase 2 |
-| `CandidateDecisionSummary` | `decision_service` | Contract and outcome mapper complete; service is Phase 2 |
-| `CandidateDecisionDetail` | `decision_service` | Contract complete; service is Phase 2 |
-| `ResearchCycleSummary` | `cycle_service` | Contract complete; service is Phase 3 |
-| `PortfolioSummary`, `PositionSummary` | `portfolio_service` | Contracts complete; service is Phase 3 |
-| `ProviderHealthSummary`, `SystemStatusSummary` | `health_service` | Contracts complete; service is Phase 3 |
+| `DashboardOverview` | `overview_service` | Phase 2 complete; latest persisted aggregate |
+| `CandidateDecisionSummary` | `decision_service` | Phase 2 complete; bounded filtered query and mapper |
+| `CandidateDecisionDetail` | `decision_service` | Phase 2 complete; whitelisted structured detail |
+| `ResearchCycleSummary`, `ResearchCycleDetail`, `ResearchCycleFunnel` | `cycle_service` | Phase 3 complete; bounded history, funnel, ticker decisions |
+| `PortfolioSummary`, `PositionSummary`, order/fill summaries | `portfolio_service` | Phase 3 complete; bounded book, position, order, and fill queries |
+| `ProviderHealthSummary`, `SystemStatusSummary`, `SystemHealthView` | `health_service` | Phase 3 complete; operational and provider-partitioned health |
 
 ## Phase status
 
 - [x] Phase 1 — Discovery and contracts
-- [ ] Phase 2 — Foundation and decision UI
-- [ ] Phase 3 — Portfolio, cycles, and health
+- [x] Phase 2 — Foundation and decision UI
+- [x] Phase 3 — Portfolio, cycles, and health
 - [ ] Phase 4 — Tailscale and final validation
 
 ## Files changed
 
 - `dashboard/models/view_models.py` — immutable view contracts, dashboard
-  outcome taxonomy, deterministic mapper, bounded unknown explanation.
+  outcome taxonomy, deterministic mapper, bounded unknown explanation, and
+  structured decision-detail fields.
+- `dashboard/services/database.py` — sanitized configuration and short-lived
+  SQLite URI `mode=ro` connections with `query_only` enabled.
+- `dashboard/services/decision_service.py` — parameterized, bounded decision
+  summary/detail queries and whitelisted structured payload parsing.
+- `dashboard/services/overview_service.py` — latest persisted paper-book,
+  cycle, scheduler, pause, and decision aggregates.
+- `dashboard/services/cycle_service.py` — bounded research-cycle history,
+  persisted funnel stages, provider/model partitions, and ticker decisions.
+- `dashboard/services/portfolio_service.py` — filtered paper books, positions,
+  persisted price provenance, orders, and fills, capped at 200 rows per book.
+- `dashboard/services/health_service.py` — pause/scheduler/budget/hysteresis
+  state plus separate evidence- and model-provider health partitions.
+- `dashboard/streamlit_app.py` — five-page navigation with unique URL paths.
+- `dashboard/pages/overview.py` — persisted overview metrics with explicit
+  `Not available` handling.
+- `dashboard/pages/decisions.py` — bounded filters, result table, and bought
+  and not-bought decision-path details shared by cycle drill-down.
+- `dashboard/pages/research_cycles.py` — cycle table, funnel, and ticker
+  decision detail.
+- `dashboard/pages/portfolio.py` — book/position/activity filters with
+  positions, price source/timestamp, orders, and fills.
+- `dashboard/pages/system_health.py` — operational state and distinct
+  evidence/model provider tables; non-production recovery is labeled.
+- `.streamlit/config.toml` — loopback-only, headless, CORS/XSRF-protected
+  Streamlit configuration with detailed errors and telemetry disabled.
+- `pyproject.toml` — adds Streamlit and Pandas runtime dependencies.
 - `tests/dashboard/test_view_models.py` — focused mapper and immutability tests.
+- `tests/dashboard/conftest.py` — temporary persisted SQLite fixture.
+- `tests/dashboard/test_database.py` — missing-path, row, and write-rejection tests.
+- `tests/dashboard/test_decision_service.py` — filter, bound, mapping, and detail tests.
+- `tests/dashboard/test_overview_service.py` — persisted overview aggregation test.
+- `tests/dashboard/test_cycle_service.py`, `test_portfolio_service.py`, and
+  `test_health_service.py` — Phase 3 read-only service coverage.
+- `tests/dashboard/test_dashboard_smoke.py` — side-effect-free imports and all
+  five page renders, including cycle drill-down.
 - `docs/ui/streamlit-dashboard-handoff.md` — persistence inventory and phase handoff.
 
 ## Focused tests completed
 
-- `.venv/bin/python -m pytest tests/dashboard/test_view_models.py -q`
-- Result: `17 passed in 0.02s`.
+- `.venv/bin/python -m pytest tests/dashboard/test_database.py tests/dashboard/test_decision_service.py tests/dashboard/test_view_models.py tests/dashboard/test_overview_service.py tests/dashboard/test_dashboard_smoke.py -q`
+- Result: `30 passed in 0.80s`.
+- `.venv/bin/streamlit config show` validated all committed options with
+  Streamlit `1.59.2`, including `address = "127.0.0.1"`.
+- Local server smoke: loopback server started and `/_stcore/health` returned
+  `ok`; the server was then stopped.
+- Phase 3 service focus: `.venv/bin/python -m pytest
+  tests/dashboard/test_cycle_service.py tests/dashboard/test_portfolio_service.py
+  tests/dashboard/test_health_service.py -q` — `7 passed in 0.14s`.
+- Phase 3 dashboard suite: `.venv/bin/python -m pytest tests/dashboard -q` —
+  `40 passed in 1.16s`.
+- `git diff --check` passed; targeted write-statement scan found no write or
+  direct SQLite connection in the Phase 3 services/pages.
 
 ## Known limitations
 
-- Phase 1 contains no database query services or UI.
-- Scheduled paper integration returns detailed per-arm outcomes but does not
-  persist that return object directly; later services must join the persisted
-  assignment, risk, order, fill, and lifecycle tables.
+- Decision outcome and reason filters scan at most 1,000 persisted candidates
+  before returning at most 200 results; there is no unbounded load.
+- Overview outcome counts display unavailable when the latest cycle exceeds
+  the 200-candidate service bound instead of showing partial or fabricated data.
+- Portfolio activity is bounded to the latest 200 orders and fills per book;
+  cycle history is bounded to 200 cycles and ticker drill-down to 200 decisions.
+- Portfolio valuations use only the latest persisted snapshot/current-position
+  price. Missing price source/timestamp remains `Not available`; no live price
+  lookup is performed.
+- Provider failure/recovery streaks use the latest 2,000 persisted events.
+  Fixture, deterministic, and scripted model partitions are labeled
+  `NON_PRODUCTION` and never contribute a production recovery streak.
 - No stable candidate-level persisted code distinguishes successful duplicate
   prevention, and `STILL_PENDING` does not distinguish a price condition from
   an external order awaiting an operator. Both remain `UNKNOWN` as required.
-- Legacy simulated/execution tables coexist with isolated paper-book tables;
-  Phase 2 should prefer isolated paper-book evidence and label legacy data.
+- The dashboard uses only isolated paper-book evidence; legacy execution data is not
+  shown.
 
 ## Exact next task
 
-Start a fresh session and execute Phase 2 only: read this handoff, add the
-read-only SQLite helper, Streamlit configuration and navigation, Overview and
-Decisions services/pages/detail, and Phase 2 focused tests. Do not implement
-Phase 3 views or Phase 4 startup/Tailscale work.
+Start a fresh session and execute Phase 4 only: add safe loopback startup,
+status, shutdown, and Tailscale Serve scripts; write the deployment/security
+runbook; run the milestone's final offline and local validation; then update
+this handoff. Do not enable Tailscale Funnel or any dashboard write/control
+action.

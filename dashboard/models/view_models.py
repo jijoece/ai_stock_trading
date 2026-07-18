@@ -86,6 +86,20 @@ class CandidateDecisionDetail:
     paper_order_intent_id: str | None
     fill_id: str | None
     provider_failure_codes: tuple[str, ...]
+    bull_thesis: str | None = None
+    bear_case: str | None = None
+    catalysts: tuple[str, ...] = ()
+    risks: tuple[str, ...] = ()
+    evidence_references: tuple[str, ...] = ()
+    policy_checks: tuple[str, ...] = ()
+    reference_price: Decimal | None = None
+    limit_price: Decimal | None = None
+    quantity: Decimal | None = None
+    fill_status: str | None = None
+    failed_stage: str | None = None
+    observed_value: str | None = None
+    required_threshold: str | None = None
+    block_category: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +116,28 @@ class ResearchCycleSummary:
     symbols_failed: int
     started_at: datetime
     completed_at: datetime | None
+    scheduler_run_id: str | None
+    research_provider_partitions: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchCycleFunnel:
+    selected: int
+    screened_out: int
+    evidence_incomplete: int
+    research_incomplete: int
+    policy_rejected: int
+    buy_candidates: int
+    paper_submitted: int
+    filled: int
+    not_filled: int
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchCycleDetail:
+    summary: ResearchCycleSummary
+    funnel: ResearchCycleFunnel
+    decisions: tuple[CandidateDecisionSummary, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,11 +154,39 @@ class PositionSummary:
     unrealized_pnl: Decimal | None
     valuation_status: str | None
     valued_at: datetime | None
+    price_source: str | None
+    allocation_percentage: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class PaperOrderSummary:
+    book_id: str
+    order_id: str
+    symbol: str
+    side: str
+    quantity: Decimal
+    limit_price: Decimal
+    status: str
+    cycle_id: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PaperFillSummary:
+    book_id: str
+    fill_id: str
+    order_id: str
+    symbol: str
+    side: str
+    quantity: Decimal
+    fill_price: Decimal
+    filled_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
 class PortfolioSummary:
     book_id: str
+    experiment_arm: str
     as_of: datetime | None
     status: str
     cash_available: Decimal | None
@@ -133,11 +197,17 @@ class PortfolioSummary:
     unrealized_pnl: Decimal | None
     valuation_status: str | None
     positions: tuple[PositionSummary, ...]
+    orders: tuple[PaperOrderSummary, ...]
+    fills: tuple[PaperFillSummary, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderHealthSummary:
+    provider_kind: str
     provider: str
+    model: str | None
+    mode: str | None
+    is_production: bool
     status: str
     window_start: datetime | None
     window_end: datetime | None
@@ -149,19 +219,36 @@ class ProviderHealthSummary:
     average_latency_ms: float | None
     p95_latency_ms: float | None
     latest_error_code: str | None
+    failure_streak: int
+    recovery_streak: int
+    authentication_failures: int
+    configuration_failures: int
+    timeout_failures: int
+    rate_limit_failures: int
+    quota_failures: int
 
 
 @dataclass(frozen=True, slots=True)
 class SystemStatusSummary:
-    as_of: datetime
+    as_of: datetime | None
     shadow_pause_state: str | None
     recurring_activation_state: str | None
     latest_shadow_scheduler_status: str | None
     latest_recurring_scheduler_status: str | None
+    latest_successful_run_at: datetime | None
     health_status: str | None
     hysteresis_status: str | None
     hysteresis_reasons: tuple[str, ...]
     active_safety_pauses: tuple[str, ...]
+    budget_status: str | None
+    active_policy_version: str | None
+    active_policy_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SystemHealthView:
+    status: SystemStatusSummary
+    providers: tuple[ProviderHealthSummary, ...]
 
 
 _SUBMITTED_ORDER_STATUSES = frozenset({"SUBMITTED", "PARTIALLY_FILLED", "FILLED"})
