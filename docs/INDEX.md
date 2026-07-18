@@ -27,8 +27,9 @@ read multiple milestone variants unless the task requires comparing them.
 | System boundaries and target architecture | [`AI-Driven-Stock-Trading-Architecture.md`](AI-Driven-Stock-Trading-Architecture.md) |
 | Original roadmap and acceptance criteria | [`AI-Stock-Trading-Implementation-Plan.md`](AI-Stock-Trading-Implementation-Plan.md) |
 | External research-source policy | [`AI-Stock-Trading-Research-Sources.md`](AI-Stock-Trading-Research-Sources.md) |
-| Current remaining integrity work | [`milestone11-3-remaining-integrity-closure.md`](milestone11-3-remaining-integrity-closure.md) |
-| Latest full integrity-closure specification | [`milestone11-2-full-integrity-closure.md`](milestone11-2-full-integrity-closure.md) |
+| Latest completed integrity implementation | [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md) |
+| Milestone 11.3 specification | [`milestones/milestone11-3-remaining-integrity-closure.md`](milestones/milestone11-3-remaining-integrity-closure.md) |
+| Latest full integrity-closure specification | [`milestones/milestone11-2-full-integrity-closure.md`](milestones/milestone11-2-full-integrity-closure.md) |
 | Latest repository audit | [`full-codebase-audit.md`](full-codebase-audit.md) |
 
 ## Architecture decisions
@@ -79,24 +80,24 @@ criteria, or the rationale not captured in an ADR.
 
 | Milestone | Primary specification | Developer or closure detail |
 |---|---|---|
-| 1 | [`milestone1-foundation.md`](milestone1-foundation.md) | Foundation developer guide |
-| 2 | [`milestone-2.md`](milestone-2.md) | [`milestone2-analysis-layer.md`](milestone2-analysis-layer.md) |
-| 3 | [`milestone-3.md`](milestone-3.md) | [`milestone3-lumibot-paper-integration.md`](milestone3-lumibot-paper-integration.md) |
-| 4 | [`milestone-4.md`](milestone-4.md) | [`milestone4-isolated-paper-broker.md`](milestone4-isolated-paper-broker.md) |
-| 5 | [`milestone-5.md`](milestone-5.md) | [`milestone5-evidence-backed-claude-research.md`](milestone5-evidence-backed-claude-research.md) |
-| 6 | [`milestone-6.md`](milestone-6.md) | [`milestone6-real-evidence-continuous-evaluation.md`](milestone6-real-evidence-continuous-evaluation.md), [`milestone-6.1.md`](milestone-6.1.md) |
-| 7 | [`milestone-7.md`](milestone-7.md) | [`milestone7-production-shadow-operations.md`](milestone7-production-shadow-operations.md), [`milestone-7.1.md`](milestone-7.1.md), [`milestone7-1-shadow-integration-closure.md`](milestone7-1-shadow-integration-closure.md), [`milestone-7.2.md`](milestone-7.2.md), [`milestone7-2-shadow-health-diagnostics.md`](milestone7-2-shadow-health-diagnostics.md) |
-| 8 | [`milestone-8.md`](milestone-8.md) | [`milestone8-isolated-paper-portfolios.md`](milestone8-isolated-paper-portfolios.md), [`milestone-8.1.md`](milestone-8.1.md), [`milestone8-1-scheduled-paper-book-integration.md`](milestone8-1-scheduled-paper-book-integration.md) |
-| 9 | [`milestone-9.md`](milestone-9.md) | [`milestone9-manual-paper-soak-and-lifecycle.md`](milestone9-manual-paper-soak-and-lifecycle.md), [`milestone-9.1.md`](milestone-9.1.md), [`milestone9-1-controlled-soak-readiness.md`](milestone9-1-controlled-soak-readiness.md), [`milestone-9.2.md`](milestone-9.2.md), [`milestone9-2-soak-evidence-integrity.md`](milestone9-2-soak-evidence-integrity.md), [`milestone-9-3-soak-campaign.md`](milestone-9-3-soak-campaign.md), [`milestone9-3-evidence-integrity-and-soak-campaign.md`](milestone9-3-evidence-integrity-and-soak-campaign.md), [`milestone9-3-1-campaign-integrity.md`](milestone9-3-1-campaign-integrity.md) |
-| 10 | [`milestone10-controlled-recurring-local-paper.md`](milestone10-controlled-recurring-local-paper.md) | Current scheduler behavior remains defined by code and its runbook |
-| 11 | [`milestone-11-alpaca-paper-boundary.md`](milestone-11-alpaca-paper-boundary.md) | [`milestone11-isolated-alpaca-paper-broker.md`](milestone11-isolated-alpaca-paper-broker.md), [`milestone11-1-external-paper-safety-closure.md`](milestone11-1-external-paper-safety-closure.md), [`milestone11-2-full-integrity-closure.md`](milestone11-2-full-integrity-closure.md), [`milestone11-3-remaining-integrity-closure.md`](milestone11-3-remaining-integrity-closure.md) |
+| 1 | [`milestones/milestone1-foundation.md`](milestones/milestone1-foundation.md) | Foundation developer guide |
+| 2 | [`milestones/milestone-2.md`](milestones/milestone-2.md) | [`milestones/milestone2-analysis-layer.md`](milestones/milestone2-analysis-layer.md) |
+| 3 | [`milestones/milestone-3.md`](milestones/milestone-3.md) | [`milestones/milestone3-lumibot-paper-integration.md`](milestones/milestone3-lumibot-paper-integration.md) |
+| 4 | [`milestones/milestone-4.md`](milestones/milestone-4.md) | [`milestones/milestone4-isolated-paper-broker.md`](milestones/milestone4-isolated-paper-broker.md) |
+| 5 | [`milestones/milestone-5.md`](milestones/milestone-5.md) | [`milestones/milestone5-evidence-backed-claude-research.md`](milestones/milestone5-evidence-backed-claude-research.md) |
+| 6 | [`milestones/milestone-6.md`](milestones/milestone-6.md) | [`milestones/milestone6-real-evidence-continuous-evaluation.md`](milestones/milestone6-real-evidence-continuous-evaluation.md), [`milestones/milestone-6.1.md`](milestones/milestone-6.1.md) |
+| 7 | [`milestones/milestone-7.md`](milestones/milestone-7.md) | [`milestones/milestone7-production-shadow-operations.md`](milestones/milestone7-production-shadow-operations.md), [`milestones/milestone-7.1.md`](milestones/milestone-7.1.md), [`milestones/milestone7-1-shadow-integration-closure.md`](milestones/milestone7-1-shadow-integration-closure.md), [`milestones/milestone-7.2.md`](milestones/milestone-7.2.md), [`milestones/milestone7-2-shadow-health-diagnostics.md`](milestones/milestone7-2-shadow-health-diagnostics.md) |
+| 8 | [`milestones/milestone-8.md`](milestones/milestone-8.md) | [`milestones/milestone8-isolated-paper-portfolios.md`](milestones/milestone8-isolated-paper-portfolios.md), [`milestones/milestone-8.1.md`](milestones/milestone-8.1.md), [`milestones/milestone8-1-scheduled-paper-book-integration.md`](milestones/milestone8-1-scheduled-paper-book-integration.md) |
+| 9 | [`milestones/milestone-9.md`](milestones/milestone-9.md) | [`milestones/milestone9-manual-paper-soak-and-lifecycle.md`](milestones/milestone9-manual-paper-soak-and-lifecycle.md), [`milestones/milestone-9.1.md`](milestones/milestone-9.1.md), [`milestones/milestone9-1-controlled-soak-readiness.md`](milestones/milestone9-1-controlled-soak-readiness.md), [`milestones/milestone-9.2.md`](milestones/milestone-9.2.md), [`milestones/milestone9-2-soak-evidence-integrity.md`](milestones/milestone9-2-soak-evidence-integrity.md), [`milestones/milestone-9-3-soak-campaign.md`](milestones/milestone-9-3-soak-campaign.md), [`milestones/milestone9-3-evidence-integrity-and-soak-campaign.md`](milestones/milestone9-3-evidence-integrity-and-soak-campaign.md), [`milestones/milestone9-3-1-campaign-integrity.md`](milestones/milestone9-3-1-campaign-integrity.md) |
+| 10 | [`milestones/milestone10-controlled-recurring-local-paper.md`](milestones/milestone10-controlled-recurring-local-paper.md) | Current scheduler behavior remains defined by code and its runbook |
+| 11 | [`milestones/milestone-11-alpaca-paper-boundary.md`](milestones/milestone-11-alpaca-paper-boundary.md) | [`milestones/milestone11-isolated-alpaca-paper-broker.md`](milestones/milestone11-isolated-alpaca-paper-broker.md), [`milestones/milestone11-1-external-paper-safety-closure.md`](milestones/milestone11-1-external-paper-safety-closure.md), [`milestones/milestone11-2-full-integrity-closure.md`](milestones/milestone11-2-full-integrity-closure.md), [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md), [`milestones/milestone11-3-remaining-integrity-closure.md`](milestones/milestone11-3-remaining-integrity-closure.md) |
 
 ## Superseded, duplicate, and pending notes
 
 These are retained for history and should not be used for current behavior:
 
-- [`milestone-7 pending.md`](milestone-7%20pending.md)
-- [`milestone-7 pending copy.md`](milestone-7%20pending%20copy.md)
-- [`milestone11-2-integrity-closure.md`](milestone11-2-integrity-closure.md) — use the full specification above
-- [`milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md`](milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md) — alternate Milestone 9.3.1 detail
-- [`pitfalls_and_improvements.md`](pitfalls_and_improvements.md) — exact duplicate
+- [`milestones/milestone-7 pending.md`](milestones/milestone-7%20pending.md)
+- [`milestones/milestone-7 pending copy.md`](milestones/milestone-7%20pending%20copy.md)
+- [`milestones/milestone11-2-integrity-closure.md`](milestones/milestone11-2-integrity-closure.md) — use the full specification above
+- [`milestones/milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md`](milestones/milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md) — superseded by the campaign-integrity document above
+- [`pitfalls_and_improvements.md`](pitfalls_and_improvements.md) — exact duplicate of `codebase-analysis-pitfalls.md`
