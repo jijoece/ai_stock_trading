@@ -15,7 +15,7 @@ Starting point: commit `23a438956ead7c00ee19369a0e39667e5ae6e4fd` on branch
 
 ## Schema and behavior changes
 
-Migration 10 additively adds `scheduler_run_id`, `research_cycle_id`,
+Migration 11 additively adds `scheduler_run_id`, `research_cycle_id`,
 `attempt_control_check_id`, and `correlation_mode` to `research_attempts`, plus
 an index on correlation mode, scheduler run, provider, model, creation time,
 and attempt ID. Existing rows remain unowned with `LEGACY_UNKNOWN`; no

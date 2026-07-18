@@ -49,14 +49,15 @@ failure analysis, and operational safety—not autonomous trading.
 | Shadow operations | Market-day scheduling, singleton leases, budgets, health diagnostics, alerts, pause/kill state, and readiness reports | Disabled |
 | Isolated paper portfolios | Independent `BASELINE` and `ENHANCED` books with separate cash, lots, positions, fills, snapshots, valuation, and reconciliation | Subsystem disabled |
 | Experiment evaluation | Baseline/enhanced comparisons, calibration, turnover, time-to-fill, cross-book verification, and advisory promotion evidence | Read-only/advisory |
-| Position lifecycle | Pending-order handling, stop loss, profit target, maximum holding period, reversal exits, and explicit manual exits | Disabled |
+| Position lifecycle | Pending-order handling, ATR stops, trailing/breakeven protection, deterministic partial profits, maximum holding period, reversal exits, and explicit manual exits | Disabled |
+| Advanced risk validation | Persisted daily-loss/drawdown breakers, point-in-time economic blackout boundary, and deterministic daily-bar control backtests | Disabled / offline |
 | Controlled soak campaigns | Bounded multi-day campaigns, resumable attempts, activation reviews, evidence integrity, and operator reports | Disabled |
 | Recurring local paper runs | Explicit review/request/activation flow, frozen-cycle queue, schedule, lease, and pre-run safety gates | Disabled |
 | Alpaca paper boundary | Isolated runtime process, account checks, preview, explicit submit/cancel, fills, reconciliation, and guarded retry | Disabled; paper account only |
 | Audit and recovery | Append-only event chains, immutable records, schema migrations, transaction discipline, crash atomicity, and sanitized failures | Always enforced |
 | Developer tooling | Unified CLI, deterministic fixtures, offline test suite, Pyright integration, CI, ADRs, and runbooks | Available |
 
-Current implementation baseline: **Milestone 11.3 complete (July 2026)**.
+Current implementation baseline: **Milestone 13 advanced risk controls (July 2026)**.
 
 ## Quick start: offline demo
 
@@ -103,6 +104,7 @@ python -m trading_research.cli <command> --help
 | Configure recurring local runs | [Recurring local simulation](#recurring-local-simulation) and its [runbook](docs/runbooks/recurring-local-paper-trading.md) |
 | Use the Alpaca paper boundary | [External paper CLI](#operator-only-external-alpaca-paper-path) and the [Alpaca runbook](docs/runbooks/alpaca-paper-operations.md) |
 | Find the right design document | [Canonical documentation index](docs/INDEX.md) |
+| Understand advanced risk controls | [Advanced risk controls](docs/advanced-risk-controls.md) |
 | Contribute code | [Development and contributing](#development-and-contributing) |
 
 ## Contents

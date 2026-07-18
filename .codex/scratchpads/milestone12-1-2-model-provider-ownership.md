@@ -18,7 +18,7 @@
 
 ## Schema changes
 
-Migration 10 adds nullable `scheduler_run_id`, `research_cycle_id`, and
+Migration 11 adds nullable `scheduler_run_id`, `research_cycle_id`, and
 `attempt_control_check_id`, plus `correlation_mode NOT NULL DEFAULT
 'LEGACY_UNKNOWN'`, and a scheduled provider/model lookup index. Existing rows
 are preserved without inferred ownership.
