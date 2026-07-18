@@ -27,4 +27,7 @@ research-results/*.md
 batch/runs/*
 !batch/runs/.gitkeep
 
+# Dashboard runtime state (PID/log files, not source)
+data/.dashboard_runtime/
+
 .DS_Store

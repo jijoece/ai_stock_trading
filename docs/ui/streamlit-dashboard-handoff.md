@@ -80,7 +80,7 @@ All contracts are immutable frozen dataclasses in
 - [x] Phase 1 — Discovery and contracts
 - [x] Phase 2 — Foundation and decision UI
 - [x] Phase 3 — Portfolio, cycles, and health
-- [ ] Phase 4 — Tailscale and final validation
+- [x] Phase 4 — Tailscale and final validation
 
 ## Files changed
 
@@ -123,6 +123,18 @@ All contracts are immutable frozen dataclasses in
 - `tests/dashboard/test_dashboard_smoke.py` — side-effect-free imports and all
   five page renders, including cycle drill-down.
 - `docs/ui/streamlit-dashboard-handoff.md` — persistence inventory and phase handoff.
+- `scripts/run_dashboard.sh` — verifies env/database/Streamlit, starts the
+  dashboard bound to `127.0.0.1:8501`, writes a PID file under
+  `data/.dashboard_runtime/`, never prints the full database path.
+- `scripts/stop_dashboard.sh` — stops only the PID-file process; no `pkill`.
+- `scripts/tailscale_serve_dashboard.sh` — verifies `tailscale` CLI,
+  connection, and local health, then runs `tailscale serve --bg
+  127.0.0.1:8501`; never invokes Funnel.
+- `scripts/dashboard_status.sh` — reports process, health, DB existence and
+  mtime, and Tailscale connection/Serve status without secrets or full paths.
+- `docs/ui/streamlit-dashboard.md` — architecture, install, env var, startup,
+  Tailscale prerequisites/setup, remote access, status/shutdown/Serve
+  disablement, security boundaries, limitations, troubleshooting.
 
 ## Focused tests completed
 
@@ -139,6 +151,23 @@ All contracts are immutable frozen dataclasses in
   `40 passed in 1.16s`.
 - `git diff --check` passed; targeted write-statement scan found no write or
   direct SQLite connection in the Phase 3 services/pages.
+- Phase 4 full offline suite: `.venv/bin/python -m pytest tests/dashboard/ -q`
+  — `40 passed`; `.venv/bin/python -m pytest tests/ -q` — `2448 passed, 18
+  skipped`; `(cd paper_runtime && ../.venv/bin/python -m pytest tests/ -q)` —
+  `53 passed, 1 skipped`.
+- `.venv/bin/python -m compileall -q dashboard src` — clean; `pyright
+  --project pyright-safety.json` — `0 errors, 0 warnings`; `git diff --check`
+  — clean.
+- Local smoke: `scripts/run_dashboard.sh` against a temporary throwaway
+  SQLite file started the server; `curl .../_stcore/health` returned `ok`;
+  `lsof -nP -iTCP:8501 -sTCP:LISTEN` confirmed `127.0.0.1:8501` only;
+  `scripts/dashboard_status.sh` and `scripts/stop_dashboard.sh` verified
+  end-to-end; the listener was confirmed gone after stop.
+- Tailscale CLI is not installed on this development machine, so
+  `tailscale_serve_dashboard.sh` and the connection/Serve status sections of
+  `dashboard_status.sh` could not be exercised live; both scripts fail
+  closed with a clear message when `tailscale` is absent. Remote Tailscale
+  verification remains a manual operator step per the milestone.
 
 ## Known limitations
 
@@ -162,8 +191,9 @@ All contracts are immutable frozen dataclasses in
 
 ## Exact next task
 
-Start a fresh session and execute Phase 4 only: add safe loopback startup,
-status, shutdown, and Tailscale Serve scripts; write the deployment/security
-runbook; run the milestone's final offline and local validation; then update
-this handoff. Do not enable Tailscale Funnel or any dashboard write/control
-action.
+All four phases are complete. Remaining work is operator-only and outside
+Claude Code's scope: on the target MacBook, run `tailscale up` if not
+already connected, run `scripts/run_dashboard.sh`, run
+`scripts/tailscale_serve_dashboard.sh`, and verify remote access from an
+authorized tailnet device. No further code changes are required unless new
+functionality is requested.
