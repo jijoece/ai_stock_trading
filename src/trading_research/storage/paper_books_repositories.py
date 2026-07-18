@@ -719,12 +719,12 @@ def save_exit_decision(
         return False
     conn.execute(
         "INSERT INTO paper_book_exit_decisions (exit_decision_id, book_id, symbol, as_of, decision, "
-        "quantity, reference_price, reasons_json, policy_version, manual_exit_request_id, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "quantity, reference_price, reasons_json, policy_version, partial_stage_id, manual_exit_request_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             exit_decision_id, book_id, symbol, _ts(as_of), decision.decision, str(decision.quantity),
             _dec_str(decision.reference_price), json.dumps(list(decision.reasons)), decision.policy_version,
-            manual_exit_request_id, _ts(created_at),
+            decision.partial_stage_id, manual_exit_request_id, _ts(created_at),
         ),
     )
     conn.commit()
@@ -1845,3 +1845,159 @@ def release_external_order_lease(
         )
     conn.commit()
     return cursor.rowcount > 0
+
+
+# -- Milestone 13 advanced risk controls -----------------------------------
+
+
+def save_daily_risk_state(conn: sqlite3.Connection, state, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_book_daily_risk_states "
+        "(risk_state_id, book_id, market_date, as_of, start_of_day_equity, current_equity, "
+        "realized_pnl_today, unrealized_pnl_today, total_pnl_today, net_external_cash_flow, "
+        "daily_loss_fraction, historical_peak_equity, current_drawdown_fraction, valuation_status, "
+        "source_snapshot_ids_json, reconciliation_status, calculation_policy_version, config_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (state.risk_state_id, state.book_id, state.market_date.isoformat(), _ts(state.as_of),
+         str(state.start_of_day_equity), str(state.current_equity), str(state.realized_pnl_today),
+         str(state.unrealized_pnl_today), str(state.total_pnl_today), str(state.net_external_cash_flow),
+         str(state.daily_loss_fraction), str(state.historical_peak_equity), str(state.current_drawdown_fraction),
+         state.valuation_status, json.dumps(list(state.source_snapshot_ids)), state.reconciliation_status,
+         state.calculation_policy_version, state.config_hash, _ts(state.created_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def latest_daily_risk_state(conn: sqlite3.Connection, book_id: str, as_of: datetime | None = None) -> dict | None:
+    sql = "SELECT * FROM paper_book_daily_risk_states WHERE book_id = ?"
+    params: list[object] = [book_id]
+    if as_of is not None:
+        sql += " AND as_of <= ?"
+        params.append(_ts(as_of))
+    row = conn.execute(sql + " ORDER BY as_of DESC, created_at DESC LIMIT 1", params).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_position_lifecycle_state(conn: sqlite3.Connection, state, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_book_position_lifecycle_states "
+        "(lifecycle_state_id, book_id, symbol, originating_intent_id, entry_fill_id, opened_at, "
+        "original_quantity, remaining_quantity, average_entry_price, entry_atr, atr_period, "
+        "initial_stop_price, current_stop_price, initial_target_price, highest_eligible_price_since_entry, "
+        "trailing_stop_active, breakeven_active, partial_profit_stage, policy_version, config_hash, "
+        "last_evaluated_at, source_market_data_id, stop_change_reason, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (state.lifecycle_state_id, state.book_id, state.symbol, state.originating_intent_id,
+         state.entry_fill_id, _ts(state.opened_at), str(state.original_quantity), str(state.remaining_quantity),
+         str(state.average_entry_price), str(state.entry_atr), state.atr_period, str(state.initial_stop_price),
+         str(state.current_stop_price), str(state.initial_target_price),
+         str(state.highest_eligible_price_since_entry), int(state.trailing_stop_active),
+         int(state.breakeven_active), state.partial_profit_stage, state.policy_version, state.config_hash,
+         _ts(state.last_evaluated_at), state.source_market_data_id, state.stop_change_reason,
+         _ts(state.last_evaluated_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def latest_position_lifecycle_state(conn: sqlite3.Connection, book_id: str, symbol: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_book_position_lifecycle_states WHERE book_id = ? AND symbol = ? "
+        "ORDER BY last_evaluated_at DESC, created_at DESC LIMIT 1", (book_id, symbol),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_partial_exit_stage_event(conn: sqlite3.Connection, event: dict, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_book_partial_exit_stages "
+        "(partial_stage_event_id, book_id, symbol, stage_id, trigger_r_multiple, evaluated_price, "
+        "quantity_before, quantity_requested, quantity_approved, quantity_filled, quantity_remaining, "
+        "resulting_stop_state_id, decision_id, lifecycle_evaluation_id, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (event["partial_stage_event_id"], event["book_id"], event["symbol"], event["stage_id"],
+         str(event["trigger_r_multiple"]), str(event["evaluated_price"]), str(event["quantity_before"]),
+         str(event["quantity_requested"]), str(event["quantity_approved"]), str(event["quantity_filled"]),
+         str(event["quantity_remaining"]), event["resulting_stop_state_id"], event["decision_id"],
+         event["lifecycle_evaluation_id"], event["status"], _ts(event["created_at"])),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def save_lifecycle_state_event(
+    conn: sqlite3.Connection, *, lifecycle_event_id: str, book_id: str, symbol: str,
+    previous_state_id: str | None, resulting_state_id: str, event_type: str,
+    complete: bool, reasons: tuple[str, ...], created_at: datetime, commit: bool = True,
+) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_book_lifecycle_state_events "
+        "(lifecycle_event_id, book_id, symbol, previous_state_id, resulting_state_id, event_type, "
+        "complete, reasons_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (lifecycle_event_id, book_id, symbol, previous_state_id, resulting_state_id, event_type,
+         int(complete), json.dumps(list(reasons)), _ts(created_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def save_economic_event(conn: sqlite3.Connection, event, *, commit: bool = True) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO economic_calendar_events "
+        "(event_id, content_hash, title, category, market, scheduled_at, originally_published_at, "
+        "last_updated_at, importance, status, actual_value, forecast_value, previous_value, "
+        "source_provider, source_locator, retrieved_at, available_at, point_in_time_safe, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (event.event_id, event.content_hash, event.title, event.category, event.market,
+         _ts(event.scheduled_at), _ts(event.originally_published_at), _ts(event.last_updated_at),
+         event.importance, event.status, event.actual_value, event.forecast_value, event.previous_value,
+         event.source_provider, event.source_locator, _ts(event.retrieved_at), _ts(event.available_at),
+         int(event.point_in_time_safe), _ts(event.retrieved_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def save_economic_blackout_decision(
+    conn: sqlite3.Connection, *, book_id: str, order_evaluation_id: str,
+    as_of: datetime, decision, created_at: datetime, commit: bool = True,
+) -> bool:
+    from ..evidence_providers.economic_calendar import blackout_decision_id
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO economic_blackout_decisions "
+        "(blackout_decision_id, book_id, order_evaluation_id, as_of, allowed, matched_event_ids_json, "
+        "blackout_start, blackout_end, reason_codes_json, policy_version, configuration_hash, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (blackout_decision_id(book_id, order_evaluation_id, as_of), book_id, order_evaluation_id,
+         _ts(as_of), int(decision.allowed), json.dumps(list(decision.matched_event_ids)),
+         _ts(decision.blackout_start) if decision.blackout_start else None,
+         _ts(decision.blackout_end) if decision.blackout_end else None,
+         json.dumps(list(decision.reason_codes)), decision.policy_version, decision.configuration_hash,
+         _ts(created_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def record_book_safety_event(
+    conn: sqlite3.Connection, *, safety_event_id: str, book_id: str, state: str,
+    reason_code: str, source_risk_state_id: str | None, operator: str | None,
+    reason: str, created_at: datetime, commit: bool = True,
+) -> bool:
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_book_safety_events "
+        "(safety_event_id, book_id, state, reason_code, source_risk_state_id, operator, reason, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (safety_event_id, book_id, state, reason_code, source_risk_state_id, operator, reason, _ts(created_at)),
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount == 1
+
+
+def latest_book_safety_event(conn: sqlite3.Connection, book_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_book_safety_events WHERE book_id = ? ORDER BY created_at DESC, safety_event_id DESC LIMIT 1",
+        (book_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None

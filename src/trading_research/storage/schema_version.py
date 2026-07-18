@@ -145,6 +145,26 @@ def _migration_5_operational_integrity_telemetry(conn: sqlite3.Connection) -> No
     )
 
 
+def _migration_6_advanced_risk_controls(conn: sqlite3.Connection) -> None:
+    """Milestone 13 additive tables are applied by paper_books_schema first.
+
+    The ordered marker makes upgrades auditable and preserves forward-version
+    refusal while remaining idempotent for older schema fixtures.
+    """
+    required = (
+        "paper_book_daily_risk_states", "paper_book_position_lifecycle_states",
+        "economic_calendar_events", "economic_blackout_decisions", "backtest_runs",
+    )
+    existing = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = set(required) - existing
+    if missing:
+        raise SchemaVersionError(f"advanced-risk schema tables missing: {sorted(missing)}")
+
+
 # Ordered, idempotent migrations. Each callable must be safe to invoke more
 # than once (defense in depth on top of the version gate, which normally
 # prevents re-invocation) and must not raise on a database that already has
@@ -166,6 +186,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     5: (
         "add provider-request cycle correlation and transport taxonomy (Milestone 11.3.2)",
         _migration_5_operational_integrity_telemetry,
+    ),
+    6: (
+        "add advanced risk, lifecycle, economic blackout, and backtest persistence (Milestone 13)",
+        _migration_6_advanced_risk_controls,
     ),
 }
 

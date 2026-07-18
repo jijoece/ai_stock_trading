@@ -48,6 +48,7 @@ ADRs are canonical for the boundary they cover:
 | Production shadow-operations boundary | [`adr/0005-production-shadow-operations-boundary.md`](adr/0005-production-shadow-operations-boundary.md) |
 | Isolated paper books and evaluation | [`adr/0006-isolated-paper-books-and-portfolio-evaluation.md`](adr/0006-isolated-paper-books-and-portfolio-evaluation.md) |
 | External paper-account isolation | [`adr/0007-external-paper-account-isolation.md`](adr/0007-external-paper-account-isolation.md) |
+| Advanced risk and lifecycle state | [`adr/0008-advanced-risk-lifecycle-state.md`](adr/0008-advanced-risk-lifecycle-state.md) |
 
 ## Operational runbooks
 
