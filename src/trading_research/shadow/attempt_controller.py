@@ -26,6 +26,12 @@ from .budget import PRICING_EXEMPT_PROVIDERS, ReservationHandle, record_actual_u
 
 Clock = Callable[[], datetime]
 
+# Locked-down, self-managed CLI providers whose own call caps/health markers
+# this controller enforces directly (docs/milestone-12-codex-provider.md) —
+# every other real provider (anthropic) relies on the generic role-budget
+# check below instead.
+_MANAGED_CLI_PROVIDERS = ("claude_code", "codex")
+
 
 def _compute_check_id(*, reservation_id: str, research_run_id: str, role: str, attempt_number: int) -> str:
     """Deterministic identity (docs/milestone-7.1.md Step 14: "deterministic/
@@ -86,7 +92,8 @@ class ShadowResearchAttemptController:
             Decimal(self.max_output_tokens_per_role) * cost_per_output_token
             + Decimal(self.max_input_tokens_per_role) * cost_per_input_token
         )
-        if self.provider == "claude_code":
+        if self.provider in _MANAGED_CLI_PROVIDERS:
+            provider_label = "Claude Code" if self.provider == "claude_code" else "Codex"
             now = self.clock()
             call_caps = (
                 ("cycle", self.max_calls_per_cycle, self.conn.execute(
@@ -94,12 +101,12 @@ class ShadowResearchAttemptController:
                     (self.reservation.reservation_id,),
                 ).fetchone()[0]),
                 ("day", self.max_calls_per_day, self.conn.execute(
-                    "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-                    (now.date().isoformat() + "%",),
+                    "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+                    (self.provider, now.date().isoformat() + "%"),
                 ).fetchone()[0]),
                 ("month", self.max_calls_per_month, self.conn.execute(
-                    "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-                    (now.strftime("%Y-%m") + "%",),
+                    "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+                    (self.provider, now.strftime("%Y-%m") + "%"),
                 ).fetchone()[0]),
             )
             for period, cap, used in call_caps:
@@ -107,7 +114,7 @@ class ShadowResearchAttemptController:
                     decision = role_budget_mod.RoleBudgetDecision(
                         decision=role_budget_mod.DECISION_SKIPPED_BUDGET_EXHAUSTED,
                         role_name=request.role,
-                        reason=f"Claude Code {period} call cap {cap} has been reached",
+                        reason=f"{provider_label} {period} call cap {cap} has been reached",
                     )
                     break
             if (
@@ -117,7 +124,7 @@ class ShadowResearchAttemptController:
                 decision = role_budget_mod.RoleBudgetDecision(
                     decision=role_budget_mod.DECISION_SKIPPED_BUDGET_EXHAUSTED,
                     role_name=request.role,
-                    reason="Claude Code maximum API-equivalent cost per call would be exceeded",
+                    reason=f"{provider_label} maximum API-equivalent cost per call would be exceeded",
                 )
         if decision is None:
             decision = role_budget_mod.check_role_budget(
@@ -162,19 +169,21 @@ class ShadowResearchAttemptController:
 
     def after_attempt(self, request: AttemptControlRequest, attempt: ResearchAttemptRecord) -> None:
         usage = attempt.usage
-        if self.provider == "claude_code" and not attempt.success:
+        if self.provider in _MANAGED_CLI_PROVIDERS and not attempt.success:
             safe_reason = (attempt.failure_reason or "").lower()
             if any(marker in safe_reason for marker in (
                 "usage metadata", "credits are unavailable", "authentication failed",
                 "oauth token is missing", "version is below", "retry",
+                "not authenticated", "quota", "unexpected authentication method",
             )):
                 from . import pause as pause_mod
 
+                provider_label = "Claude Code" if self.provider == "claude_code" else "Codex"
                 current = pause_mod.current_state(self.conn)
                 if current.state == pause_mod.STATE_ACTIVE:
                     pause_mod.request_pause(
                         self.conn,
-                        reason="Claude Code provider health failed closed",
+                        reason=f"{provider_label} provider health failed closed",
                         source=pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE,
                         target_state=pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
                         clock=self.clock,

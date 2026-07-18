@@ -93,12 +93,14 @@ def build_usage_record(
     configured_model_alias: str | None = None,
     resolved_model_name: str | None = None,
     claude_code_version: str | None = None,
+    provider_cli_version: str | None = None,
     pricing_model: str | None = None,
 ) -> UsageRecord:
     provenance = {
         "configured_model_alias": configured_model_alias,
         "resolved_model_name": resolved_model_name,
         "claude_code_version": claude_code_version,
+        "provider_cli_version": provider_cli_version,
     }
     if not success:
         failure_basis = cost_estimate_basis or COST_BASIS_NOT_APPLICABLE

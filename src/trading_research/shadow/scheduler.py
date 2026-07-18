@@ -436,6 +436,60 @@ def _save_health_checks(
         )
 
 
+@dataclass(frozen=True)
+class _ManagedCliBudgetView:
+    """Resolves the per-provider budget knobs for a locked-down, self-managed
+    CLI research provider (Claude Code, Codex) from `BudgetsSection`'s
+    `max_<provider>_*` fields, so the cycle-reservation and attempt-controller
+    wiring below reads one small object instead of repeating an
+    `is_claude_code`/`is_codex` ternary at every call site."""
+
+    is_managed: bool
+    output_tokens_per_cycle: int
+    input_tokens_per_cycle: int
+    latency_seconds_per_cycle: int
+    latency_seconds_per_role: int
+    calls_per_cycle: int | None
+    calls_per_day: int | None
+    calls_per_month: int | None
+    api_equivalent_cost_per_call_usd: Decimal | None
+    api_equivalent_cost_per_cycle_usd: Decimal | None
+    api_equivalent_cost_per_day_usd: Decimal | None
+    api_equivalent_cost_per_month_usd: Decimal | None
+
+
+def _managed_cli_budget_view(budgets, provider_name: str) -> _ManagedCliBudgetView:
+    if provider_name == "claude_code":
+        prefix = "claude_code"
+    elif provider_name == "codex":
+        prefix = "codex"
+    else:
+        return _ManagedCliBudgetView(
+            is_managed=False,
+            output_tokens_per_cycle=budgets.max_output_tokens_per_cycle,
+            input_tokens_per_cycle=budgets.max_input_tokens_per_cycle,
+            latency_seconds_per_cycle=budgets.max_latency_seconds_per_cycle,
+            latency_seconds_per_role=budgets.max_latency_seconds_per_cycle,
+            calls_per_cycle=None, calls_per_day=None, calls_per_month=None,
+            api_equivalent_cost_per_call_usd=None, api_equivalent_cost_per_cycle_usd=None,
+            api_equivalent_cost_per_day_usd=None, api_equivalent_cost_per_month_usd=None,
+        )
+    return _ManagedCliBudgetView(
+        is_managed=True,
+        output_tokens_per_cycle=getattr(budgets, f"max_{prefix}_output_tokens_per_cycle"),
+        input_tokens_per_cycle=getattr(budgets, f"max_{prefix}_input_tokens_per_cycle"),
+        latency_seconds_per_cycle=getattr(budgets, f"max_{prefix}_latency_seconds_per_cycle"),
+        latency_seconds_per_role=getattr(budgets, f"max_{prefix}_latency_seconds_per_role"),
+        calls_per_cycle=getattr(budgets, f"max_{prefix}_calls_per_cycle"),
+        calls_per_day=getattr(budgets, f"max_{prefix}_calls_per_day"),
+        calls_per_month=getattr(budgets, f"max_{prefix}_calls_per_month"),
+        api_equivalent_cost_per_call_usd=Decimal(str(getattr(budgets, f"max_{prefix}_api_equivalent_cost_per_call_usd"))),
+        api_equivalent_cost_per_cycle_usd=Decimal(str(getattr(budgets, f"max_{prefix}_api_equivalent_cost_per_cycle_usd"))),
+        api_equivalent_cost_per_day_usd=Decimal(str(getattr(budgets, f"max_{prefix}_api_equivalent_cost_per_day_usd"))),
+        api_equivalent_cost_per_month_usd=Decimal(str(getattr(budgets, f"max_{prefix}_api_equivalent_cost_per_month_usd"))),
+    )
+
+
 def run_due_shadow_cycle(
     *,
     now: datetime,
@@ -646,25 +700,17 @@ def run_due_shadow_cycle(
         symbols = candidate_symbols()
         bounded_symbols = tuple(symbols[: shadow_config.budgets.max_symbols_per_cycle])
 
-        is_claude_code = research_provider_name == "claude_code"
+        managed_budget = _managed_cli_budget_view(shadow_config.budgets, research_provider_name)
+        is_claude_code = research_provider_name == "claude_code"  # retained: used by cost-cap check below
         intent = budget_mod.CycleIntent(
             provider=research_provider_name, model_name=research_model_name,
             max_symbols_per_cycle=shadow_config.budgets.max_symbols_per_cycle,
             max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
             max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
-            max_output_tokens_per_cycle=(
-                shadow_config.budgets.max_claude_code_output_tokens_per_cycle if is_claude_code
-                else shadow_config.budgets.max_output_tokens_per_cycle
-            ),
-            max_input_tokens_per_cycle=(
-                shadow_config.budgets.max_claude_code_input_tokens_per_cycle if is_claude_code
-                else shadow_config.budgets.max_input_tokens_per_cycle
-            ),
-            max_latency_seconds_per_cycle=(
-                shadow_config.budgets.max_claude_code_latency_seconds_per_cycle if is_claude_code
-                else shadow_config.budgets.max_latency_seconds_per_cycle
-            ),
-            max_calls_per_cycle=(shadow_config.budgets.max_claude_code_calls_per_cycle if is_claude_code else None),
+            max_output_tokens_per_cycle=managed_budget.output_tokens_per_cycle,
+            max_input_tokens_per_cycle=managed_budget.input_tokens_per_cycle,
+            max_latency_seconds_per_cycle=managed_budget.latency_seconds_per_cycle,
+            max_calls_per_cycle=managed_budget.calls_per_cycle,
         )
         # `intent.provider`/`.model_name` come directly from the caller's
         # `research_provider_name`/`research_model_name` — the actual
@@ -703,27 +749,28 @@ def run_due_shadow_cycle(
                 failure_reason=str(exc), lease_owner=lease_owner, reason="pricing required but not configured",
             )
 
+        managed_provider_label = "Claude Code" if is_claude_code else "Codex"
+        managed_cycle_cost_cap = managed_budget.api_equivalent_cost_per_cycle_usd
         if (
-            is_claude_code and estimate.estimated_cost_usd is not None
-            and estimate.estimated_cost_usd
-            > Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_cycle_usd))
+            managed_budget.is_managed and managed_cycle_cost_cap is not None
+            and estimate.estimated_cost_usd is not None and estimate.estimated_cost_usd > managed_cycle_cost_cap
         ):
             reservation_result = budget_mod.BudgetRejected(
                 idempotency_key=f"shadow-budget:{intended_schedule_id}",
-                reason="Claude Code cycle API-equivalent cost cap would be exceeded",
-                cap_name="claude_code_cycle_api_equivalent_cost",
-                remaining=Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_cycle_usd)),
+                reason=f"{managed_provider_label} cycle API-equivalent cost cap would be exceeded",
+                cap_name=f"{research_provider_name}_cycle_api_equivalent_cost",
+                remaining=managed_cycle_cost_cap,
                 requested=estimate.estimated_cost_usd,
             )
         else:
             reservation_result = budget_mod.reserve_budget(
             conn, f"shadow-budget:{intended_schedule_id}", intent, estimate,
             max_actual_cost_per_day_usd=Decimal(str(
-                shadow_config.budgets.max_claude_code_api_equivalent_cost_per_day_usd if is_claude_code
+                managed_budget.api_equivalent_cost_per_day_usd if managed_budget.is_managed
                 else shadow_config.budgets.max_actual_cost_per_day_usd
             )),
             max_actual_cost_per_month_usd=Decimal(str(
-                shadow_config.budgets.max_claude_code_api_equivalent_cost_per_month_usd if is_claude_code
+                managed_budget.api_equivalent_cost_per_month_usd if managed_budget.is_managed
                 else shadow_config.budgets.max_actual_cost_per_month_usd
             )),
             clock=clock,
@@ -775,31 +822,28 @@ def run_due_shadow_cycle(
             )
 
             def _build_attempt_controller(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
-                per_call_divisor = max(1, shadow_config.budgets.max_claude_code_calls_per_cycle)
+                per_call_divisor = max(1, managed_budget.calls_per_cycle or 1)
                 return attempt_controller_mod.ShadowResearchAttemptController(
                     conn=conn, reservation=reservation, provider=intent.provider, allowed_roles=research_roles,
                     max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
                     max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
                     max_output_tokens_per_role=(
-                        shadow_config.budgets.max_claude_code_output_tokens_per_cycle // per_call_divisor
-                        if is_claude_code else shadow_config.budgets.max_output_tokens_per_cycle
+                        managed_budget.output_tokens_per_cycle // per_call_divisor
+                        if managed_budget.is_managed else shadow_config.budgets.max_output_tokens_per_cycle
                     ),
                     max_input_tokens_per_role=(
-                        shadow_config.budgets.max_claude_code_input_tokens_per_cycle // per_call_divisor
-                        if is_claude_code else shadow_config.budgets.max_input_tokens_per_cycle
+                        managed_budget.input_tokens_per_cycle // per_call_divisor
+                        if managed_budget.is_managed else shadow_config.budgets.max_input_tokens_per_cycle
                     ),
                     max_latency_seconds_per_role=(
-                        shadow_config.budgets.max_claude_code_latency_seconds_per_role
-                        if is_claude_code else shadow_config.budgets.max_latency_seconds_per_cycle
+                        managed_budget.latency_seconds_per_role
+                        if managed_budget.is_managed else shadow_config.budgets.max_latency_seconds_per_cycle
                     ),
                     pricing=pricing_for_roles, clock=clock, scheduler_run_id=scheduler_run_id, cycle_id=None,
-                    max_calls_per_cycle=(shadow_config.budgets.max_claude_code_calls_per_cycle if is_claude_code else None),
-                    max_calls_per_day=(shadow_config.budgets.max_claude_code_calls_per_day if is_claude_code else None),
-                    max_calls_per_month=(shadow_config.budgets.max_claude_code_calls_per_month if is_claude_code else None),
-                    max_api_equivalent_cost_per_call_usd=(
-                        Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_call_usd))
-                        if is_claude_code else None
-                    ),
+                    max_calls_per_cycle=managed_budget.calls_per_cycle,
+                    max_calls_per_day=managed_budget.calls_per_day,
+                    max_calls_per_month=managed_budget.calls_per_month,
+                    max_api_equivalent_cost_per_call_usd=managed_budget.api_equivalent_cost_per_call_usd,
                 )
             attempt_controller_factory = _build_attempt_controller
 

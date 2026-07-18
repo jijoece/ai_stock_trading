@@ -11,8 +11,9 @@ version: 1
 
 research:
   enabled: false
-  provider: deterministic       # deterministic | scripted | anthropic | claude_code
-  model: null                   # use `sonnet` explicitly for provider: claude_code
+  provider: deterministic       # deterministic | scripted | anthropic | claude_code | codex
+  model: null                   # use `sonnet` explicitly for provider: claude_code; an explicit
+                                 # Codex model id (e.g. the configured chat model) for provider: codex
   max_attempts_per_role: 2
   request_timeout_seconds: 60
   max_input_characters: 100000
@@ -41,6 +42,24 @@ claude_code:
   maximum_turns: 1
   working_directory: /private/tmp/agentic-trading-desk-claude-code
   require_oauth_authentication: true
+  require_usage_metadata: true
+
+# Safe inactive Codex defaults. Selecting this provider still requires
+# research.provider=codex and an explicit research.model; credentials never
+# activate it. The operator should replace working_directory with a private
+# 0700 runtime directory outside the repository.
+codex:
+  binary_path: /opt/homebrew/bin/codex
+  minimum_version: "0.144.0"
+  terminate_grace_seconds: 5
+  maximum_stdout_bytes: 1048576
+  maximum_stderr_bytes: 65536
+  maximum_jsonl_line_bytes: 262144
+  maximum_jsonl_events: 10000
+  maximum_schema_bytes: 262144
+  maximum_prompt_bytes: 524288
+  working_directory: /private/tmp/agentic-trading-desk-codex
+  require_chatgpt_authentication: true
   require_usage_metadata: true
 
 # First vertical slice role set (docs/milestone-5.md Step 7). Additional

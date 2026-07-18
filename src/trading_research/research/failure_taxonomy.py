@@ -121,6 +121,35 @@ CLAUDE_CODE_FAILURE_CODES = (
     "CLAUDE_CODE_PROMPT_TOO_LARGE",
 )
 
+# Locked-down Codex subprocess/provider failures — mirrors
+# CLAUDE_CODE_FAILURE_CODES's intent for the second locked-down CLI
+# provider; raw CLI diagnostics are never persisted in their place.
+CODEX_FAILURE_CODES = (
+    "CODEX_BINARY_MISSING",
+    "CODEX_BINARY_NOT_EXECUTABLE",
+    "CODEX_VERSION_UNPARSABLE",
+    "CODEX_VERSION_UNSUPPORTED",
+    "CODEX_LOGIN_STATUS_FAILED",
+    "CODEX_NOT_AUTHENTICATED",
+    "CODEX_UNEXPECTED_AUTH_METHOD",
+    "CODEX_PROCESS_TIMEOUT",
+    "CODEX_PROCESS_EXITED",
+    "CODEX_RATE_LIMITED",
+    "CODEX_QUOTA_EXHAUSTED",
+    "CODEX_TRANSIENT_FAILURE",
+    "CODEX_SCHEMA_REJECTED",
+    "CODEX_PROMPT_TOO_LARGE",
+    "CODEX_OUTPUT_OVERFLOW",
+    "CODEX_STDERR_OVERFLOW",
+    "CODEX_INVALID_JSONL",
+    "CODEX_TERMINAL_EVENT_MISSING",
+    "CODEX_MULTIPLE_TERMINAL_EVENTS",
+    "CODEX_FINAL_OUTPUT_MISSING",
+    "CODEX_FINAL_OUTPUT_MALFORMED",
+    "CODEX_USAGE_METADATA_MISSING",
+    "CODEX_MODEL_PROVENANCE_MISSING",
+)
+
 CODES = (
     CODE_PROVIDER_TIMEOUT,
     CODE_PROVIDER_RATE_LIMITED,
@@ -155,7 +184,7 @@ CODES = (
     CODE_PERSISTENCE_FAILURE,
     CODE_BUDGET_EXHAUSTED,
     CODE_UNCLASSIFIED_VALIDATION_FAILURE,
-) + CLAUDE_CODE_FAILURE_CODES
+) + CLAUDE_CODE_FAILURE_CODES + CODEX_FAILURE_CODES
 
 # Roles this taxonomy accepts beyond the analyst/manager roles — "system" is used for
 # run-level meta-failures (retry exhaustion / manager skip) that are not attributable to
@@ -186,7 +215,10 @@ ALLOWED_METADATA_KEYS = frozenset(
         "stdout_bytes",
         "stderr_bytes",
         "claude_code_version",
+        "provider_cli_version",
         "usage_present",
+        "event_count",
+        "cli_version",
     }
 )
 

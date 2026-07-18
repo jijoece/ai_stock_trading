@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS research_attempts (
     configured_model_alias TEXT,
     resolved_model_name TEXT,
     claude_code_version TEXT,
+    provider_cli_version TEXT,
     created_at TEXT NOT NULL
 );
 

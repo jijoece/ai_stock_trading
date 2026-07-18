@@ -29,3 +29,14 @@ pricing:
     input_price_per_million: "3.00"
     output_price_per_million: "15.00"
     pricing_version: claude-code-sonnet-api-equivalent-2026-07-17
+  # Conservative API-equivalent estimate for the Codex CLI's ChatGPT-plan
+  # authentication. Every usage row also persists the CLI version, so this
+  # estimate is never represented as the user's actual ChatGPT subscription
+  # charge.
+  - provider: codex
+    model: gpt-5.1-codex
+    effective_date: "2026-07-18"
+    currency: USD
+    input_price_per_million: "1.25"
+    output_price_per_million: "10.00"
+    pricing_version: codex-gpt-5.1-codex-api-equivalent-2026-07-18
