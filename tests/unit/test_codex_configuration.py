@@ -24,7 +24,7 @@ research:
   allow_parallel_roles: false
 codex:
   binary_path: /opt/homebrew/bin/codex
-  minimum_version: "0.144.0"
+  minimum_version: "0.144.5"
   terminate_grace_seconds: 5
   maximum_stdout_bytes: 1048576
   maximum_stderr_bytes: 65536
@@ -64,7 +64,7 @@ def test_codex_provider_accepted_and_loads(tmp_path):
     cfg = load_research_config(_write(tmp_path, VALID_YAML))
     assert cfg.provider == "codex"
     assert cfg.codex is not None
-    assert cfg.codex.minimum_version == "0.144.0"
+    assert cfg.codex.minimum_version == "0.144.5"
     cfg.require_ready()  # explicit model + codex section present — must not raise
 
 
@@ -125,14 +125,24 @@ def test_build_codex_provider_config_wires_through(tmp_path):
     fake_binary = tmp_path / "fake-codex"
     fake_binary.write_text("#!/usr/bin/env python3\n")
     fake_binary.chmod(0o755)
-    yaml_text = VALID_YAML.replace("binary_path: /opt/homebrew/bin/codex", f"binary_path: {fake_binary}")
+    # Working directory must be a real, writable path on the current
+    # platform: the previous hardcoded `/private/tmp/...` is a macOS-only
+    # path (the resolved target of macOS's `/tmp` symlink) that does not
+    # exist and is not creatable on Linux CI runners.
+    codex_workdir = tmp_path / "codex-workdir"
+    yaml_text = VALID_YAML.replace(
+        "binary_path: /opt/homebrew/bin/codex", f"binary_path: {fake_binary}"
+    ).replace(
+        "working_directory: /private/tmp/agentic-trading-desk-codex-test",
+        f"working_directory: {codex_workdir}",
+    )
     cfg = load_research_config(_write(tmp_path, yaml_text))
     from trading_research.research.codex_provider import CodexProviderConfig
 
     provider_config = cfg.build_codex_provider_config()
     assert isinstance(provider_config, CodexProviderConfig)
     assert provider_config.model == "gpt-5.1-codex"
-    assert provider_config.minimum_version == "0.144.0"
+    assert provider_config.minimum_version == "0.144.5"
     assert provider_config.request_timeout_seconds == 60
 
 

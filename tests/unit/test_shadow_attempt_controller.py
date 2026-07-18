@@ -73,7 +73,8 @@ def _request(role="fundamental", attempt_number=1):
 def _attempt(
     *, attempt_id="run-1-fundamental-1", success=True, input_tokens: int | None = 100,
     output_tokens: int | None = 50, latency_ms: int | None = 200,
-    provider="anthropic", model_name="claude-test",
+    provider="anthropic", model_name="claude-test", failure_code: str | None = None,
+    failure_stage: str | None = None, failure_retryable: bool | None = None,
 ):
     usage = UsageRecord(
         provider=provider, model_name=model_name, role="fundamental", input_tokens=input_tokens,
@@ -88,6 +89,7 @@ def _attempt(
         prompt_version="v1", prompt_hash="h1", system_prompt_hash="sph1", schema_version="s1", provider=provider,
         model_name=model_name, success=success, failure_reason=None if success else "rejected",
         raw_response_json={}, validated_payload_json={} if success else None, usage=usage, created_at=NOW,
+        failure_code=failure_code, failure_stage=failure_stage, failure_retryable=failure_retryable,
     )
 
 
@@ -201,12 +203,94 @@ def test_claude_code_missing_usage_activates_provider_health_pause(conn):
     reservation, pricing = _reservation(conn)
     controller = _controller(conn, reservation, pricing, provider="claude_code")
     failed = replace(
-        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="claude_code"),
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="claude_code",
+            failure_code="CLAUDE_CODE_USAGE_METADATA_MISSING",
+        ),
         failure_reason="Claude Code usage metadata was missing",
     )
     controller.after_attempt(_request(), failed)
     state = pause_mod.current_state(conn)
     assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+def test_claude_code_pause_action_is_driven_by_code_not_message_text(conn):
+    """Milestone 12.1 Item 1, required test #2: changing the human-readable
+    message must not change the pause decision — only `failure_code` may."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="claude_code")
+    failed = replace(
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="claude_code",
+            failure_code="CLAUDE_CODE_USAGE_METADATA_MISSING",
+        ),
+        failure_reason="some totally different human-readable wording that mentions nothing special",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+def test_message_containing_the_word_retry_does_not_pause_without_an_allowed_code(conn):
+    """Milestone 12.1 Item 1, required test #6."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = replace(
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="CODEX_TRANSIENT_FAILURE", failure_retryable=True,
+        ),
+        failure_reason="please retry the request shortly, this is a transient failure",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_ACTIVE
+
+
+def test_retryable_codex_timeout_does_not_immediately_pause(conn):
+    """Milestone 12.1 Item 1, required test #4."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = replace(
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="CODEX_PROCESS_TIMEOUT", failure_retryable=True,
+        ),
+        failure_reason="Codex process timed out",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_ACTIVE
+
+
+def test_schema_validation_failure_does_not_masquerade_as_provider_unavailability(conn):
+    """Milestone 12.1 Item 1, required test #5: a code from the ordinary
+    structured-schema taxonomy (not the CLI-provider taxonomy) must never
+    trip the CLI-provider pause allowlist."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = replace(
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="SCHEMA_REQUIRED_FIELD_MISSING", failure_retryable=True,
+        ),
+        failure_reason="authentication failed to validate the schema",  # deliberately misleading text
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_ACTIVE
+
+
+def test_missing_failure_code_does_not_pause(conn):
+    """A legacy/null `failure_code` (e.g. a row from before this migration)
+    must fail closed on the side of *not* pausing from this rule alone —
+    never treated as an implicit match."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex")
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_ACTIVE
 
 
 def test_codex_cycle_call_cap_counts_allowed_failed_or_successful_calls(conn):
@@ -227,7 +311,10 @@ def test_codex_repeated_authentication_failure_activates_provider_health_pause(c
     reservation, pricing = _reservation(conn)
     controller = _controller(conn, reservation, pricing, provider="codex")
     failed = replace(
-        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex"),
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="CODEX_NOT_AUTHENTICATED",
+        ),
         failure_reason="Codex is not authenticated with ChatGPT",
     )
     controller.after_attempt(_request(), failed)
@@ -239,7 +326,10 @@ def test_codex_quota_exhaustion_activates_provider_health_pause(conn):
     reservation, pricing = _reservation(conn)
     controller = _controller(conn, reservation, pricing, provider="codex")
     failed = replace(
-        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex"),
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="CODEX_QUOTA_EXHAUSTED",
+        ),
         failure_reason="Codex quota is exhausted",
     )
     controller.after_attempt(_request(), failed)

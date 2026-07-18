@@ -23,7 +23,7 @@ research:
   allow_parallel_roles: false
 codex:
   binary_path: /opt/homebrew/bin/codex
-  minimum_version: "0.144.0"
+  minimum_version: "0.144.5"
   terminate_grace_seconds: 5
   maximum_stdout_bytes: 1048576
   maximum_stderr_bytes: 65536

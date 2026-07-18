@@ -46,6 +46,20 @@ COST_ESTIMATE_BASES = (
     COST_BASIS_USAGE_NOT_RETURNED,
 )
 
+# Milestone 12.1 Item 4: explicit reasoning-token accounting policy — see
+# `research/codex_provider.py`'s module docstring for which policy applies
+# to Codex and why. `NOT_APPLICABLE` covers providers that never report a
+# separate reasoning-token count at all (deterministic, scripted, Claude
+# Code, anthropic without extended thinking).
+TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT = "REASONING_INCLUDED_IN_OUTPUT"
+TOKEN_ACCOUNTING_REASONING_SEPARATE = "REASONING_SEPARATE"
+TOKEN_ACCOUNTING_NOT_APPLICABLE = "NOT_APPLICABLE"
+TOKEN_ACCOUNTING_POLICIES = (
+    TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT,
+    TOKEN_ACCOUNTING_REASONING_SEPARATE,
+    TOKEN_ACCOUNTING_NOT_APPLICABLE,
+)
+
 
 def _require_tz_aware(value: datetime | None, name: str) -> None:
     if value is not None and value.tzinfo is None:
@@ -279,12 +293,27 @@ class UsageRecord:
     resolved_model_name: str | None = None
     claude_code_version: str | None = None
     provider_cli_version: str | None = None
+    provider_adapter_version: str | None = None
+    reasoning_output_tokens: int | None = None
+    token_accounting_policy: str = TOKEN_ACCOUNTING_NOT_APPLICABLE
 
     _SUBSCRIPTION_ESTIMATE_PROVIDERS = ("claude_code", "codex")
 
     def __post_init__(self) -> None:
         _require_enum(self.cost_status, COST_STATUSES, "UsageRecord.cost_status")
         _require_enum(self.cost_estimate_basis, COST_ESTIMATE_BASES, "UsageRecord.cost_estimate_basis")
+        _require_enum(self.token_accounting_policy, TOKEN_ACCOUNTING_POLICIES, "UsageRecord.token_accounting_policy")
+        if self.reasoning_output_tokens is not None and self.reasoning_output_tokens < 0:
+            raise EvidenceValidationError("UsageRecord.reasoning_output_tokens must not be negative")
+        if (
+            self.token_accounting_policy == TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT
+            and self.reasoning_output_tokens is not None and self.output_tokens is not None
+            and self.reasoning_output_tokens > self.output_tokens
+        ):
+            raise EvidenceValidationError(
+                "UsageRecord.reasoning_output_tokens cannot exceed output_tokens under the "
+                "REASONING_INCLUDED_IN_OUTPUT policy"
+            )
         if self.cost_status == COST_CALCULATED and self.estimated_cost is None:
             raise EvidenceValidationError("UsageRecord.cost_status=CALCULATED requires estimated_cost")
         if self.cost_status != COST_CALCULATED and self.estimated_cost is not None:

@@ -120,6 +120,65 @@ def _migration_4_codex_provider_cli_version(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE research_attempts ADD COLUMN provider_cli_version TEXT")
 
 
+def _migration_6_attempt_structured_failure_fields(conn: sqlite3.Connection) -> None:
+    """Milestone 12.1 Item 1: typed provider-failure taxonomy propagated onto
+    `research_attempts` itself, so operational health decisions (Item 1's
+    `IMMEDIATE_PROVIDER_PAUSE_CODES` allowlist in `shadow/attempt_controller.py`)
+    can act on a stable code instead of scanning `failure_reason` free text.
+
+    Every pre-existing attempt row becomes NULL/unknown for these four columns
+    — never backfilled by guessing a code from historical `failure_reason`
+    text, which would be exactly the free-text-classification anti-pattern
+    this milestone removes."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    additions = (
+        ("failure_code", "TEXT"),
+        ("failure_stage", "TEXT"),
+        ("failure_retryable", "INTEGER"),
+        ("failure_metadata_json", "TEXT"),
+    )
+    for column_name, column_type in additions:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE research_attempts ADD COLUMN {column_name} {column_type}")
+
+
+def _migration_7_codex_adapter_version(conn: sqlite3.Connection) -> None:
+    """Milestone 12.1 Item 2: persist the tested JSONL-contract adapter
+    version (`codex_version_policy.VersionRange.adapter_version`) a Codex
+    attempt's installed CLI version was matched to, distinct from the raw
+    `provider_cli_version` string. Pre-existing rows stay NULL."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    if "provider_adapter_version" not in existing:
+        conn.execute("ALTER TABLE research_attempts ADD COLUMN provider_adapter_version TEXT")
+
+
+def _migration_8_reasoning_token_accounting(conn: sqlite3.Connection) -> None:
+    """Milestone 12.1 Item 4: persist reasoning-token usage and the explicit
+    accounting policy it was computed under. Pre-existing rows get
+    `token_accounting_policy='NOT_APPLICABLE'` (they predate reasoning-token
+    reporting entirely) and a NULL `reasoning_output_tokens` — never
+    backfilled by guessing."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    additions = (
+        ("reasoning_output_tokens", "INTEGER"),
+        ("token_accounting_policy", "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'"),
+    )
+    for column_name, column_type in additions:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE research_attempts ADD COLUMN {column_name} {column_type}")
+
+
+def _migration_9_scheduled_run_telemetry_index(conn: sqlite3.Connection) -> None:
+    """Milestone 12.1 Item 7: supports the exact
+    `evidence_providers/persistence.py::list_provider_requests_for_scheduled_run`
+    query (`correlation_mode='SCHEDULED' AND research_cycle_id=? AND
+    scheduler_run_id=?`) without a full-table scan."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_scheduled_run "
+        "ON evidence_provider_requests(correlation_mode, research_cycle_id, scheduler_run_id, created_at, request_id)"
+    )
+
+
 def _migration_5_operational_integrity_telemetry(conn: sqlite3.Connection) -> None:
     """Milestone 11.3.2: exact request ownership and bounded transport taxonomy.
 
@@ -166,6 +225,22 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     5: (
         "add provider-request cycle correlation and transport taxonomy (Milestone 11.3.2)",
         _migration_5_operational_integrity_telemetry,
+    ),
+    6: (
+        "add structured typed failure fields to research_attempts (Milestone 12.1 Item 1)",
+        _migration_6_attempt_structured_failure_fields,
+    ),
+    7: (
+        "add Codex JSONL adapter version provenance column (Milestone 12.1 Item 2)",
+        _migration_7_codex_adapter_version,
+    ),
+    8: (
+        "add reasoning-token accounting columns to research_attempts (Milestone 12.1 Item 4)",
+        _migration_8_reasoning_token_accounting,
+    ),
+    9: (
+        "add scheduled-run-scoped provider telemetry index (Milestone 12.1 Item 7)",
+        _migration_9_scheduled_run_telemetry_index,
     ),
 }
 

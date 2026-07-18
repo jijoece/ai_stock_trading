@@ -1,0 +1,19 @@
+{
+  "include": [
+    "src/trading_research/research/codex_provider.py",
+    "src/trading_research/research/codex_jsonl_adapter.py",
+    "src/trading_research/research/codex_version_policy.py",
+    "src/trading_research/research/codex_failure_classifier.py",
+    "src/trading_research/research/orchestration.py",
+    "src/trading_research/shadow/attempt_controller.py",
+    "src/trading_research/shadow/health.py",
+    "src/trading_research/shadow/health_hysteresis.py",
+    "src/trading_research/shadow/scheduler.py",
+    "src/trading_research/evidence_providers/health.py",
+    "src/trading_research/evidence_providers/persistence.py"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}

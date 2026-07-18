@@ -6,14 +6,21 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from trading_research.evidence_providers.health import (
+    REQUIRED_CATEGORY_STATUS_FAIL,
+    REQUIRED_CATEGORY_STATUS_MISSING,
+    REQUIRED_CATEGORY_STATUS_PASS,
     SEVERE_AUTHENTICATION_FAILED,
     SEVERE_DNS_OR_CONNECTION_FAILURE,
     SEVERE_PROTOCOL_OR_SCHEMA_BREAK,
     SEVERE_PROVIDER_CONFIGURATION_INVALID,
     SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION,
+    ProviderCoveragePolicy,
     classify_severe_error,
     compute_cycle_provider_telemetry,
+    evaluate_required_category_health,
 )
 
 
@@ -111,6 +118,223 @@ def test_one_provider_outage_not_hidden_by_another_providers_success():
     assert telem.aggregate_success_rate == 0.5
     assert telem.per_provider["sec-edgar"].success_rate == 0.0
     assert telem.per_provider["alpaca-data"].success_rate == 1.0
+
+
+# --- Milestone 12.1 Item 6: required categories evaluated independently -----
+
+_TWO_CATEGORY_POLICY = ProviderCoveragePolicy(
+    required_categories=(
+        ("corporate_filings", ("sec-edgar",)),
+        ("market_data", ("alpaca-data",)),
+    ),
+)
+
+
+def test_required_provider_dilution_sec_healthy_alpaca_failed_is_not_healthy():
+    """Required test #1: SEC 9 successes plus Alpaca 1 failure must not read
+    as healthy just because the aggregate is 90%."""
+    rows = [_row(provider="sec-edgar", success=True) for _ in range(9)] + [
+        _row(provider="alpaca-data", success=False),
+    ]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=_TWO_CATEGORY_POLICY)
+    assert telem.aggregate_success_rate == 0.9
+    assert telem.unhealthy_required_categories == ("market_data",)
+    market_data = next(h for h in telem.required_category_health if h.category == "market_data")
+    assert market_data.status == REQUIRED_CATEGORY_STATUS_FAIL
+    corporate_filings = next(h for h in telem.required_category_health if h.category == "corporate_filings")
+    assert corporate_filings.status == REQUIRED_CATEGORY_STATUS_PASS
+
+
+def test_required_provider_dilution_alpaca_healthy_sec_absent_is_not_healthy():
+    """Required test #2."""
+    rows = [_row(provider="alpaca-data", success=True) for _ in range(5)]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=_TWO_CATEGORY_POLICY)
+    assert telem.unhealthy_required_categories == ("corporate_filings",)
+    corporate_filings = next(h for h in telem.required_category_health if h.category == "corporate_filings")
+    assert corporate_filings.status == REQUIRED_CATEGORY_STATUS_MISSING
+
+
+def test_each_required_provider_healthy_yields_healthy_coverage():
+    """Required test #3."""
+    rows = [_row(provider="sec-edgar", success=True), _row(provider="alpaca-data", success=True)]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=_TWO_CATEGORY_POLICY)
+    assert telem.unhealthy_required_categories == ()
+
+
+def test_optional_provider_failure_does_not_fail_required_coverage():
+    """Required test #4."""
+    policy = ProviderCoveragePolicy(
+        required_categories=(("market_data", ("alpaca-data",)),), optional_providers=("alpaca-news",),
+    )
+    rows = [_row(provider="alpaca-data", success=True), _row(provider="alpaca-news", success=False)]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=policy)
+    assert telem.unhealthy_required_categories == ()
+
+
+def test_provider_aliases_normalize_correctly_for_required_category_health():
+    """Required test #5."""
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    rows = [_row(provider="AlpacaData", success=True)]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=policy)
+    assert telem.unhealthy_required_categories == ()
+
+
+def test_category_specific_sample_floor():
+    """Required test #6: a category with a higher configured
+    minimum_requests is INSUFFICIENT_DATA (not FAIL/healthy) below it."""
+    policy = ProviderCoveragePolicy(
+        required_categories=(("market_data", ("alpaca-data",)),),
+        category_minimum_requests={"market_data": 3},
+    )
+    rows = [_row(provider="alpaca-data", success=True)]
+    results = evaluate_required_category_health(rows, policy)
+    assert results[0].status == "INSUFFICIENT_DATA"
+    # INSUFFICIENT_DATA is not counted as unhealthy for pause purposes.
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=policy)
+    assert telem.unhealthy_required_categories == ()
+
+
+def test_per_provider_reasons_are_persisted():
+    """Required test #7."""
+    results = evaluate_required_category_health(
+        [_row(provider="alpaca-data", success=False)],
+        ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),)),
+    )
+    assert results[0].reasons
+    assert "market_data" in results[0].reasons[0]
+
+
+def test_aggregate_rate_remains_informational_only():
+    """Required test #8: aggregate rate is still computed/available, but no
+    longer the sole signal driving the FAIL verdict."""
+    rows = [_row(provider="sec-edgar", success=True) for _ in range(9)] + [
+        _row(provider="alpaca-data", success=False),
+    ]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=_TWO_CATEGORY_POLICY)
+    assert telem.aggregate_success_rate == 0.9  # still reported
+    assert telem.unhealthy_required_categories  # but does not determine health alone
+
+
+def test_failing_category_determines_the_health_dimension_result():
+    """Required test #9."""
+    from trading_research.shadow.health import (
+        CHECK_STATUS_FAIL,
+        CycleHealthInputs,
+        HealthPolicyConfig,
+        evaluate_cycle_health,
+        provider_health_check,
+    )
+
+    inputs = CycleHealthInputs(
+        provider_success_rate=0.9, evidence_completeness_rate=None, claude_role_success_rate=None,
+        retry_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None, output_truncation_rate=None,
+        latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None, pricing_configured=True,
+        paper_reconciliation_mismatch=False, duplicate_prevention_violation=False, cycle_duration_seconds=None,
+        provider_unhealthy_required_categories=("market_data",),
+    )
+    config = HealthPolicyConfig(
+        policy_version="test", pause_on_provider_failure_rate=0.5, pause_on_retry_exhaustion_rate=0.5,
+        pause_on_unsupported_claim_rate=0.5, pause_on_reconciliation_mismatch=True, pause_on_budget_breach=True,
+    )
+    result = evaluate_cycle_health(inputs, config)
+    assert provider_health_check(result).status == CHECK_STATUS_FAIL
+    assert "market_data" in provider_health_check(result).reason
+
+
+# --- Milestone 12.1 Item 8: typed transport diagnostic rates ----------------
+
+
+def test_timeout_rate_counts_only_timeout_category():
+    rows = [
+        _row(success=False, transport_failure_category="TIMEOUT"),
+        _row(success=False, transport_failure_category="HTTP_SERVER_ERROR"),
+        _row(success=True),
+    ]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.timeout_rate == pytest.approx(1 / 3)
+
+
+def test_http_500_does_not_count_as_timeout():
+    rows = [_row(success=False, transport_failure_category="HTTP_SERVER_ERROR") for _ in range(3)]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.timeout_rate == 0.0
+    assert summary.http_server_error_rate == 1.0
+
+
+def test_dns_failure_does_not_count_as_timeout():
+    rows = [_row(success=False, transport_failure_category="DNS_FAILURE") for _ in range(3)]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.timeout_rate == 0.0
+    assert summary.dns_failure_rate == 1.0
+
+
+def test_429_counts_as_rate_limit():
+    rows = [_row(success=False, transport_failure_category="RATE_LIMITED") for _ in range(3)]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.rate_limit_rate == 1.0
+
+
+def test_authentication_is_distinct_from_other_categories():
+    rows = [
+        _row(success=False, transport_failure_category="AUTHENTICATION_FAILURE"),
+        _row(success=False, transport_failure_category="TLS_FAILURE"),
+        _row(success=True),
+    ]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.authentication_failure_rate == pytest.approx(1 / 3)
+    assert summary.tls_failure_rate == pytest.approx(1 / 3)
+    assert summary.timeout_rate == 0.0
+
+
+def test_successful_requests_count_in_the_denominator():
+    rows = [_row(success=True) for _ in range(2)] + [_row(success=False, transport_failure_category="TIMEOUT")]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.timeout_rate == pytest.approx(1 / 3)
+    assert summary.success_rate == pytest.approx(2 / 3)
+
+
+def test_missing_legacy_category_is_represented_explicitly_not_fabricated():
+    """A legacy pre-migration row with `transport_failure_category='NONE'`
+    (or absent entirely) is a real failure but contributes to no typed rate
+    — never silently folded into `unknown_transport_error_rate`."""
+    rows = [_row(success=False, transport_failure_category="NONE") for _ in range(3)]
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    assert summary.timeout_rate == 0.0
+    assert summary.unknown_transport_error_rate == 0.0
+    assert summary.success_rate == 0.0  # the failure itself is still visible
+
+
+def test_typed_rates_are_deterministic_and_bounded_between_zero_and_one():
+    rows = (
+        [_row(success=True) for _ in range(4)]
+        + [_row(success=False, transport_failure_category="CONNECTION_RESET") for _ in range(2)]
+        + [_row(success=False, transport_failure_category="PROTOCOL_ERROR")]
+    )
+    from trading_research.evidence_providers.health import compute_provider_health
+
+    summary = compute_provider_health(rows, "alpaca-data")
+    for rate in (
+        summary.timeout_rate, summary.connection_reset_rate, summary.protocol_error_rate,
+        summary.dns_failure_rate, summary.rate_limit_rate,
+    ):
+        assert rate is not None
+        assert 0.0 <= rate <= 1.0
+    assert summary.connection_reset_rate == pytest.approx(2 / 7)
+    assert summary.protocol_error_rate == pytest.approx(1 / 7)
 
 
 def test_severe_error_present_in_telemetry():

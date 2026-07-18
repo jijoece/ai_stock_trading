@@ -202,6 +202,138 @@ class SafetySection:
             raise ShadowOperationsConfigError("safety.minimum_requests_for_failure_rate must be an integer >= 1")
 
 
+# Milestone 12.1 Item 9: hysteresis thresholds move from hard-coded Python
+# defaults (`shadow/health_hysteresis.py::PersistentHealthPolicyConfig()`
+# constructed with no arguments) into this strict, frozen, versioned config
+# surface — an operator-visible, code-reviewed change, never a runtime YAML
+# free-for-all (values are strictly typed; unknown dimensions/fields fail
+# closed exactly like every other section in this module).
+HEALTH_HYSTERESIS_POLICY_VERSION = "persistent-health/v2"
+HEALTH_HYSTERESIS_DIMENSIONS = ("evidence_provider", "retry_exhaustion", "unsupported_claims")
+
+
+@dataclass(frozen=True)
+class HysteresisDimensionSection:
+    warning_after_failures: int
+    pause_recommended_after_failures: int
+    pause_required_after_failures: int
+    recovery_streak: int
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "warning_after_failures", "pause_recommended_after_failures",
+            "pause_required_after_failures", "recovery_streak",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 1:
+                raise ShadowOperationsConfigError(f"health_hysteresis.*.{field_name} must be a positive integer >= 1")
+        if not (
+            self.warning_after_failures <= self.pause_recommended_after_failures <= self.pause_required_after_failures
+        ):
+            raise ShadowOperationsConfigError(
+                "health_hysteresis.*: warning_after_failures <= pause_recommended_after_failures <= "
+                "pause_required_after_failures must hold"
+            )
+
+
+@dataclass(frozen=True)
+class HealthHysteresisSection:
+    policy_version: str
+    evidence_provider: HysteresisDimensionSection
+    retry_exhaustion: HysteresisDimensionSection
+    unsupported_claims: HysteresisDimensionSection
+
+    @property
+    def policy_hash(self) -> str:
+        return hash_config({
+            "policy_version": self.policy_version,
+            "evidence_provider": _dimension_hash_payload(self.evidence_provider),
+            "retry_exhaustion": _dimension_hash_payload(self.retry_exhaustion),
+            "unsupported_claims": _dimension_hash_payload(self.unsupported_claims),
+        })
+
+
+def _dimension_hash_payload(section: HysteresisDimensionSection) -> dict:
+    return {
+        "warning_after_failures": section.warning_after_failures,
+        "pause_recommended_after_failures": section.pause_recommended_after_failures,
+        "pause_required_after_failures": section.pause_required_after_failures,
+        "recovery_streak": section.recovery_streak,
+    }
+
+
+_DEFAULT_HYSTERESIS_DIMENSION = HysteresisDimensionSection(
+    warning_after_failures=1, pause_recommended_after_failures=2, pause_required_after_failures=3,
+    recovery_streak=2,
+)
+
+DEFAULT_HEALTH_HYSTERESIS = HealthHysteresisSection(
+    policy_version=HEALTH_HYSTERESIS_POLICY_VERSION,
+    evidence_provider=_DEFAULT_HYSTERESIS_DIMENSION,
+    retry_exhaustion=_DEFAULT_HYSTERESIS_DIMENSION,
+    unsupported_claims=_DEFAULT_HYSTERESIS_DIMENSION,
+)
+
+
+def _parse_hysteresis_dimension(raw_section: dict, *, dimension: str) -> HysteresisDimensionSection:
+    if not isinstance(raw_section, dict):
+        raise ShadowOperationsConfigError(f"health_hysteresis.{dimension} must be a mapping")
+    required_keys = {
+        "warning_after_failures", "pause_recommended_after_failures", "pause_required_after_failures",
+        "recovery_streak",
+    }
+    missing = required_keys - raw_section.keys()
+    if missing:
+        raise ShadowOperationsConfigError(f"health_hysteresis.{dimension} missing keys: {sorted(missing)}")
+    unknown = raw_section.keys() - required_keys
+    if unknown:
+        raise ShadowOperationsConfigError(f"health_hysteresis.{dimension} has unknown keys: {sorted(unknown)}")
+    return HysteresisDimensionSection(
+        warning_after_failures=_strict_positive_int(
+            raw_section["warning_after_failures"], f"health_hysteresis.{dimension}.warning_after_failures"
+        ),
+        pause_recommended_after_failures=_strict_positive_int(
+            raw_section["pause_recommended_after_failures"],
+            f"health_hysteresis.{dimension}.pause_recommended_after_failures",
+        ),
+        pause_required_after_failures=_strict_positive_int(
+            raw_section["pause_required_after_failures"],
+            f"health_hysteresis.{dimension}.pause_required_after_failures",
+        ),
+        recovery_streak=_strict_positive_int(
+            raw_section["recovery_streak"], f"health_hysteresis.{dimension}.recovery_streak"
+        ),
+    )
+
+
+def _parse_health_hysteresis(raw: dict) -> HealthHysteresisSection:
+    """`health_hysteresis` is an OPTIONAL top-level section — absent entirely
+    means `DEFAULT_HEALTH_HYSTERESIS` (safe repository defaults, matching
+    `PersistentHealthPolicyConfig()`'s pre-existing hard-coded values, so
+    unattended scheduling stays exactly as conservative as before this
+    section existed). Present-but-malformed always fails closed."""
+    section = raw.get("health_hysteresis")
+    if section is None:
+        return DEFAULT_HEALTH_HYSTERESIS
+    if not isinstance(section, dict):
+        raise ShadowOperationsConfigError("health_hysteresis must be a mapping")
+    unknown_top = section.keys() - ({"policy_version"} | set(HEALTH_HYSTERESIS_DIMENSIONS))
+    if unknown_top:
+        raise ShadowOperationsConfigError(f"health_hysteresis has unknown dimensions/fields: {sorted(unknown_top)}")
+    missing_dims = set(HEALTH_HYSTERESIS_DIMENSIONS) - section.keys()
+    if missing_dims:
+        raise ShadowOperationsConfigError(f"health_hysteresis missing dimensions: {sorted(missing_dims)}")
+    policy_version = section.get("policy_version", HEALTH_HYSTERESIS_POLICY_VERSION)
+    if type(policy_version) is not str or not policy_version.strip():
+        raise ShadowOperationsConfigError("health_hysteresis.policy_version must be a non-empty string")
+    return HealthHysteresisSection(
+        policy_version=policy_version,
+        evidence_provider=_parse_hysteresis_dimension(section["evidence_provider"], dimension="evidence_provider"),
+        retry_exhaustion=_parse_hysteresis_dimension(section["retry_exhaustion"], dimension="retry_exhaustion"),
+        unsupported_claims=_parse_hysteresis_dimension(section["unsupported_claims"], dimension="unsupported_claims"),
+    )
+
+
 @dataclass(frozen=True)
 class ShadowOperationsConfiguration:
     version: int
@@ -211,6 +343,7 @@ class ShadowOperationsConfiguration:
     safety: SafetySection
     config_hash: str
     raw: dict
+    health_hysteresis: HealthHysteresisSection = DEFAULT_HEALTH_HYSTERESIS
 
 
 def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOperationsConfiguration:
@@ -338,6 +471,7 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
             pause_on_budget_breach=_strict_bool(safety["pause_on_budget_breach"], "safety.pause_on_budget_breach"),
             minimum_requests_for_failure_rate=int(safety.get("minimum_requests_for_failure_rate", 1)),
         )
+        health_hysteresis_section = _parse_health_hysteresis(raw)
     except ShadowOperationsConfigError:
         raise
     except Exception as exc:
@@ -346,4 +480,5 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
     return ShadowOperationsConfiguration(
         version=raw.get("version", 1), shadow_operations=shadow_operations_section, schedule=schedule_section,
         budgets=budgets_section, safety=safety_section, config_hash=hash_config(raw), raw=raw,
+        health_hysteresis=health_hysteresis_section,
     )

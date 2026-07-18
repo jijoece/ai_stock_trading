@@ -67,6 +67,27 @@ jobs:
         run: pyright
         continue-on-error: true
 
+  type-check-safety:
+    name: type-check-safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install main package + pyright
+        run: |
+          pip install -e ".[dev]"
+          pip install pyright
+      # Milestone 12.1 Item 10: BLOCKING type-check gate scoped to the
+      # production modules this milestone's provider/health/CI-integrity
+      # work modified (pyright-safety.json's `include` list) — deliberately
+      # narrower than, and in addition to, the non-blocking whole-project
+      # `type-check` job above. No `continue-on-error` here: this must stay
+      # at 0 errors, never globally suppressed.
+      - name: Run pyright (safety-critical subset, blocking)
+        run: pyright --project pyright-safety.json
+
   migration-smoke:
     name: migration-smoke
     runs-on: ubuntu-latest
@@ -116,4 +137,28 @@ jobs:
               assert 'scope_sequence' in cols
               second.close()
           print('upgrade schema smoke OK')
+          "
+      - name: Milestone 12.1 structured-failure/reasoning-token/adapter-version columns and scheduled-run index exist
+        run: |
+          python -c "
+          import tempfile
+          from pathlib import Path
+          from trading_research.storage.database import connect
+          from trading_research.storage.schema_version import CURRENT_SCHEMA_VERSION
+
+          with tempfile.TemporaryDirectory() as tmp:
+              conn = connect(Path(tmp) / 'm12_1.sqlite3')
+              cols = {row[1] for row in conn.execute('PRAGMA table_info(research_attempts)').fetchall()}
+              for expected in (
+                  'failure_code', 'failure_stage', 'failure_retryable', 'failure_metadata_json',
+                  'provider_adapter_version', 'reasoning_output_tokens', 'token_accounting_policy',
+              ):
+                  assert expected in cols, expected
+              indexes = {
+                  row[1] for row in conn.execute(\"PRAGMA index_list(evidence_provider_requests)\").fetchall()
+              }
+              assert 'idx_evidence_provider_requests_scheduled_run' in indexes
+              assert CURRENT_SCHEMA_VERSION >= 9
+              conn.close()
+          print('Milestone 12.1 schema smoke OK')
           "

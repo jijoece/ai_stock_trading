@@ -8,14 +8,23 @@ statuses instead of a misleading zero when there is no data yet.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..hashing import hash_config
 from .http_client import (
     TRANSPORT_AUTHENTICATION_FAILURE,
     TRANSPORT_CONFIGURATION_ERROR,
+    TRANSPORT_CONNECTION_REFUSED,
+    TRANSPORT_CONNECTION_RESET,
+    TRANSPORT_DNS_FAILURE,
+    TRANSPORT_HTTP_CLIENT_ERROR,
+    TRANSPORT_HTTP_SERVER_ERROR,
+    TRANSPORT_NONE,
     TRANSPORT_PROTOCOL_ERROR,
+    TRANSPORT_RATE_LIMITED,
+    TRANSPORT_TIMEOUT,
     TRANSPORT_TLS_FAILURE,
+    TRANSPORT_UNKNOWN_ERROR,
 )
 
 STATUS_HEALTHY = "HEALTHY"
@@ -40,6 +49,23 @@ class ProviderHealthSummary:
     cache_hit_rate: float | None
     average_latency_ms: float | None
     p95_latency_ms: float | None
+    # Milestone 12.1 Item 8: computed from the exact, already-classified
+    # `transport_failure_category` enum (`http_client.py`) — never inferred
+    # from a generic exception class name, a free-text message, or a missing
+    # HTTP status. `timeout_rate` above is now ALSO computed this way
+    # (previously it counted every generic `ProviderRequestError`, which
+    # could include 5xx/connection failures/other non-timeout errors).
+    dns_failure_rate: float | None = None
+    connection_refused_rate: float | None = None
+    connection_reset_rate: float | None = None
+    tls_failure_rate: float | None = None
+    authentication_failure_rate: float | None = None
+    rate_limit_rate: float | None = None
+    http_client_error_rate: float | None = None
+    http_server_error_rate: float | None = None
+    protocol_error_rate: float | None = None
+    configuration_error_rate: float | None = None
+    unknown_transport_error_rate: float | None = None
 
 
 def _percentile(sorted_values: list[float], pct: float) -> float:
@@ -47,6 +73,26 @@ def _percentile(sorted_values: list[float], pct: float) -> float:
         return 0.0
     idx = min(len(sorted_values) - 1, int(round(pct * (len(sorted_values) - 1))))
     return sorted_values[idx]
+
+
+# Milestone 12.1 Item 8: exact enum -> rate-field mapping. Deliberately a
+# lookup table, not a chain of `if transport_category == ...: elif ...` —
+# every category maps to exactly one rate field, and `TRANSPORT_NONE` is
+# absent on purpose (it means "no transport failure", never itself a rate).
+_TRANSPORT_CATEGORY_TO_RATE_FIELD = {
+    TRANSPORT_TIMEOUT: "timeout_rate",
+    TRANSPORT_DNS_FAILURE: "dns_failure_rate",
+    TRANSPORT_CONNECTION_REFUSED: "connection_refused_rate",
+    TRANSPORT_CONNECTION_RESET: "connection_reset_rate",
+    TRANSPORT_TLS_FAILURE: "tls_failure_rate",
+    TRANSPORT_AUTHENTICATION_FAILURE: "authentication_failure_rate",
+    TRANSPORT_RATE_LIMITED: "rate_limit_rate",
+    TRANSPORT_HTTP_CLIENT_ERROR: "http_client_error_rate",
+    TRANSPORT_HTTP_SERVER_ERROR: "http_server_error_rate",
+    TRANSPORT_PROTOCOL_ERROR: "protocol_error_rate",
+    TRANSPORT_CONFIGURATION_ERROR: "configuration_error_rate",
+    TRANSPORT_UNKNOWN_ERROR: "unknown_transport_error_rate",
+}
 
 
 def compute_provider_health(rows: list[dict], provider: str) -> ProviderHealthSummary:
@@ -60,11 +106,25 @@ def compute_provider_health(rows: list[dict], provider: str) -> ProviderHealthSu
         )
 
     successes = sum(1 for r in provider_rows if r["success"])
-    timeouts = sum(1 for r in provider_rows if r.get("error_code") == "ProviderRequestError" and not r["success"])
     rate_limited = sum(1 for r in provider_rows if r["rate_limited"])
     invalid = sum(1 for r in provider_rows if r.get("error_code") == "MalformedProviderResponseError")
     cache_hits = sum(1 for r in provider_rows if r["cache_status"] == "HIT")
     latencies = sorted(r["latency_ms"] for r in provider_rows if r.get("latency_ms") is not None)
+
+    # Milestone 12.1 Item 8: typed rates use EXACT `transport_failure_category`
+    # matching — never inferred from a generic exception class name, a
+    # missing HTTP status, or a free-text message. A row whose category is
+    # `TRANSPORT_NONE` (a legacy pre-migration-5 row, or a genuinely
+    # successful/non-transport failure) contributes to none of these rates —
+    # it is not silently folded into "unknown" either, since "unknown" is
+    # itself a real, classified category (`TRANSPORT_UNKNOWN_ERROR`).
+    category_counts: dict[str, int] = {field_name: 0 for field_name in _TRANSPORT_CATEGORY_TO_RATE_FIELD.values()}
+    for row in provider_rows:
+        category = row.get("transport_failure_category") or TRANSPORT_NONE
+        field_name = _TRANSPORT_CATEGORY_TO_RATE_FIELD.get(category)
+        if field_name is not None:
+            category_counts[field_name] += 1
+    typed_rates = {field_name: count / total for field_name, count in category_counts.items()}
 
     success_rate = successes / total
     if success_rate < UNAVAILABLE_SUCCESS_RATE_THRESHOLD:
@@ -76,10 +136,11 @@ def compute_provider_health(rows: list[dict], provider: str) -> ProviderHealthSu
 
     return ProviderHealthSummary(
         provider=provider, status=status, total_requests=total, success_rate=success_rate,
-        timeout_rate=timeouts / total, rate_limited_rate=rate_limited / total,
+        rate_limited_rate=rate_limited / total,
         invalid_response_rate=invalid / total, cache_hit_rate=cache_hits / total,
         average_latency_ms=(sum(latencies) / len(latencies)) if latencies else None,
         p95_latency_ms=_percentile(latencies, 0.95) if latencies else None,
+        **typed_rates,
     )
 
 
@@ -138,6 +199,123 @@ def classify_severe_error(row: dict) -> str | None:
     return None
 
 
+# --- Milestone 12.1 Item 6: required-provider health evaluated per category,
+# independently of every other category's/provider's success. An aggregate
+# success rate across all providers can hide a required provider's total
+# failure behind an unrelated provider's success (e.g. SEC EDGAR 9/9 plus
+# Alpaca 0/1 reads as a healthy 90% in aggregate) — this section computes one
+# health verdict per required category, using only that category's own
+# acceptable providers' requests, never diluted by any other provider.
+
+REQUIRED_CATEGORY_STATUS_PASS = "PASS"
+REQUIRED_CATEGORY_STATUS_WARNING = "WARNING"
+REQUIRED_CATEGORY_STATUS_FAIL = "FAIL"
+REQUIRED_CATEGORY_STATUS_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+REQUIRED_CATEGORY_STATUS_MISSING = "MISSING"
+REQUIRED_CATEGORY_STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+REQUIRED_CATEGORY_STATUSES = (
+    REQUIRED_CATEGORY_STATUS_PASS, REQUIRED_CATEGORY_STATUS_WARNING, REQUIRED_CATEGORY_STATUS_FAIL,
+    REQUIRED_CATEGORY_STATUS_INSUFFICIENT_DATA, REQUIRED_CATEGORY_STATUS_MISSING,
+    REQUIRED_CATEGORY_STATUS_NOT_APPLICABLE,
+)
+
+# A category unhealthy for pause purposes — FAIL (below the configured
+# success-rate floor) or MISSING (zero requests to any acceptable provider
+# this cycle). INSUFFICIENT_DATA (below the request-count floor, but no
+# outright failure) is deliberately NOT treated as unhealthy — a category
+# that naturally makes fewer requests than its floor is not itself a
+# failure signal (docs: "choose whether a low-sample category is
+# INSUFFICIENT_DATA or acceptable" — this repository treats it as
+# observationally distinct from FAIL, never silently passing OR failing).
+_UNHEALTHY_REQUIRED_CATEGORY_STATUSES = (REQUIRED_CATEGORY_STATUS_FAIL, REQUIRED_CATEGORY_STATUS_MISSING)
+
+# Category-specific sample floor defaults (docs' suggested
+# `provider_health.required_categories.*` shape) — most required categories
+# in this repository make exactly one request per cycle, so the default
+# floor is 1 request / 100% success, not one global minimum blindly applied
+# to every category regardless of its expected request volume.
+DEFAULT_CATEGORY_MINIMUM_REQUESTS = 1
+DEFAULT_CATEGORY_MINIMUM_SUCCESS_RATE = 1.0
+
+
+@dataclass(frozen=True)
+class RequiredCategoryHealth:
+    category: str
+    acceptable_providers: tuple[str, ...]
+    observed_provider: str | None
+    request_count: int
+    success_count: int
+    failure_count: int
+    success_rate: float | None
+    sample_floor: int
+    minimum_success_rate: float
+    status: str
+    reasons: tuple[str, ...]
+
+
+def evaluate_required_category_health(
+    rows: list[dict], policy: "ProviderCoveragePolicy",
+) -> tuple[RequiredCategoryHealth, ...]:
+    """One independent health verdict per required category — computed only
+    from THAT category's own acceptable providers' rows, never from an
+    aggregate across every provider. `rows` are raw, un-normalized
+    `evidence_provider_requests` rows (provider names are normalized here,
+    matching `compute_cycle_provider_telemetry`)."""
+    normalized_rows = [{**row, "provider": normalize_provider_name(row["provider"])} for row in rows]
+    results: list[RequiredCategoryHealth] = []
+    for category, acceptable_providers in policy.required_categories:
+        acceptable = tuple(normalize_provider_name(p) for p in acceptable_providers)
+        category_rows = [r for r in normalized_rows if r["provider"] in acceptable]
+        request_count = len(category_rows)
+        minimum_requests = policy.category_minimum_requests.get(category, DEFAULT_CATEGORY_MINIMUM_REQUESTS)
+        minimum_success_rate = policy.category_minimum_success_rate.get(
+            category, DEFAULT_CATEGORY_MINIMUM_SUCCESS_RATE
+        )
+        observed_provider = category_rows[0]["provider"] if category_rows else None
+        if request_count == 0:
+            results.append(RequiredCategoryHealth(
+                category=category, acceptable_providers=acceptable, observed_provider=None,
+                request_count=0, success_count=0, failure_count=0, success_rate=None,
+                sample_floor=minimum_requests, minimum_success_rate=minimum_success_rate,
+                status=REQUIRED_CATEGORY_STATUS_MISSING,
+                reasons=(f"no request to any acceptable provider {acceptable} this cycle",),
+            ))
+            continue
+        success_count = sum(1 for r in category_rows if r["success"])
+        failure_count = request_count - success_count
+        success_rate = success_count / request_count
+        if request_count < minimum_requests:
+            status = REQUIRED_CATEGORY_STATUS_INSUFFICIENT_DATA
+            reasons = (
+                f"request_count {request_count} < minimum_requests {minimum_requests} for category {category!r} — "
+                "not treated as pass or fail",
+            )
+        elif success_rate < minimum_success_rate:
+            status = REQUIRED_CATEGORY_STATUS_FAIL
+            reasons = (
+                f"success_rate {success_rate:.3f} < minimum_success_rate {minimum_success_rate:.3f} for "
+                f"required category {category!r} (provider {observed_provider!r})",
+            )
+        else:
+            status = REQUIRED_CATEGORY_STATUS_PASS
+            reasons = (f"success_rate {success_rate:.3f} meets minimum_success_rate {minimum_success_rate:.3f}",)
+        results.append(RequiredCategoryHealth(
+            category=category, acceptable_providers=acceptable, observed_provider=observed_provider,
+            request_count=request_count, success_count=success_count, failure_count=failure_count,
+            success_rate=success_rate, sample_floor=minimum_requests, minimum_success_rate=minimum_success_rate,
+            status=status, reasons=reasons,
+        ))
+    for category in policy.unavailable_required_categories:
+        results.append(RequiredCategoryHealth(
+            category=category, acceptable_providers=(), observed_provider=None, request_count=0, success_count=0,
+            failure_count=0, success_rate=None, sample_floor=0, minimum_success_rate=0.0,
+            status=REQUIRED_CATEGORY_STATUS_NOT_APPLICABLE,
+            reasons=(f"category {category!r} has no provider configured/enabled — excluded from coverage entirely",),
+        ))
+    return tuple(sorted(results, key=lambda r: r.category))
+
+
 PROVIDER_COVERAGE_POLICY_VERSION = "provider-coverage/v1"
 
 
@@ -159,6 +337,13 @@ class ProviderCoveragePolicy:
     unavailable_required_categories: tuple[str, ...] = ()
     configuration_hash: str = ""
     telemetry_expected: bool = True
+    # Milestone 12.1 Item 6: per-category sample floor/success-rate policy —
+    # `evaluate_required_category_health` falls back to
+    # `DEFAULT_CATEGORY_MINIMUM_REQUESTS`/`DEFAULT_CATEGORY_MINIMUM_SUCCESS_RATE`
+    # for any category not named here, so an existing caller that never sets
+    # these keeps the pre-existing "one request, 100% success" expectation.
+    category_minimum_requests: "dict[str, int]" = field(default_factory=dict)
+    category_minimum_success_rate: "dict[str, float]" = field(default_factory=dict)
 
     @property
     def required_providers(self) -> tuple[str, ...]:
@@ -177,6 +362,8 @@ class ProviderCoveragePolicy:
             "unavailable_required_categories": self.unavailable_required_categories,
             "configuration_hash": self.configuration_hash,
             "telemetry_expected": self.telemetry_expected,
+            "category_minimum_requests": tuple(sorted(self.category_minimum_requests.items())),
+            "category_minimum_success_rate": tuple(sorted(self.category_minimum_success_rate.items())),
         })
 
 
@@ -232,6 +419,13 @@ class CycleProviderTelemetry:
     policy_hash: str = ""
     configuration_hash: str = ""
     telemetry_expected: bool = True
+    # Milestone 12.1 Item 6: independent per-required-category verdicts —
+    # `unhealthy_required_categories` names every category whose OWN
+    # acceptable-provider requests failed its OWN success-rate floor
+    # (FAIL) or made zero requests (MISSING/`missing_required_categories`
+    # already covers the latter) — never derived from the aggregate rate.
+    required_category_health: "tuple[RequiredCategoryHealth, ...]" = ()
+    unhealthy_required_categories: tuple[str, ...] = ()
 
 
 def compute_cycle_provider_telemetry(
@@ -256,6 +450,10 @@ def compute_cycle_provider_telemetry(
     severe_categories = sorted({
         category for row in normalized_rows for category in (classify_severe_error(row),) if category is not None
     })
+    required_category_health = evaluate_required_category_health(rows, policy)
+    unhealthy_required_categories = tuple(sorted(
+        h.category for h in required_category_health if h.status in _UNHEALTHY_REQUIRED_CATEGORY_STATUSES
+    ))
     return CycleProviderTelemetry(
         total_requests=total, successful_requests=successes, aggregate_success_rate=aggregate_rate,
         per_provider=per_provider, required_providers_missing=missing,
@@ -265,6 +463,8 @@ def compute_cycle_provider_telemetry(
         missing_required_categories=tuple(sorted(missing_categories)), policy_version=policy.policy_version,
         policy_hash=policy.policy_hash, configuration_hash=policy.configuration_hash,
         telemetry_expected=policy.telemetry_expected,
+        required_category_health=required_category_health,
+        unhealthy_required_categories=unhealthy_required_categories,
     )
 
 

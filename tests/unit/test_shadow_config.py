@@ -294,3 +294,179 @@ def test_config_hash_remains_deterministic_with_strict_bool_parsing():
     c1 = load_shadow_operations_config(path)
     c2 = load_shadow_operations_config(path)
     assert c1.config_hash == c2.config_hash
+
+
+# --- Milestone 12.1 Item 9: frozen hysteresis configuration ------------------
+
+_VALID_HYSTERESIS = {
+    "policy_version": "persistent-health/v2",
+    "evidence_provider": {
+        "warning_after_failures": 1, "pause_recommended_after_failures": 2,
+        "pause_required_after_failures": 3, "recovery_streak": 2,
+    },
+    "retry_exhaustion": {
+        "warning_after_failures": 1, "pause_recommended_after_failures": 2,
+        "pause_required_after_failures": 3, "recovery_streak": 2,
+    },
+    "unsupported_claims": {
+        "warning_after_failures": 1, "pause_recommended_after_failures": 2,
+        "pause_required_after_failures": 3, "recovery_streak": 2,
+    },
+}
+
+
+def _with_hysteresis(hysteresis: dict) -> dict:
+    import copy
+
+    raw = copy.deepcopy(VALID_RAW)
+    raw["health_hysteresis"] = hysteresis
+    return raw
+
+
+def test_valid_hysteresis_configuration_loads():
+    path = _write_config(_with_hysteresis(_VALID_HYSTERESIS))
+    config = load_shadow_operations_config(path)
+    assert config.health_hysteresis.policy_version == "persistent-health/v2"
+    assert config.health_hysteresis.retry_exhaustion.pause_required_after_failures == 3
+
+
+def test_absent_hysteresis_section_uses_safe_repository_defaults():
+    path = _write_config(VALID_RAW)  # no health_hysteresis key at all
+    config = load_shadow_operations_config(path)
+    assert config.health_hysteresis.evidence_provider.warning_after_failures == 1
+    assert config.health_hysteresis.retry_exhaustion.recovery_streak == 2
+
+
+def test_quoted_integer_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["warning_after_failures"] = "1"
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_float_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["recovery_streak"] = 2.5
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_boolean_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["warning_after_failures"] = True
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_null_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["recovery_streak"] = None
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_zero_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["warning_after_failures"] = 0
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_negative_value_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["retry_exhaustion"]["pause_required_after_failures"] = -1
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_inconsistent_ordering_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["unsupported_claims"]["warning_after_failures"] = 5
+    bad["unsupported_claims"]["pause_recommended_after_failures"] = 2
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_unknown_dimension_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["model_provider"] = bad["evidence_provider"]
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_unknown_field_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    bad["evidence_provider"]["extra_unknown_field"] = 1
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_missing_dimension_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_HYSTERESIS)
+    del bad["unsupported_claims"]
+    path = _write_config(_with_hysteresis(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_policy_hash_changes_when_thresholds_change():
+    path_a = _write_config(_with_hysteresis(_VALID_HYSTERESIS))
+    config_a = load_shadow_operations_config(path_a)
+
+    import copy
+
+    changed = copy.deepcopy(_VALID_HYSTERESIS)
+    changed["retry_exhaustion"]["pause_required_after_failures"] = 9
+    path_b = _write_config(_with_hysteresis(changed))
+    config_b = load_shadow_operations_config(path_b)
+
+    assert config_a.health_hysteresis.policy_hash != config_b.health_hysteresis.policy_hash
+
+
+def test_each_dimension_uses_its_own_configured_thresholds():
+    import copy
+
+    custom = copy.deepcopy(_VALID_HYSTERESIS)
+    custom["retry_exhaustion"]["pause_required_after_failures"] = 9
+    custom["retry_exhaustion"]["pause_recommended_after_failures"] = 8
+    custom["retry_exhaustion"]["warning_after_failures"] = 7
+    path = _write_config(_with_hysteresis(custom))
+    config = load_shadow_operations_config(path)
+    assert config.health_hysteresis.retry_exhaustion.pause_required_after_failures == 9
+    assert config.health_hysteresis.evidence_provider.pause_required_after_failures == 3
+
+
+def test_safe_repository_default_config_keeps_unattended_scheduling_disabled():
+    config = load_shadow_operations_config(DEFAULT_SHADOW_OPERATIONS_CONFIG_PATH)
+    assert config.health_hysteresis.policy_version == "persistent-health/v2"
+    assert config.shadow_operations.enabled is False
+    assert config.schedule.enabled is False
