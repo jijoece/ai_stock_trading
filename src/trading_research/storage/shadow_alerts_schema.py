@@ -88,6 +88,30 @@ CREATE TABLE IF NOT EXISTS shadow_run_health_checks (
     policy_version TEXT NOT NULL,
     evaluated_at TEXT NOT NULL
 );
+
+-- Milestone 11.3.1 Item 8 Part C: persistent, multi-cycle provider-health
+-- hysteresis state. One row per `scope` (a singleton "default" scope today;
+-- the column exists so a future multi-book/multi-provider-set deployment
+-- can key additional rows without a schema change). Reading this row is how
+-- `evaluate_and_persist_hysteresis` survives a process restart -- the
+-- decision is reconstructed from durable state, never from in-memory
+-- counters.
+CREATE TABLE IF NOT EXISTS shadow_health_hysteresis_state (
+    scope TEXT PRIMARY KEY,
+    policy_version TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    consecutive_recoveries INTEGER NOT NULL DEFAULT 0,
+    qualified_cycle_count INTEGER NOT NULL DEFAULT 0,
+    failing_cycle_count INTEGER NOT NULL DEFAULT 0,
+    window_start TEXT,
+    window_end TEXT,
+    last_cycle_id TEXT,
+    last_evaluated_at TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    per_provider_metrics_json TEXT NOT NULL DEFAULT '{}'
+);
 """
 
 SHADOW_ALERTS_INDEXES = """

@@ -195,3 +195,39 @@ def list_health_checks(
     query += " ORDER BY check_name"
     rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
+
+
+# -- Milestone 11.3.1 Item 8 Part C: persistent health hysteresis state ------
+
+
+def load_health_hysteresis_state(conn: sqlite3.Connection, scope: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_health_hysteresis_state WHERE scope = ?", (scope,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def save_health_hysteresis_state(conn: sqlite3.Connection, state: dict) -> None:
+    """Upsert — exactly one row per `scope`. Callers always write the full
+    freshly-computed state (never a partial patch), so there is no risk of
+    a stale field surviving an update."""
+    conn.execute(
+        "INSERT INTO shadow_health_hysteresis_state "
+        "(scope, policy_version, policy_hash, decision, consecutive_failures, consecutive_recoveries, "
+        "qualified_cycle_count, failing_cycle_count, window_start, window_end, last_cycle_id, "
+        "last_evaluated_at, reasons_json, per_provider_metrics_json) "
+        "VALUES (:scope, :policy_version, :policy_hash, :decision, :consecutive_failures, "
+        ":consecutive_recoveries, :qualified_cycle_count, :failing_cycle_count, :window_start, :window_end, "
+        ":last_cycle_id, :last_evaluated_at, :reasons_json, :per_provider_metrics_json) "
+        "ON CONFLICT(scope) DO UPDATE SET "
+        "policy_version = excluded.policy_version, policy_hash = excluded.policy_hash, "
+        "decision = excluded.decision, consecutive_failures = excluded.consecutive_failures, "
+        "consecutive_recoveries = excluded.consecutive_recoveries, "
+        "qualified_cycle_count = excluded.qualified_cycle_count, "
+        "failing_cycle_count = excluded.failing_cycle_count, window_start = excluded.window_start, "
+        "window_end = excluded.window_end, last_cycle_id = excluded.last_cycle_id, "
+        "last_evaluated_at = excluded.last_evaluated_at, reasons_json = excluded.reasons_json, "
+        "per_provider_metrics_json = excluded.per_provider_metrics_json",
+        state,
+    )
+    conn.commit()

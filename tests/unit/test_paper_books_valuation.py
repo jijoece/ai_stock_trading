@@ -166,8 +166,10 @@ def test_snapshot_id_changes_when_price_input_changes(conn):
     snap_low = valuation.build_portfolio_snapshot(
         conn, "BASELINE", NOW, price_provider=_FakePriceProvider(Decimal("150.00")), maximum_price_age_seconds=900,
     )
-    # New connection state (position unchanged) but a different price input.
-    snap_high_id = valuation.compute_snapshot_id(
-        "BASELINE", NOW, {"AAPL": {"quantity": "10", "price": "160.00", "status": "COMPLETE", "price_timestamp": None}},
+    # Same position, a different price input -- persist=False so this
+    # doesn't collide with snap_low's own row for the same (book_id, as_of).
+    snap_high = valuation.build_portfolio_snapshot(
+        conn, "BASELINE", NOW, price_provider=_FakePriceProvider(Decimal("160.00")), maximum_price_age_seconds=900,
+        persist=False,
     )
-    assert snap_low.snapshot_id != snap_high_id
+    assert snap_low.snapshot_id != snap_high.snapshot_id

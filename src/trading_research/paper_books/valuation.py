@@ -141,6 +141,22 @@ def build_portfolio_snapshot(
     evidence_snapshots_by_symbol = evidence_snapshots_by_symbol or {}
     cash_available = cash_ledger.available_cash(conn, book_id)
     cash_reserved = cash_ledger.reserved_cash(conn, book_id)
+    cash_settled = cash_ledger.settled_cash(conn, book_id)
+    # Milestone 11.3.1 Item 3: a canonical hash over every contributing
+    # cash-ledger entry, not just the three aggregate totals above. Two
+    # different sets of ledger entries can coincidentally sum to the same
+    # available/reserved/settled totals (e.g. a fee reversed and reapplied
+    # at a different amount netting to the same balance) -- the identity
+    # must still change when the underlying ledger changed. Keyed by
+    # ledger_entry_id (unique) rather than a list, so hash_config's
+    # sort_keys makes the result independent of the entries' return order.
+    cash_ledger_hash = hash_config({
+        entry["ledger_entry_id"]: {
+            "event_type": entry["event_type"], "amount_usd": entry["amount_usd"],
+            "event_timestamp": entry["event_timestamp"], "idempotency_key": entry["idempotency_key"],
+        }
+        for entry in repo.list_cash_ledger_entries(conn, book_id)
+    })
     positions = repo.list_positions(conn, book_id, open_only=True)
 
     position_inputs: dict[str, dict] = {}
@@ -165,10 +181,26 @@ def build_portfolio_snapshot(
             symbol, as_of, evidence_snapshot=evidence_snapshots_by_symbol.get(symbol),
             price_provider=price_provider, maximum_price_age_seconds=maximum_price_age_seconds,
         )
+        # Milestone 11.3.1 Item 3: every economically material position/
+        # price input, not just quantity/price/status/timestamp -- a
+        # cost-basis correction, a realized-P&L change, or a change in
+        # *which* price record was selected (provider/available_at/source
+        # record/point-in-time-safety/staleness) must also change the
+        # snapshot identity even when the raw quantity and price happen to
+        # be unchanged.
         position_inputs[symbol] = {
-            "quantity": str(quantity), "price": str(selection.price) if selection.price is not None else None,
-            "status": selection.status, "price_timestamp": selection.price_timestamp.isoformat()
-            if selection.price_timestamp else None,
+            "quantity": str(quantity),
+            "available_quantity": pos.get("available_quantity"),
+            "average_cost_usd": pos["average_cost_usd"],
+            "realized_pnl_usd": pos["realized_pnl_usd"],
+            "price": str(selection.price) if selection.price is not None else None,
+            "price_timestamp": selection.price_timestamp.isoformat() if selection.price_timestamp else None,
+            "price_available_at": selection.available_at.isoformat() if selection.available_at else None,
+            "price_provider": selection.provider,
+            "source_record_id": selection.source_record_id,
+            "point_in_time_safe": selection.point_in_time_safe,
+            "staleness_seconds": selection.staleness_seconds,
+            "status": selection.status,
         }
 
         market_value = None
@@ -213,11 +245,23 @@ def build_portfolio_snapshot(
     net_liq = (cash_available + cash_reserved + gross_mv) if gross_mv is not None else None
     unrealized = unrealized_pnl if gross_mv is not None else None
 
-    snapshot_id = compute_snapshot_id(book_id, as_of, position_inputs)
-    source_hash = hash_config({
-        "book_id": book_id, "as_of": as_of.isoformat(), "positions": position_inputs,
+    # Milestone 11.3.1 Item 3: one canonical snapshot-input payload derives
+    # both the snapshot identity and the source hash -- covering every
+    # economically material cash, ledger, position, and price input, not
+    # just positions/prices. A cash adjustment, a reservation change, a fee/
+    # slippage correction, a late fill, or a settlement/methodology version
+    # bump must all change the identity even if every position input is
+    # byte-for-byte unchanged.
+    identity_payload = {
+        "book_id": book_id, "as_of": as_of.isoformat(),
+        "cash_available_usd": str(cash_available), "cash_reserved_usd": str(cash_reserved),
+        "settled_cash_usd": str(cash_settled), "cash_ledger_hash": cash_ledger_hash,
         "settlement_policy_version": SETTLEMENT_POLICY_VERSION,
-    })
+        "snapshot_methodology_version": SNAPSHOT_METHODOLOGY_VERSION,
+        "positions": position_inputs,
+    }
+    snapshot_id = compute_snapshot_id(identity_payload)
+    source_hash = hash_config(identity_payload)
 
     snapshot = PaperPortfolioSnapshot(
         snapshot_id=snapshot_id, book_id=book_id, as_of=as_of, cash_available_usd=cash_available,

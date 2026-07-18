@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Any
 
 from ..research.evidence import EvidenceBundle
 from ..research.models import EvidenceItem, SourceRecord
@@ -28,7 +29,6 @@ from .market_data_provider import AlpacaMarketDataClient
 from .models import CompanyFactValue, FilingRecord
 from .news_provider import UnconfiguredNewsProvider
 from .sec_provider import SecEdgarClient
-from .sentiment_provider import RedditSentimentSource
 
 
 def _content_hash(*parts: object) -> str:
@@ -220,14 +220,16 @@ class RealNewsEvidenceProvider:
 
 
 class RealSentimentEvidenceProvider:
-    def __init__(self, source: RedditSentimentSource):
+    def __init__(self, source: Any):
         self._source = source
 
     def fetch(self, symbol: str, as_of: datetime) -> EvidenceBundle:
         result = self._source.fetch(symbol, as_of)
+        provider_name = getattr(self._source, "provider_name", "reddit-mcp")
+        source_locator = getattr(self._source, "source_locator", None)
         source_id = f"reddit-sentiment-{symbol}-{as_of.date().isoformat()}"
         record = SourceRecord(
-            source_id=source_id, source_type="sentiment", provider="reddit-mcp", source_locator=None,
+            source_id=source_id, source_type="sentiment", provider=provider_name, source_locator=source_locator,
             retrieved_at=as_of, published_at=as_of, effective_at=as_of, available_at=as_of,
             content_hash=_content_hash(symbol, result.net_sentiment, result.total_mentions),
             status="ok" if not result.missing_data_reasons else "missing", is_stale=False,
