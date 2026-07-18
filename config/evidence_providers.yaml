@@ -31,3 +31,15 @@ providers:
 
   sentiment:
     enabled: false                # requires REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET
+
+  reddit_free:
+    enabled: true                 # public Reddit Atom feeds; no credentials are read or sent
+    provider_class: trading_research.evidence_providers.reddit_free.RedditFreeProvider
+    cache_ttl_minutes: 60
+    user_agent: "AgenticTradingDesk/1.0"
+    subreddits: ["wallstreetbets", "stocks", "investing"]
+    max_posts_per_symbol: 100
+    request_timeout_seconds: 20
+    max_attempts: 3
+    min_request_interval_seconds: 2.0
+    max_requests_per_endpoint_hour: 30

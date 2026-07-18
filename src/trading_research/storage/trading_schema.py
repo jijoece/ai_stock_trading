@@ -83,6 +83,8 @@ CREATE TABLE IF NOT EXISTS news_items (
 
 CREATE TABLE IF NOT EXISTS reddit_posts (
     id TEXT PRIMARY KEY,
+    reddit_post_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL DEFAULT '',
     subreddit TEXT NOT NULL,
     author TEXT NOT NULL DEFAULT '[unknown]',
     created_utc REAL NOT NULL,
@@ -90,9 +92,13 @@ CREATE TABLE IF NOT EXISTS reddit_posts (
     num_comments INTEGER NOT NULL DEFAULT 0,
     title TEXT NOT NULL DEFAULT '',
     text TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
     url TEXT,
     injection_risk TEXT NOT NULL DEFAULT 'none',
-    retrieved_at TEXT NOT NULL
+    retrieved_at TEXT NOT NULL,
+    source_endpoint TEXT NOT NULL DEFAULT '',
+    fetch_timestamp TEXT NOT NULL DEFAULT '',
+    sentiment_compound REAL
 );
 
 CREATE TABLE IF NOT EXISTS reddit_comments (
@@ -317,6 +323,8 @@ CREATE INDEX IF NOT EXISTS idx_earnings_report_date ON earnings_calendar(report_
 CREATE INDEX IF NOT EXISTS idx_sec_filings_symbol ON sec_filings(symbol, filed_at);
 CREATE INDEX IF NOT EXISTS idx_news_symbol_published ON news_items(symbol, published_at);
 CREATE INDEX IF NOT EXISTS idx_reddit_posts_sub_created ON reddit_posts(subreddit, created_utc);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reddit_posts_symbol_post_id
+    ON reddit_posts(symbol, reddit_post_id) WHERE reddit_post_id <> '';
 CREATE INDEX IF NOT EXISTS idx_reddit_comments_post ON reddit_comments(post_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_symbol_ts ON reddit_ticker_mentions(symbol, ts);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_mentions_record_symbol_span
@@ -390,6 +398,14 @@ _COLUMN_UPGRADES: dict[str, dict[str, str]] = {
         "span_start": "INTEGER",
         "confidence": "TEXT NOT NULL DEFAULT ''",
         "rejection_reason": "TEXT",
+    },
+    "reddit_posts": {
+        "reddit_post_id": "TEXT NOT NULL DEFAULT ''",
+        "symbol": "TEXT NOT NULL DEFAULT ''",
+        "body": "TEXT NOT NULL DEFAULT ''",
+        "source_endpoint": "TEXT NOT NULL DEFAULT ''",
+        "fetch_timestamp": "TEXT NOT NULL DEFAULT ''",
+        "sentiment_compound": "REAL",
     },
     "errors": {
         "severity": "TEXT NOT NULL DEFAULT 'error'",
