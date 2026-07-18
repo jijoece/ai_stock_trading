@@ -75,6 +75,10 @@ REASON_PROVIDER_STRUCTURAL_ERROR = "provider_structural_error"
 # (still unconditionally PAUSE_REQUIRED when True), only which config flag
 # gates the *pause action* changes.
 REASON_DUPLICATE_PREVENTION_VIOLATION = "duplicate_prevention_violation"
+# Milestone 12.1.1 Item 7: model-provider (Codex/Claude Code/Anthropic)
+# health — independent from REASON_PROVIDER_FAILURE_RATE (evidence
+# providers).
+REASON_MODEL_PROVIDER_FAILURE_RATE = "model_provider_failure_rate"
 
 # --- Field-level check status vocabulary (docs/milestone-7.2.md Part 2) -------
 CHECK_STATUS_PASS = "PASS"
@@ -107,9 +111,15 @@ CHECK_NAME_PAPER_RECONCILIATION_MISMATCH = "paper_reconciliation_mismatch"
 CHECK_NAME_DUPLICATE_PREVENTION_VIOLATION = "duplicate_prevention_violation"
 CHECK_NAME_CYCLE_DURATION_SECONDS = "cycle_duration_seconds"
 CHECK_NAME_BUDGET_BREACHED = "budget_breached"
+# Milestone 12.1.1 Item 7: independent model-provider (Codex/Claude
+# Code/Anthropic) health — distinct from CHECK_NAME_PROVIDER_FAILURE_RATE,
+# which covers evidence providers (SEC/Alpaca/Reddit), never the model
+# provider itself.
+CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE = "model_provider_failure_rate"
 
 CHECK_NAMES_IN_ORDER = (
-    CHECK_NAME_PROVIDER_FAILURE_RATE, CHECK_NAME_EVIDENCE_COMPLETENESS_RATE, CHECK_NAME_CLAUDE_ROLE_SUCCESS_RATE,
+    CHECK_NAME_PROVIDER_FAILURE_RATE, CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE, CHECK_NAME_EVIDENCE_COMPLETENESS_RATE,
+    CHECK_NAME_CLAUDE_ROLE_SUCCESS_RATE,
     CHECK_NAME_RETRY_RATE, CHECK_NAME_RETRY_EXHAUSTION_RATE, CHECK_NAME_UNSUPPORTED_CLAIM_RATE,
     CHECK_NAME_OUTPUT_TRUNCATION_RATE, CHECK_NAME_INPUT_TOKENS, CHECK_NAME_OUTPUT_TOKENS,
     CHECK_NAME_LATENCY_SECONDS, CHECK_NAME_COST_PRICING, CHECK_NAME_PRICING_CONFIGURED,
@@ -166,6 +176,23 @@ class CycleHealthInputs:
     # per category (never diluted by another provider's success) in
     # `evidence_providers/health.py::evaluate_required_category_health`.
     provider_unhealthy_required_categories: tuple[str, ...] = ()
+    # Milestone 12.1.1 Item 5: required categories that are individually
+    # INSUFFICIENT_DATA (own request count below own sample floor) — never
+    # merged into `provider_unhealthy_required_categories` (that tuple
+    # drives FAIL; this one must drive INSUFFICIENT_DATA instead, never PASS).
+    provider_insufficient_required_categories: tuple[str, ...] = ()
+    # Milestone 12.1.1 Item 7: independent model-provider health, sourced
+    # from persisted `research_attempts` for the current scheduler run
+    # (`shadow/model_provider_health.py`), never from evidence-provider
+    # request rows. `model_provider_structural_failure=True` bypasses the
+    # sample floor exactly like `provider_severe_error` does for the
+    # evidence-provider dimension — an unambiguous structural failure (auth,
+    # quota, unsupported version/model, invalid config, contract rejection,
+    # missing usage metadata) must pause immediately, never wait for a
+    # hysteresis streak.
+    model_provider_success_rate: float | None = None
+    model_provider_request_count: int | None = None
+    model_provider_structural_failure: bool = False
     provider_per_provider_metrics: dict = field(default_factory=dict)
     provider_severe_error_categories: tuple[str, ...] = ()
     provider_policy_version: str = ""
@@ -191,6 +218,11 @@ class HealthPolicyConfig:
     # noise. Default of 1 preserves prior behavior (every non-empty sample
     # was evaluated) for any config that hasn't set this explicitly.
     minimum_requests_for_failure_rate: int = 1
+    # Milestone 12.1.1 Item 7: independent model-provider threshold/sample
+    # floor — deliberately separate fields from the evidence-provider ones
+    # above so a change to one never silently retunes the other.
+    pause_on_model_provider_failure_rate: float = 0.5
+    minimum_requests_for_model_provider_failure_rate: int = 1
 
     @classmethod
     def from_shadow_config(cls, config: ShadowOperationsConfiguration, *, policy_version: str = POLICY_VERSION) -> "HealthPolicyConfig":
@@ -203,6 +235,10 @@ class HealthPolicyConfig:
             pause_on_budget_breach=config.safety.pause_on_budget_breach,
             max_cycle_duration_seconds=config.budgets.max_latency_seconds_per_cycle,
             minimum_requests_for_failure_rate=config.safety.minimum_requests_for_failure_rate,
+            pause_on_model_provider_failure_rate=config.safety.pause_on_model_provider_failure_rate,
+            minimum_requests_for_model_provider_failure_rate=(
+                config.safety.minimum_requests_for_model_provider_failure_rate
+            ),
         )
 
 
@@ -313,6 +349,11 @@ def provider_health_is_qualified(result: HealthResult) -> bool:
 DIMENSION_EVIDENCE_PROVIDER_FAILURE = "EVIDENCE_PROVIDER_FAILURE"
 DIMENSION_RETRY_EXHAUSTION = "RETRY_EXHAUSTION"
 DIMENSION_UNSUPPORTED_CLAIMS = "UNSUPPORTED_CLAIMS"
+# Milestone 12.1.1 Item 7: independent of DIMENSION_EVIDENCE_PROVIDER_FAILURE
+# — its own persistent hysteresis scope/streak, sourced from
+# `research_attempts`, never evidence-provider success clearing this streak
+# or vice versa.
+DIMENSION_MODEL_PROVIDER_FAILURE = "MODEL_PROVIDER_FAILURE"
 
 # Rate-based dimensions with their own persistent hysteresis scope. Structural
 # dimensions (reconciliation, duplicate-prevention, budget breach) remain
@@ -320,6 +361,7 @@ DIMENSION_UNSUPPORTED_CLAIMS = "UNSUPPORTED_CLAIMS"
 # and are deliberately NOT included here.
 HYSTERESIS_DIMENSIONS = (
     (DIMENSION_EVIDENCE_PROVIDER_FAILURE, CHECK_NAME_PROVIDER_FAILURE_RATE),
+    (DIMENSION_MODEL_PROVIDER_FAILURE, CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE),
     (DIMENSION_RETRY_EXHAUSTION, CHECK_NAME_RETRY_EXHAUSTION_RATE),
     (DIMENSION_UNSUPPORTED_CLAIMS, CHECK_NAME_UNSUPPORTED_CLAIM_RATE),
 )
@@ -330,10 +372,16 @@ def check_by_name(result: HealthResult, check_name: str) -> HealthCheckResult:
 
 
 def dimension_is_qualified(check: HealthCheckResult) -> bool:
-    """A dimension is qualified for hysteresis counting unless its own check
-    was `INSUFFICIENT_DATA` this cycle — evaluated per-dimension, never
-    inherited from a different dimension's sample size."""
-    return check.status != CHECK_STATUS_INSUFFICIENT_DATA
+    """A dimension is qualified for hysteresis counting only when its own
+    check this cycle actually drew a real conclusion — `PASS`, `WARNING`, or
+    `FAIL` — evaluated per-dimension, never inherited from a different
+    dimension's sample size (Milestone 12.1.1 Item 3: an allowlist, not a
+    single-value denylist, so `NOT_APPLICABLE` — a fixture-only/deterministic
+    cycle where the check does not even apply — and `INSUFFICIENT_DATA` both
+    move neither the failure nor the recovery streak, and any future
+    non-conclusive status added to `CHECK_STATUSES` fails closed to
+    unqualified by default instead of silently counting as healthy)."""
+    return check.status in (CHECK_STATUS_PASS, CHECK_STATUS_WARNING, CHECK_STATUS_FAIL)
 
 
 def dimension_cycle_status(check: HealthCheckResult) -> str:
@@ -549,6 +597,26 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
             comparison="required coverage", applicable=True,
             pause_flag_enabled=config.pause_on_provider_failure_rate > 0, reason=fail_reason,
         )
+    elif inputs.provider_insufficient_required_categories:
+        # Milestone 12.1.1 Item 5: a required category that made fewer
+        # requests than ITS OWN sample floor (e.g. market_data floor=3,
+        # observed=1) must never be masked by a passing aggregate
+        # `provider_failure_rate` computed across every provider (SEC's own
+        # healthy volume cannot hide Alpaca's own insufficient sample) —
+        # only reached once MISSING/FAIL required categories are ruled out
+        # above, matching the policy "MISSING/FAIL -> FAIL,
+        # INSUFFICIENT_DATA -> INSUFFICIENT_DATA, else evaluate the rate".
+        insufficient_reason = (
+            "required categories below their own sample floor: "
+            + ", ".join(inputs.provider_insufficient_required_categories)
+        )
+        fail_reason = degraded_reason = None
+        check = HealthCheckResult(
+            check_name=CHECK_NAME_PROVIDER_FAILURE_RATE, status=CHECK_STATUS_INSUFFICIENT_DATA,
+            input_value=_fmt(provider_failure_rate), input_unit="fraction",
+            threshold_value=_fmt(config.pause_on_provider_failure_rate), threshold_unit="fraction",
+            comparison="required coverage", applicable=True, pause_flag_enabled=False, reason=insufficient_reason,
+        )
     checks[CHECK_NAME_PROVIDER_FAILURE_RATE] = check
     if fail_reason:
         reasons.append(fail_reason)
@@ -556,6 +624,37 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
         status = _worse(status, STATUS_PAUSE_REQUIRED)
     elif degraded_reason:
         reasons.append(degraded_reason)
+        status = _worse(status, STATUS_DEGRADED)
+
+    # --- model_provider_failure_rate (Milestone 12.1.1 Item 7): independent of
+    # the evidence-provider dimension above — a healthy SEC/Alpaca cycle says
+    # nothing about whether Codex/Claude Code/Anthropic itself is healthy. ---
+    model_provider_failure_rate = (
+        1.0 - inputs.model_provider_success_rate if inputs.model_provider_success_rate is not None else None
+    )
+    model_check, model_fail_reason, model_degraded_reason = _rate_check(
+        check_name=CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE, value=model_provider_failure_rate,
+        threshold=config.pause_on_model_provider_failure_rate, label="model_provider_failure_rate",
+        sample_size=inputs.model_provider_request_count,
+        minimum_sample_size=config.minimum_requests_for_model_provider_failure_rate,
+        sample_floor_bypassed=inputs.model_provider_structural_failure,
+    )
+    if inputs.model_provider_structural_failure:
+        model_fail_reason = "model-provider structural failure requires an immediate pause"
+        model_degraded_reason = None
+        model_check = HealthCheckResult(
+            check_name=CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE, status=CHECK_STATUS_FAIL,
+            input_value=_fmt(model_provider_failure_rate), input_unit="fraction",
+            threshold_value=_fmt(config.pause_on_model_provider_failure_rate), threshold_unit="fraction",
+            comparison="structural failure", applicable=True, pause_flag_enabled=True, reason=model_fail_reason,
+        )
+    checks[CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE] = model_check
+    if model_fail_reason:
+        reasons.append(model_fail_reason)
+        triggering_flags.append(REASON_MODEL_PROVIDER_FAILURE_RATE)
+        status = _worse(status, STATUS_PAUSE_REQUIRED)
+    elif model_degraded_reason:
+        reasons.append(model_degraded_reason)
         status = _worse(status, STATUS_DEGRADED)
 
     # --- evidence_completeness_rate: captured, not thresholded by this policy ---
@@ -815,6 +914,7 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
 
 _FLAG_TO_PAUSE_TARGET = {
     REASON_PROVIDER_FAILURE_RATE: pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
+    REASON_MODEL_PROVIDER_FAILURE_RATE: pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
     REASON_RETRY_EXHAUSTION_RATE: pause_mod.STATE_PAUSED_RESEARCH_QUALITY,
     REASON_UNSUPPORTED_CLAIM_RATE: pause_mod.STATE_PAUSED_RESEARCH_QUALITY,
     REASON_RECONCILIATION_MISMATCH: pause_mod.STATE_PAUSED_RECONCILIATION,
@@ -825,6 +925,7 @@ _FLAG_TO_PAUSE_TARGET = {
 
 _FLAG_TO_CONFIG_ATTR = {
     REASON_PROVIDER_FAILURE_RATE: "pause_on_provider_failure_rate",
+    REASON_MODEL_PROVIDER_FAILURE_RATE: "pause_on_model_provider_failure_rate",
     REASON_RETRY_EXHAUSTION_RATE: "pause_on_retry_exhaustion_rate",
     REASON_UNSUPPORTED_CLAIM_RATE: "pause_on_unsupported_claim_rate",
     REASON_RECONCILIATION_MISMATCH: "pause_on_reconciliation_mismatch",
@@ -860,6 +961,7 @@ def apply_health_result(
     # `evaluate_cycle_health` already used to produce `triggering_flags`.
     boolish_flags = {
         REASON_PROVIDER_FAILURE_RATE: config.pause_on_provider_failure_rate > 0,
+        REASON_MODEL_PROVIDER_FAILURE_RATE: config.pause_on_model_provider_failure_rate > 0,
         REASON_RETRY_EXHAUSTION_RATE: config.pause_on_retry_exhaustion_rate > 0,
         REASON_UNSUPPORTED_CLAIM_RATE: config.pause_on_unsupported_claim_rate > 0,
         REASON_RECONCILIATION_MISMATCH: config.pause_on_reconciliation_mismatch,

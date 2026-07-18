@@ -124,6 +124,8 @@ class ScriptedStep:
     payload: Mapping | None = None
     raw_text: str | None = None
     usage_overrides: Mapping | None = None
+    retryable: bool | None = None
+    code: str | None = None
 
 
 _ERROR_KINDS = {
@@ -152,9 +154,21 @@ class ScriptedResearchProvider:
         step = self._steps[key]
 
         if step.kind in _ERROR_KINDS:
-            raise _ERROR_KINDS[step.kind](f"scripted {step.kind} for role={request.role} attempt={request.attempt_number}")
+            kwargs: dict = {}
+            if step.retryable is not None:
+                kwargs["retryable"] = step.retryable
+            if step.code is not None:
+                kwargs["code"] = step.code
+            raise _ERROR_KINDS[step.kind](
+                f"scripted {step.kind} for role={request.role} attempt={request.attempt_number}", **kwargs
+            )
         if step.kind == "malformed":
-            raise MalformedOutputError(step.raw_text or "scripted malformed output")
+            kwargs = {}
+            if step.retryable is not None:
+                kwargs["retryable"] = step.retryable
+            if step.code is not None:
+                kwargs["code"] = step.code
+            raise MalformedOutputError(step.raw_text or "scripted malformed output", **kwargs)
         if step.kind != "response":
             raise AssertionError(f"unknown ScriptedStep.kind {step.kind!r}")
 

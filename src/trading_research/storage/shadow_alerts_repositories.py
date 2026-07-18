@@ -256,14 +256,14 @@ def insert_health_hysteresis_evaluation(conn: sqlite3.Connection, evaluation: di
         "observed_providers_json, missing_required_providers_json, missing_required_categories_json, "
         "per_provider_metrics_json, severe_error_categories_json, consecutive_failures_before, "
         "consecutive_failures_after, consecutive_recoveries_before, consecutive_recoveries_after, "
-        "reasons_json, evaluated_at) VALUES "
+        "reasons_json, evaluated_at, research_cycle_id) VALUES "
         "(:evaluation_id, :scope, :cycle_id, :policy_version, :policy_hash, :single_cycle_status, "
         ":previous_hysteresis_status, :new_hysteresis_status, :effective_status, :qualified, :sample_size, "
         ":minimum_sample_size, :aggregate_success_rate, :required_categories_json, :required_providers_json, "
         ":observed_providers_json, :missing_required_providers_json, :missing_required_categories_json, "
         ":per_provider_metrics_json, :severe_error_categories_json, :consecutive_failures_before, "
         ":consecutive_failures_after, :consecutive_recoveries_before, :consecutive_recoveries_after, "
-        ":reasons_json, :evaluated_at) ON CONFLICT(scope, cycle_id, policy_hash) DO NOTHING",
+        ":reasons_json, :evaluated_at, :research_cycle_id) ON CONFLICT(scope, cycle_id, policy_hash) DO NOTHING",
         evaluation,
     )
     return cursor.rowcount > 0

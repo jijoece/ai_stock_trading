@@ -182,6 +182,13 @@ class CodexPreflight:
     # `None` unless `ready` is True. Persisted into usage provenance so a
     # future JSONL contract break can be root-caused to an adapter mismatch.
     adapter_version: str | None = None
+    # Milestone 12.1.1 Item 6: the configured `codex.minimum_version` floor
+    # this preflight was actually checked against — persisted alongside
+    # `binary_version`/`adapter_version` so an operator can distinguish "CLI
+    # too old for the adapter contract" from "CLI is adapter-compatible but
+    # below the configured floor" purely from provenance, without re-deriving
+    # it from the current (possibly since-changed) config file.
+    configured_minimum_version: str | None = None
 
 
 class _CodexProcessRunner:
@@ -370,6 +377,24 @@ class CodexResearchProvider:
             )
         adapter_version = classification.adapter_version
 
+        # Milestone 12.1.1 Item 6: Codex is ready only when the installed
+        # version ALSO meets the operator-configured `codex.minimum_version`
+        # floor — `classify_codex_version` above only enforces the narrower,
+        # code-reviewed adapter-contract range (Milestone 12.1 Item 2), which
+        # is deliberately independent of and can be looser than an
+        # operator's own configured minimum. Both checks must pass; neither
+        # widens the other. Fails closed before any inference subprocess.
+        configured_minimum = _version_tuple(self._config.minimum_version)
+        if installed_version < configured_minimum:
+            raise ProviderUnavailableError(
+                "Codex version is below the configured minimum", code="CODEX_VERSION_UNSUPPORTED", retryable=False,
+                metadata={
+                    "cli_version": normalized_version,
+                    "configured_minimum_version": self._config.minimum_version,
+                    "adapter_version": adapter_version,
+                },
+            )
+
         try:
             auth_result = self._run([str(self._config.binary_path), "login", "status"])
         except (ProviderTimeoutError, MalformedOutputError, OSError) as exc:
@@ -385,7 +410,7 @@ class CodexResearchProvider:
         preflight = CodexPreflight(
             ready=True, binary_version=normalized_version, authenticated=True,
             authentication_method=method, failure_code=None, checked_at=checked_at,
-            adapter_version=adapter_version,
+            adapter_version=adapter_version, configured_minimum_version=self._config.minimum_version,
         )
         self._preflight = preflight
         self._preflight_monotonic = time.monotonic()

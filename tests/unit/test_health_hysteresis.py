@@ -228,3 +228,143 @@ def test_policy_rejects_non_positive_threshold():
             warning_after_n_failures=0, pause_recommended_after_n_failures=2, pause_required_after_m_failures=3,
             recovery_streak=1,
         )
+
+
+# --- Milestone 12.1.1 Item 4: scheduler-run identity, not research_cycle_id, is the
+# --- hysteresis evaluation/idempotency key.
+
+
+def test_two_scheduler_runs_for_the_same_research_cycle_each_advance_the_streak(conn):
+    """Required tests #1-2: run A and run B share the same deterministic
+    `research_cycle_id` but are distinct `scheduler_run_id`s — each must
+    independently advance the failure streak, not collide as one replay."""
+    config = _config()
+    decision_a = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(1),
+    )
+    decision_b = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-B", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(2),
+    )
+    assert decision_a.idempotent_replay is False
+    assert decision_b.idempotent_replay is False
+    assert decision_a.consecutive_failures == 1
+    assert decision_b.consecutive_failures == 2
+
+
+def test_replaying_the_same_scheduler_run_does_not_double_count(conn):
+    """Required test #3."""
+    config = _config()
+    hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(1),
+    )
+    replay = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(2),
+    )
+    assert replay.idempotent_replay is True
+    assert replay.consecutive_failures == 1
+
+
+def test_later_successful_scheduler_run_advances_recovery(conn):
+    """Required test #4."""
+    config = _config()
+    hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_REQUIRED, qualified=True, config=config, clock=_clock(1),
+    )
+    recovery = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-B", research_cycle_id="research-cycle-2",
+        cycle_status=STATUS_HEALTHY, qualified=True, config=config, clock=_clock(2),
+    )
+    assert recovery.consecutive_recoveries == 1
+    assert recovery.consecutive_failures == 0
+
+
+def test_manual_and_scheduled_evaluations_cannot_collide(conn):
+    """Required test #5: a manual re-evaluation of the same research cycle
+    (its own distinct scheduler_run_id/evaluation identity) does not collide
+    with the scheduled run's own evaluation."""
+    config = _config()
+    scheduled = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(1),
+    )
+    manual = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="manual-eval-1", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_PAUSE_RECOMMENDED, qualified=True, config=config, clock=_clock(2),
+    )
+    assert scheduled.idempotent_replay is False
+    assert manual.idempotent_replay is False
+    assert manual.consecutive_failures == 2
+
+
+def test_research_cycle_id_persisted_for_reporting_only(conn):
+    from trading_research.storage import shadow_alerts_repositories as repo
+
+    config = _config()
+    hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+        cycle_status=STATUS_HEALTHY, qualified=True, config=config, clock=_clock(1),
+    )
+    row = repo.load_health_hysteresis_evaluation(
+        conn, scope=hh.DEFAULT_SCOPE, cycle_id="sched-run-A",
+        policy_hash=hh.evaluate_and_persist_hysteresis(
+            conn, cycle_id="sched-run-A", research_cycle_id="research-cycle-1",
+            cycle_status=STATUS_HEALTHY, qualified=True, config=config, clock=_clock(1),
+        ).policy_hash,
+    )
+    assert row["cycle_id"] == "sched-run-A"
+    assert row["research_cycle_id"] == "research-cycle-1"
+
+
+def test_migration_preserves_pr19_schema_history(tmp_path):
+    """Required test #6: a database created under the pre-Milestone-12.1.1
+    (PR #19) schema — no `research_cycle_id` column — must migrate additively,
+    keep its historical evaluation rows readable, and accept new evaluations
+    afterward."""
+    import sqlite3
+
+    from trading_research.storage.database import connect as connect_full
+    from trading_research.storage.shadow_alerts_schema import SHADOW_ALERTS_DDL, apply_shadow_alerts_schema
+
+    db_path = tmp_path / "pr19.db"
+    legacy_ddl = SHADOW_ALERTS_DDL.replace(
+        "    research_cycle_id TEXT,\n    UNIQUE(scope, cycle_id, policy_hash)",
+        "    UNIQUE(scope, cycle_id, policy_hash)",
+    )
+    assert "research_cycle_id" not in legacy_ddl
+    legacy_conn = sqlite3.connect(db_path)
+    legacy_conn.executescript(legacy_ddl)
+    legacy_conn.execute(
+        "INSERT INTO shadow_health_hysteresis_evaluations "
+        "(evaluation_id, scope, cycle_id, policy_version, policy_hash, single_cycle_status, "
+        "previous_hysteresis_status, new_hysteresis_status, effective_status, qualified, sample_size, "
+        "minimum_sample_size, aggregate_success_rate, required_categories_json, required_providers_json, "
+        "observed_providers_json, missing_required_providers_json, missing_required_categories_json, "
+        "per_provider_metrics_json, severe_error_categories_json, consecutive_failures_before, "
+        "consecutive_failures_after, consecutive_recoveries_before, consecutive_recoveries_after, "
+        "reasons_json, evaluated_at) VALUES "
+        "('eval-legacy', 'default', 'research-cycle-legacy', 'persistent_health/v1', 'hash-legacy', 'PASS', "
+        "'HEALTHY', 'HEALTHY', 'HEALTHY', 1, 5, 1, 1.0, '[]', '[]', '[]', '[]', '[]', '{}', '[]', 0, 0, 0, 0, "
+        "'[]', '2026-01-01T00:00:00+00:00')",
+    )
+    legacy_conn.commit()
+    legacy_conn.close()
+
+    conn = connect_full(db_path)
+    row = conn.execute(
+        "SELECT cycle_id, research_cycle_id FROM shadow_health_hysteresis_evaluations WHERE evaluation_id = 'eval-legacy'"
+    ).fetchone()
+    assert row["cycle_id"] == "research-cycle-legacy"
+    assert row["research_cycle_id"] is None  # additive column, absent on historical rows
+
+    config = _config()
+    decision = hh.evaluate_and_persist_hysteresis(
+        conn, cycle_id="sched-run-new", research_cycle_id="research-cycle-new",
+        cycle_status=STATUS_HEALTHY, qualified=True, config=config, clock=_clock(1),
+    )
+    assert decision.idempotent_replay is False
+    conn.close()

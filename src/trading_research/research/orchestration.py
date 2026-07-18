@@ -45,6 +45,7 @@ from .failure_taxonomy import (
     ResearchValidationFailure,
     build_retry_feedback,
     new_failure,
+    select_primary_failure,
 )
 from .models import EvidenceSnapshot, ResearchDecision, RoleResearchReport, UsageRecord
 from .output_validation import build_decision, build_role_report, decision_json_schema, role_report_json_schema
@@ -208,15 +209,19 @@ def _attempt_id(research_run_id: str, role: str, attempt_number: int) -> str:
 def _structured_failure_fields(
     failures: "list[ResearchValidationFailure] | tuple[ResearchValidationFailure, ...]",
 ) -> tuple[str | None, str | None, bool | None, Mapping[str, Any]]:
-    """Copies the stable `code`/`stage`/`retryable`/`metadata` of the first
-    failure attributed to this attempt onto `ResearchAttemptRecord` (Milestone
-    12.1 Item 1). The source `ResearchValidationFailure` already sanitized and
-    allowlisted its own metadata in `__post_init__` — this never re-derives or
-    re-validates anything from free text, it only copies already-typed data."""
+    """Copies the stable `code`/`stage`/`retryable`/`metadata` of the
+    deterministically-selected primary failure for this attempt onto
+    `ResearchAttemptRecord` (Milestone 12.1 Item 1, refined by Milestone
+    12.1.1 Item 2: `select_primary_failure` picks by an explicit priority
+    policy over `stage`/`retryable`, never by list order). The source
+    `ResearchValidationFailure` already sanitized and allowlisted its own
+    metadata in `__post_init__` — this never re-derives or re-validates
+    anything from free text, it only copies already-typed data."""
     if not failures:
         return None, None, None, {}
-    first = failures[0]
-    return first.code, first.stage, first.retryable, dict(first.metadata)
+    primary = select_primary_failure(failures)
+    assert primary is not None
+    return primary.code, primary.stage, primary.retryable, dict(primary.metadata)
 
 
 def _failure_from_exc(
@@ -404,6 +409,17 @@ def _run_role_with_retries(
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
+            if rt_retryable is False:
+                # Milestone 12.1.1 Item 1: retry eligibility must be driven by the
+                # structured `retryable` value on the failure itself, not by which
+                # exception class was caught. `_RETRYABLE_ERRORS` groups exception
+                # *types* that are usually retryable (timeouts, rate limits,
+                # malformed output) purely for a single `except` clause, but some
+                # instances of those same types (e.g. CODEX_USAGE_METADATA_MISSING,
+                # CODEX_REASONING_TOKENS_INVALID) are constructed with
+                # `retryable=False` because the failure is a structural provider
+                # contract violation that will recur identically on every attempt.
+                break
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 

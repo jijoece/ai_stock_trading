@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS shadow_health_hysteresis_evaluations (
     consecutive_recoveries_after INTEGER NOT NULL,
     reasons_json TEXT NOT NULL,
     evaluated_at TEXT NOT NULL,
+    research_cycle_id TEXT,
     UNIQUE(scope, cycle_id, policy_hash)
 );
 """
@@ -161,6 +162,8 @@ CREATE INDEX IF NOT EXISTS idx_shadow_health_evaluations_scope_time
     ON shadow_health_hysteresis_evaluations(scope, evaluated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_shadow_health_evaluations_cycle
     ON shadow_health_hysteresis_evaluations(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_health_evaluations_research_cycle
+    ON shadow_health_hysteresis_evaluations(research_cycle_id);
 """
 
 # Milestone 9.1 (docs/milestone9-1-controlled-soak-readiness.md): additive,
@@ -177,6 +180,21 @@ _SHADOW_ALERTS_COLUMN_UPGRADES = {
         "resolved_at": "TEXT",
         "resolved_by": "TEXT",
         "resolved_reason": "TEXT",
+    },
+    # Milestone 12.1.1 Item 4: `shadow_health_hysteresis_evaluations.cycle_id`
+    # (PR #19) held the deterministic `research_cycle_id` — two distinct
+    # scheduler runs for the same deterministic schedule slot produced the
+    # SAME `cycle_id`, so the `UNIQUE(scope, cycle_id, policy_hash)`
+    # idempotency key silently treated the second run's evaluation as a
+    # replay of the first and never advanced its streak. `cycle_id` is now
+    # populated with `scheduler_run_id` (the true per-attempt operational
+    # evaluation identity) going forward; every pre-existing PR #19 row is
+    # left exactly as written (its `cycle_id` value is still a valid,
+    # already-unique identity for that historical row). `research_cycle_id`
+    # is new, additive, and nullable for old rows — it exists purely for
+    # provenance/reporting grouping, never as part of the idempotency key.
+    "shadow_health_hysteresis_evaluations": {
+        "research_cycle_id": "TEXT",
     },
     "shadow_run_summaries": {
         "single_cycle_status": "TEXT",

@@ -156,9 +156,20 @@ def evaluate_and_persist_hysteresis(
     conn, *, scope: str = DEFAULT_SCOPE, cycle_id: str, cycle_status: str, qualified: bool,
     severe_error: bool = False, config: PersistentHealthPolicyConfig, clock: Clock,
     evidence: HysteresisEvaluationEvidence | None = None, immediate_pause: bool = False,
+    research_cycle_id: str | None = None,
 ) -> PersistentHealthDecision:
     """Advance (or replay) the persistent hysteresis state machine by
     exactly one cycle.
+
+    `cycle_id` is the operational evaluation identity — every idempotency
+    check and the `UNIQUE(scope, cycle_id, policy_hash)` persistence
+    constraint key off it alone (Milestone 12.1.1 Item 4: callers must pass
+    `scheduler_run_id` here, never the deterministic `research_cycle_id` —
+    two distinct scheduler runs produced for the same deterministic research
+    cycle must each be able to advance this streak once, not collide into a
+    single replayed evaluation). `research_cycle_id`, if supplied, is stored
+    alongside purely for reporting/provenance grouping and never
+    participates in idempotency or state-machine logic.
 
     `cycle_status` is the per-cycle `shadow/health.py::HealthResult.status`
     for this cycle. `qualified` is `False` when the cycle had insufficient
@@ -300,6 +311,7 @@ def evaluate_and_persist_hysteresis(
         "consecutive_recoveries_before": recoveries_before,
         "consecutive_recoveries_after": consecutive_recoveries,
         "reasons_json": json.dumps(reasons), "evaluated_at": now.isoformat(),
+        "research_cycle_id": research_cycle_id,
     }
     with transaction(conn):
         repo.save_health_hysteresis_state(conn, new_state, commit=False)

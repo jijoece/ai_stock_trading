@@ -189,3 +189,93 @@ def test_orchestration_module_never_imports_shadow():
                 assert alias.name != "sqlite3"
         if isinstance(node, ast.ImportFrom) and node.module:
             assert "shadow" not in node.module
+
+
+def test_non_retryable_malformed_output_produces_exactly_one_provider_call():
+    """Milestone 12.1.1 Item 1: `MalformedOutputError` is usually retryable
+    (`default_retryable = True`), but a scripted instance with
+    `retryable=False` — e.g. the real CODEX_USAGE_METADATA_MISSING /
+    CODEX_REASONING_TOKENS_INVALID contract failures — must stop the retry
+    loop after exactly one attempt instead of continuing to attempt 2."""
+    from trading_research.research.deterministic_provider import ScriptedStep
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(
+            kind="malformed", raw_text="bad", retryable=False, code="CODEX_USAGE_METADATA_MISSING",
+        ),
+    })
+    controller = _RecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(max_attempts_per_role=3), clock=lambda: NOW, run_mode="scripted",
+        attempt_controller=controller,
+    )
+    assert result.status == "ANALYSIS_INCOMPLETE"
+    assert len(provider.calls) == 1
+    fundamental_before = [r for r in controller.before_calls if r.role == "fundamental"]
+    assert len(fundamental_before) == 1
+    failure_codes = {f.code for f in result.failures}
+    assert "CODEX_USAGE_METADATA_MISSING" in failure_codes
+
+
+def test_retryable_timeout_can_retry():
+    from trading_research.research.deterministic_provider import ScriptedStep
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="timeout"),
+        ("fundamental", 2): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
+        ("manager", 1): ScriptedStep(kind="response", payload=MANAGER_PAYLOAD),
+    })
+    controller = _RecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(max_attempts_per_role=3), clock=lambda: NOW, run_mode="scripted",
+        attempt_controller=controller,
+    )
+    assert result.status == "COMPLETED"
+    assert len([c for c in provider.calls if c.role == "fundamental"]) == 2
+
+
+def test_authentication_failure_never_retries():
+    """Milestone 12.1.1 Item 1, required test #5: `ProviderUnavailableError`
+    (authentication/quota-class failures) already stops after exactly one
+    call — regression guard against that behavior silently changing."""
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="unavailable"),
+    })
+    controller = _RecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(max_attempts_per_role=3), clock=lambda: NOW, run_mode="scripted",
+        attempt_controller=controller,
+    )
+    assert result.status == "ANALYSIS_INCOMPLETE"
+    assert len(provider.calls) == 1
+
+
+def test_persisted_failure_retryable_matches_actual_behavior():
+    """Milestone 12.1.1 Item 1, required test #8."""
+    from trading_research.research.deterministic_provider import ScriptedStep
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="malformed", raw_text="bad", retryable=False),
+    })
+    controller = _RecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(max_attempts_per_role=3), clock=lambda: NOW, run_mode="scripted",
+        attempt_controller=controller,
+    )
+    non_retried_attempts = [a for _r, a in controller.after_calls if a.attempt_number == 1]
+    assert len(non_retried_attempts) == 1
+    assert non_retried_attempts[0].failure_retryable is False
+    assert len(provider.calls) == 1

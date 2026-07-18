@@ -28,6 +28,11 @@ Clock = Callable[[], datetime]
 
 DECISION_PROCEED = "PROCEED"
 DECISION_SKIPPED_BUDGET_EXHAUSTED = "SKIPPED_BUDGET_EXHAUSTED"
+# Milestone 12.1.1 Item 1: distinct from SKIPPED_BUDGET_EXHAUSTED — the call
+# is blocked by the persistent pause/kill system state, not by any budget
+# figure, including a pause an earlier attempt in the same role's retry loop
+# just triggered (`shadow/attempt_controller.py::after_attempt`).
+DECISION_SKIPPED_PAUSED_OR_KILLED = "SKIPPED_PAUSED_OR_KILLED"
 
 
 class RoleBudgetError(RuntimeError):
@@ -46,7 +51,9 @@ class RoleBudgetDecision:
     reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.decision not in (DECISION_PROCEED, DECISION_SKIPPED_BUDGET_EXHAUSTED):
+        if self.decision not in (
+            DECISION_PROCEED, DECISION_SKIPPED_BUDGET_EXHAUSTED, DECISION_SKIPPED_PAUSED_OR_KILLED,
+        ):
             raise RoleBudgetError(f"unrecognized role-budget decision {self.decision!r} — fails closed")
 
     @property

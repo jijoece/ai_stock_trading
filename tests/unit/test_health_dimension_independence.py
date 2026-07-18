@@ -155,3 +155,62 @@ def test_history_can_explain_which_dimension_caused_the_pause(conn):
     retry_history = repo.load_latest_health_hysteresis_evaluation(conn, scope=retry_scope)
     assert evidence_history["single_cycle_status"] == health_mod.STATUS_HEALTHY
     assert retry_history["single_cycle_status"] == health_mod.STATUS_PAUSE_REQUIRED
+
+
+def test_pass_warning_fail_are_all_qualified():
+    """Milestone 12.1.1 Item 3, required test #1."""
+    for status in (health_mod.CHECK_STATUS_PASS, health_mod.CHECK_STATUS_WARNING, health_mod.CHECK_STATUS_FAIL):
+        assert health_mod.dimension_is_qualified(_check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, status)) is True
+
+
+def test_insufficient_data_is_unqualified():
+    """Milestone 12.1.1 Item 3, required test #2."""
+    check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_INSUFFICIENT_DATA)
+    assert health_mod.dimension_is_qualified(check) is False
+
+
+def test_not_applicable_is_unqualified():
+    """Milestone 12.1.1 Item 3, required test #3: the bug this closes — a
+    generic `!= INSUFFICIENT_DATA` qualification helper treated
+    `NOT_APPLICABLE` (e.g. a fixture-only/deterministic cycle) as qualified."""
+    check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_NOT_APPLICABLE)
+    assert health_mod.dimension_is_qualified(check) is False
+
+
+def test_repeated_fixture_cycles_do_not_advance_recovery(conn):
+    """Milestone 12.1.1 Item 3, required test #4: a real failure streak
+    followed only by NOT_APPLICABLE fixture cycles must never recover."""
+    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_RETRY_EXHAUSTION}"
+    fail_check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_FAIL)
+    _dimension_result(conn, scope=scope, check=fail_check, cycle_id="cycle-1", clock=_clock(0))
+    _dimension_result(conn, scope=scope, check=fail_check, cycle_id="cycle-2", clock=_clock(1))
+    failing_decision = _dimension_result(conn, scope=scope, check=fail_check, cycle_id="cycle-3", clock=_clock(2))
+    assert failing_decision.decision == hh.STATUS_PAUSE_REQUIRED
+
+    na_check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_NOT_APPLICABLE)
+    for i, offset in enumerate((3, 4, 5)):
+        na_decision = _dimension_result(conn, scope=scope, check=na_check, cycle_id=f"na-{i}", clock=_clock(offset))
+        assert na_decision.decision == hh.STATUS_PAUSE_REQUIRED
+        assert na_decision.consecutive_recoveries == 0
+
+
+def test_fixture_cycles_do_not_advance_failure(conn):
+    """Milestone 12.1.1 Item 3, required test #5."""
+    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_RETRY_EXHAUSTION}"
+    na_check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_NOT_APPLICABLE)
+    decision = None
+    for i, offset in enumerate((0, 1, 2, 3)):
+        decision = _dimension_result(conn, scope=scope, check=na_check, cycle_id=f"na-{i}", clock=_clock(offset))
+    assert decision.decision == hh.STATUS_HEALTHY
+    assert decision.consecutive_failures == 0
+
+
+def test_not_applicable_idempotent_replay_is_unchanged(conn):
+    """Milestone 12.1.1 Item 3, required test #6."""
+    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_RETRY_EXHAUSTION}"
+    na_check = _check(health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE, health_mod.CHECK_STATUS_NOT_APPLICABLE)
+    first = _dimension_result(conn, scope=scope, check=na_check, cycle_id="na-replay", clock=_clock(0))
+    second = _dimension_result(conn, scope=scope, check=na_check, cycle_id="na-replay", clock=_clock(0))
+    assert second.idempotent_replay is True
+    assert second.consecutive_failures == first.consecutive_failures
+    assert second.consecutive_recoveries == first.consecutive_recoveries
