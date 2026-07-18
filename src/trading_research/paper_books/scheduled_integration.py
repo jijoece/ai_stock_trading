@@ -39,7 +39,7 @@ cycle output mapping" for the full field-provenance table.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 import hashlib
 from typing import Any, Callable
@@ -52,13 +52,21 @@ from ..storage.research_cycle_repositories import SQLiteResearchCycleRepository,
 from ..storage.research_repositories import load_evidence_snapshot
 from ..storage import paper_books_repositories as pb_repo
 from ..storage.trading_repositories import load_recommendation
+from ..evidence_providers.economic_calendar import evaluate_economic_event_blackout
+from ..analysis.indicators import OHLCBar, average_true_range
+from ..risk.position_sizing import IncompleteStateError, compute_atr_position_plan
 from . import cash_ledger, execution, order_intent, reconciliation
 from . import risk as risk_module
 from . import valuation
+from . import daily_risk as daily_risk_module
+from . import safety_pause
+from . import lifecycle_state as lifecycle_state_module
 from .config import PaperBooksConfiguration
 from .experiment_assignment import PaperBookExperimentAssignment, save_assignment
 from .models import (
     APPROVED_RISK_DECISIONS,
+    RISK_REJECTED_DAILY_LOSS_LIMIT,
+    RISK_REJECTED_DRAWDOWN_LIMIT,
     VALUATION_POINT_IN_TIME_UNSAFE,
     VALUATION_SOURCE_UNAVAILABLE,
     derive_paper_order_intent_id,
@@ -106,6 +114,21 @@ class ScheduledIntegrationError(RuntimeError):
     entry point itself (disabled config, unknown cycle_id) — never raised
     for a single symbol/arm's own eligibility failure, which is always
     recorded as a bounded `SymbolArmOutcome` instead."""
+
+
+def _atr_for_entry(price_provider: Any, symbol: str, as_of: datetime, period: int):
+    if price_provider is None or not hasattr(price_provider, "get_price_history"):
+        return None, None
+    bars = price_provider.get_price_history(
+        symbol, start=as_of.date() - timedelta(days=period * 4), end=as_of.date(), as_of=as_of,
+    )
+    if not bars or bars[-1].session_date != as_of.date():
+        return None, None
+    atr = average_true_range(tuple(
+        OHLCBar(bar.session_date, bar.high, bar.low, bar.close) for bar in bars
+    ), period=period)
+    source_id = f"{bars[-1].provider}:{symbol}:{bars[-1].session_date.isoformat()}"
+    return atr, source_id
 
 
 @dataclass(frozen=True)
@@ -198,6 +221,7 @@ def _process_arm(
     conn, *, book_id: str, arm: str, cycle_id: str, symbol: str, as_of: datetime, recommendation_id: str | None,
     evidence_snapshot: EvidenceSnapshot | None, evidence_status: dict | None, cfg: PaperBooksConfiguration,
     may_submit: bool, policy_reason: str | None, price_provider: Any, clock: Callable[[], datetime],
+    economic_events=None,
 ) -> SymbolArmOutcome:
     def outcome(code: str, *reasons: str, **extra) -> SymbolArmOutcome:
         return SymbolArmOutcome(
@@ -256,16 +280,81 @@ def _process_arm(
         symbol, as_of, evidence_snapshot=evidence_snapshot, price_provider=price_provider,
         maximum_price_age_seconds=cfg.valuation.maximum_price_age_seconds,
     )
+    entry_atr = None
+    atr_source_id = None
+    requested_quantity = Decimal(str(risk_plan["shares"]))
+    if cfg.lifecycle.atr.enabled:
+        entry_atr, atr_source_id = _atr_for_entry(
+            price_provider, symbol, as_of, cfg.lifecycle.atr.period,
+        )
+        if entry_atr is None or price_selection.price is None or entry_atr <= 0:
+            return outcome(OUTCOME_REJECTED_BY_RISK, "ATR_UNAVAILABLE_OR_STALE")
+        atr_percent = entry_atr / price_selection.price
+        if not (cfg.lifecycle.atr.minimum_atr_percent <= atr_percent <= cfg.lifecycle.atr.maximum_atr_percent):
+            return outcome(
+                OUTCOME_REJECTED_BY_RISK,
+                f"ATR_PERCENT_OUT_OF_BOUNDS:{atr_percent}",
+            )
+        if context.net_liquidation_value_usd is None:
+            return outcome(OUTCOME_REJECTED_BY_RISK, "ATR_RISK_PLAN_REQUIRES_COMPLETE_EQUITY")
+        try:
+            atr_plan = compute_atr_position_plan(
+                account_equity=context.net_liquidation_value_usd,
+                settled_cash=context.available_cash_usd, entry_price=price_selection.price,
+                atr=entry_atr, risk_fraction=Decimal("0.01"),
+                max_position_fraction=cfg.risk.max_position_weight,
+                initial_stop_multiple=cfg.lifecycle.atr.initial_stop_multiple,
+                initial_target_multiple=cfg.lifecycle.atr.initial_target_multiple,
+                minimum_atr_percent=cfg.lifecycle.atr.minimum_atr_percent,
+                maximum_atr_percent=cfg.lifecycle.atr.maximum_atr_percent,
+            )
+            requested_quantity = min(requested_quantity, atr_plan.shares)
+        except IncompleteStateError as exc:
+            return outcome(OUTCOME_REJECTED_BY_RISK, f"ATR_RISK_PLAN_REJECTED:{exc}")
+
+    authoritative_enabled = "max_daily_loss_fraction" in cfg.raw.get("paper_books", {}).get("risk", {})
+    daily_state = None
+    if authoritative_enabled:
+        try:
+            reconciliation.reconcile_book(conn, book_id, as_of)
+            daily_state = daily_risk_module.calculate_and_persist_daily_risk_state(
+                conn, book_id=book_id, market_date=as_of.date(), as_of=as_of,
+                config_hash=cfg.config_hash,
+                require_reconciled=cfg.risk.require_reconciled_risk_state,
+            )
+        except daily_risk_module.DailyRiskStateError:
+            daily_state = None
+    blackout_decision = evaluate_economic_event_blackout(
+        as_of=as_of, events=economic_events,
+        configuration=cfg.lifecycle.economic_event_blackout,
+    )
+    if authoritative_enabled:
+        pb_repo.save_economic_blackout_decision(
+            conn, book_id=book_id, order_evaluation_id=recommendation_id,
+            as_of=as_of, decision=blackout_decision, created_at=clock(),
+        )
 
     decision = risk_module.evaluate_paper_risk(
-        book_status=book.status, experiment_arm=book.experiment_arm, expected_arm=arm, context=context,
-        requested_quantity_hint=Decimal(str(risk_plan["shares"])), reference_price=price_selection.price,
+        book_status="PAUSED" if safety_pause.is_paused(conn, book_id) else book.status,
+        experiment_arm=book.experiment_arm, expected_arm=arm, context=context,
+        requested_quantity_hint=requested_quantity, reference_price=price_selection.price,
         reference_price_age_seconds=price_selection.staleness_seconds,
         reference_price_point_in_time_safe=price_selection.point_in_time_safe, risk_config=cfg.risk,
+        daily_risk_state=daily_state, economic_blackout_decision=blackout_decision,
+        enforce_authoritative_state=authoritative_enabled,
     )
     risk_decision_id = order_intent.persist_risk_decision(
         conn, book_id, cycle_id, recommendation_id, symbol, decision, snap.snapshot_id, clock,
     )
+
+    if daily_state is not None and decision.decision in (
+        RISK_REJECTED_DAILY_LOSS_LIMIT, RISK_REJECTED_DRAWDOWN_LIMIT,
+    ):
+        safety_pause.pause_for_risk_state(
+            conn, book_id=book_id, reason_code=decision.decision,
+            risk_state_id=daily_state.risk_state_id,
+            reason="; ".join(decision.reasons), at=clock(),
+        )
 
     if decision.decision not in APPROVED_RISK_DECISIONS:
         return outcome(OUTCOME_REJECTED_BY_RISK, *decision.reasons, risk_decision_id=risk_decision_id)
@@ -303,6 +392,18 @@ def _process_arm(
 
     submit_result = execution.submit_and_simulate(conn, intent, market_input, clock())
     fill = submit_result.get("fill")
+    if fill and entry_atr is not None and atr_source_id is not None:
+        state = lifecycle_state_module.create_entry_lifecycle_state(
+            book_id=book_id, symbol=symbol, originating_intent_id=intent.paper_order_intent_id,
+            entry_fill_id=fill["fill_id"], opened_at=fill["fill_timestamp"],
+            quantity=fill["fill_quantity"], average_entry_price=fill["fill_price"],
+            entry_atr=entry_atr, atr_period=cfg.lifecycle.atr.period,
+            initial_stop_multiple=cfg.lifecycle.atr.initial_stop_multiple,
+            initial_target_multiple=cfg.lifecycle.atr.initial_target_multiple,
+            policy_version=lifecycle_state_module.LIFECYCLE_POLICY_VERSION,
+            config_hash=cfg.config_hash, source_market_data_id=atr_source_id,
+        )
+        pb_repo.save_position_lifecycle_state(conn, state)
     final_outcome = OUTCOME_EXECUTED if submit_result["status"] == execution.INTENT_STATUS_FILLED else OUTCOME_INTENT_CREATED_PENDING_FILL
     return outcome(
         final_outcome, risk_decision_id=risk_decision_id, paper_order_intent_id=intent.paper_order_intent_id,
@@ -312,7 +413,7 @@ def _process_arm(
 
 def integrate_scheduled_cycle_into_paper_books(
     conn, *, cycle_id: str, experiment_policy: str, paper_books_config: PaperBooksConfiguration,
-    clock: Callable[[], datetime], price_provider: Any = None,
+    clock: Callable[[], datetime], price_provider: Any = None, economic_events=None,
 ) -> PaperBookCycleIntegrationResult:
     """Deterministic entry point closing the Milestone 8.1 integration gap.
 
@@ -401,7 +502,7 @@ def integrate_scheduled_cycle_into_paper_books(
                     conn, book_id=book_id, arm=arm, cycle_id=cycle_id, symbol=symbol, as_of=as_of,
                     recommendation_id=rec_id, evidence_snapshot=evidence_snapshot, evidence_status=evidence_status,
                     cfg=paper_books_config, may_submit=may_submit, policy_reason=policy_reason,
-                    price_provider=price_provider, clock=clock,
+                    price_provider=price_provider, clock=clock, economic_events=economic_events,
                 )
             except Exception as exc:  # per-arm failure isolation — never loses the whole cycle's other arms/symbols
                 symbol_outcome = SymbolArmOutcome(

@@ -88,6 +88,12 @@ paper_books:
     max_open_positions: 20
     max_symbol_concentration_weight: "0.10"
     reject_stale_market_price_seconds: 900
+    max_daily_loss_fraction: "0.03"
+    max_drawdown_fraction: "0.15"
+    daily_loss_action: PAUSE_NEW_ENTRIES
+    drawdown_action: PAUSE_NEW_ENTRIES
+    require_reconciled_risk_state: true
+    maximum_risk_state_age_seconds: 900
 
   valuation:
     price_source: evidence_snapshot        # evidence_snapshot | persisted_market_bar — unknown values fail closed
@@ -111,6 +117,57 @@ paper_books:
       profit_target_percent: "0.15"
       maximum_holding_market_days: 20
       exit_on_recommendation_reversal: true
+
+    # Milestone 13 controls are dormant until lifecycle and the individual
+    # feature gate are both enabled. Python computes every value.
+    atr:
+      enabled: false
+      period: 14
+      initial_stop_multiple: "2.0"
+      initial_target_multiple: "3.0"
+      minimum_atr_percent: "0.005"
+      maximum_atr_percent: "0.20"
+
+    trailing_stop:
+      enabled: false
+      activation_r_multiple: "1.5"
+      atr_multiple: "2.0"
+      never_loosen_stop: true
+
+    breakeven:
+      enabled: false
+      activation_r_multiple: "1.0"
+      offset_bps: "0"
+      never_loosen_stop: true
+
+    partial_profit:
+      enabled: false
+      stages:
+        - stage: 1
+          trigger_r_multiple: "1.5"
+          close_fraction: "0.50"
+        - stage: 2
+          trigger_r_multiple: "2.5"
+          close_fraction: "0.25"
+      minimum_remaining_quantity: "1"
+
+    economic_event_blackout:
+      enabled: false
+      before_minutes: 30
+      after_minutes: 30
+      minimum_importance: HIGH
+      markets:
+        - US
+      blocked_categories:
+        - FOMC
+        - CPI
+        - PPI
+        - NONFARM_PAYROLLS
+        - GDP
+        - RETAIL_SALES
+        - UNEMPLOYMENT
+      unknown_event_state_action: BLOCK_NEW_ENTRIES
+      maximum_data_age_minutes: 1440
 
     soak:
       minimum_completed_cycles: 10

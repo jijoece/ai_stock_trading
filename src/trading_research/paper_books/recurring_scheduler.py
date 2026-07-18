@@ -27,6 +27,7 @@ from ..storage.research_cycle_repositories import SQLiteResearchCycleRepository
 from .config import PaperBooksConfiguration
 from .controlled_soak_readiness import evaluate_controlled_soak_readiness
 from .cross_book_verification import verification_is_stale
+from . import safety_pause
 from .soak_campaign import (
     CAMPAIGN_COMPLETED_READY,
     RECOMMENDATION_READY,
@@ -325,6 +326,9 @@ def validate_activation_review(
     pause_state = pause_mod.current_state(conn)
     if pause_state.is_blocking:
         reasons.append(f"shadow operational state is {pause_state.state}: {pause_state.reason}")
+    for book_id in (paper_books_config.baseline.book_id, paper_books_config.enhanced.book_id):
+        if paper_books_config.is_book_enabled(book_id) and safety_pause.is_paused(conn, book_id):
+            reasons.append(f"paper book {book_id} has an active advanced-risk safety pause")
 
     latest_verification = pb_repo.latest_cross_book_verification_upto(conn, now.isoformat())
     if latest_verification is None:
@@ -721,6 +725,14 @@ def evaluate_pre_run_safety_gates(
     pause_state = pause_mod.current_state(conn)
     add("shadow_kill_state", not pause_state.is_killed, pause_state.reason)
     add("shadow_pause_state", not pause_state.is_blocking, f"{pause_state.state}: {pause_state.reason}")
+    paused_books = [
+        book_id for book_id in (paper_books_config.baseline.book_id, paper_books_config.enhanced.book_id)
+        if paper_books_config.is_book_enabled(book_id) and safety_pause.is_paused(conn, book_id)
+    ]
+    add(
+        "advanced_risk_book_pauses", not paused_books,
+        f"paused books: {paused_books}" if paused_books else "none",
+    )
     unexplained = shadow_readiness._unexplained_pause_required_runs(conn)
     add("unexplained_pause_required", not unexplained, f"unexplained scheduler runs: {unexplained}" if unexplained else "none")
     critical = alerts_repo.list_alerts(conn, severity="CRITICAL", unresolved_only=True)

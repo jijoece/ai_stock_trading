@@ -2,9 +2,10 @@
 docs/milestone-9.md Section 2-3).
 
 Pure functions over already-computed, typed inputs — never touches Claude
-output, never sizes a position, never decides an *entry*. Full-position
-exits only (no partial exits) in this milestone. The same inputs always
-produce the same `PaperExitDecision` (deterministic, persisted, versioned).
+output, never sizes a position, never decides an *entry*. Stop and safety
+exits close the full remainder; an explicitly calculated partial stage may
+carry a smaller whole-share quantity. The same inputs always produce the
+same `PaperExitDecision` (deterministic, persisted, versioned).
 """
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ DECISION_EXIT_PROFIT_TARGET = "EXIT_PROFIT_TARGET"
 DECISION_EXIT_MAX_HOLDING_PERIOD = "EXIT_MAX_HOLDING_PERIOD"
 DECISION_EXIT_RECOMMENDATION_REVERSAL = "EXIT_RECOMMENDATION_REVERSAL"
 DECISION_EXIT_MANUAL_REQUEST = "EXIT_MANUAL_REQUEST"
+DECISION_EXIT_TRAILING_STOP = "EXIT_TRAILING_STOP"
+DECISION_EXIT_BREAKEVEN_STOP = "EXIT_BREAKEVEN_STOP"
+DECISION_EXIT_SAFETY = "EXIT_SAFETY"
+DECISION_EXIT_PARTIAL_PROFIT = "EXIT_PARTIAL_PROFIT"
 DECISION_SKIPPED_MISSING_PRICE = "SKIPPED_MISSING_PRICE"
 DECISION_SKIPPED_STALE_PRICE = "SKIPPED_STALE_PRICE"
 DECISION_SKIPPED_POINT_IN_TIME_UNSAFE = "SKIPPED_POINT_IN_TIME_UNSAFE"
@@ -32,12 +37,16 @@ KNOWN_EXIT_DECISIONS = (
     DECISION_EXIT_MAX_HOLDING_PERIOD, DECISION_EXIT_RECOMMENDATION_REVERSAL,
     DECISION_EXIT_MANUAL_REQUEST, DECISION_SKIPPED_MISSING_PRICE, DECISION_SKIPPED_STALE_PRICE,
     DECISION_SKIPPED_POINT_IN_TIME_UNSAFE, DECISION_SKIPPED_NO_POSITION,
+    DECISION_EXIT_TRAILING_STOP, DECISION_EXIT_BREAKEVEN_STOP,
+    DECISION_EXIT_SAFETY, DECISION_EXIT_PARTIAL_PROFIT,
 )
 
 # A position exits, never a HOLD/SKIPPED outcome.
 EXIT_DECISIONS = (
     DECISION_EXIT_STOP_LOSS, DECISION_EXIT_PROFIT_TARGET, DECISION_EXIT_MAX_HOLDING_PERIOD,
     DECISION_EXIT_RECOMMENDATION_REVERSAL, DECISION_EXIT_MANUAL_REQUEST,
+    DECISION_EXIT_TRAILING_STOP, DECISION_EXIT_BREAKEVEN_STOP,
+    DECISION_EXIT_SAFETY, DECISION_EXIT_PARTIAL_PROFIT,
 )
 
 # Recommendation side/status combination that constitutes a "reversal" for
@@ -64,6 +73,7 @@ class PaperExitDecision:
     reference_price: Decimal | None
     reasons: tuple[str, ...]
     policy_version: str
+    partial_stage_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.decision not in KNOWN_EXIT_DECISIONS:
@@ -112,6 +122,13 @@ def evaluate_exit_decision(
     reversal_recommendation: dict | None = None,
     manual_request: dict | None = None,
     policy_version: str = EXIT_POLICY_VERSION,
+    current_stop_price: Decimal | None = None,
+    initial_target_price: Decimal | None = None,
+    trailing_stop_active: bool = False,
+    breakeven_active: bool = False,
+    safety_full_exit: bool = False,
+    partial_stage_id: int | None = None,
+    partial_close_quantity: Decimal | None = None,
 ) -> PaperExitDecision:
     """Fixed, documented check order — same inputs always produce the same
     decision:
@@ -122,16 +139,18 @@ def evaluate_exit_decision(
     4. price stale -> SKIPPED_STALE_PRICE
     5. an unconsumed manual exit request exists -> EXIT_MANUAL_REQUEST
        (an explicit, audited human instruction outranks the automatic rules)
-    6. stop loss (price <= cost_basis * (1 - stop_loss_percent))
-    7. profit target (price >= cost_basis * (1 + profit_target_percent))
+    6. hard, trailing, or breakeven stop
+    7. safety-mandated full exit
     8. maximum holding period (market days held >= configured maximum)
     9. recommendation reversal (only when enabled and a qualifying newer
        recommendation was supplied by the caller)
-    10. otherwise HOLD
+    10. deterministic partial-profit stage
+    11. final profit target
+    12. otherwise HOLD
 
-    Full-position exits only: `quantity` on any EXIT_* decision is always
-    the entire `position_quantity`. Missing/stale/unsafe prices never reach
-    the trigger rules, so they can never fabricate an exit.
+    Missing/stale/unsafe prices never reach the trigger rules, so they can
+    never fabricate an exit. Partial quantity is supplied by the deterministic
+    lifecycle policy and every other EXIT carries the full remainder.
     """
 
     def hold_or_skip(decision: str, *reasons: str) -> PaperExitDecision:
@@ -141,9 +160,15 @@ def evaluate_exit_decision(
         )
 
     def exit_(decision: str, *reasons: str) -> PaperExitDecision:
+        quantity = (
+            partial_close_quantity
+            if decision == DECISION_EXIT_PARTIAL_PROFIT and partial_close_quantity is not None
+            else position_quantity
+        )
         return PaperExitDecision(
-            decision=decision, book_id=book_id, symbol=symbol, quantity=position_quantity,
+            decision=decision, book_id=book_id, symbol=symbol, quantity=quantity,
             reference_price=reference_price, reasons=tuple(reasons), policy_version=policy_version,
+            partial_stage_id=partial_stage_id if decision == DECISION_EXIT_PARTIAL_PROFIT else None,
         )
 
     if position_quantity is None or position_quantity <= 0:
@@ -162,20 +187,22 @@ def evaluate_exit_decision(
         )
 
     if cost_basis_per_share is not None and cost_basis_per_share > 0:
-        stop_threshold = cost_basis_per_share * (Decimal("1") - stop_loss_percent)
+        fixed_stop = cost_basis_per_share * (Decimal("1") - stop_loss_percent)
+        stop_threshold = max(fixed_stop, current_stop_price or fixed_stop)
         if reference_price <= stop_threshold:
+            stop_decision = (
+                DECISION_EXIT_TRAILING_STOP if trailing_stop_active
+                else DECISION_EXIT_BREAKEVEN_STOP if breakeven_active
+                else DECISION_EXIT_STOP_LOSS
+            )
             return exit_(
-                DECISION_EXIT_STOP_LOSS,
+                stop_decision,
                 f"reference_price {reference_price} <= stop threshold {stop_threshold} "
-                f"(cost_basis {cost_basis_per_share} * (1 - {stop_loss_percent}))",
+                f"(deterministic long stop; fixed baseline {fixed_stop})",
             )
-        profit_threshold = cost_basis_per_share * (Decimal("1") + profit_target_percent)
-        if reference_price >= profit_threshold:
-            return exit_(
-                DECISION_EXIT_PROFIT_TARGET,
-                f"reference_price {reference_price} >= profit threshold {profit_threshold} "
-                f"(cost_basis {cost_basis_per_share} * (1 + {profit_target_percent}))",
-            )
+
+    if safety_full_exit:
+        return exit_(DECISION_EXIT_SAFETY, "deterministic safety policy requires a full risk-reducing exit")
 
     if position_opened_at is not None:
         held = market_days_held(position_opened_at.date(), as_of.date())
@@ -192,6 +219,22 @@ def evaluate_exit_decision(
             f"{reversal_recommendation['ts']} reversed to side={reversal_recommendation['side']!r} "
             f"status={reversal_recommendation['status']!r}",
         )
+
+    if partial_stage_id is not None and partial_close_quantity is not None and partial_close_quantity > 0:
+        return exit_(
+            DECISION_EXIT_PARTIAL_PROFIT,
+            f"partial-profit stage {partial_stage_id} approved {partial_close_quantity} whole shares",
+        )
+
+    if cost_basis_per_share is not None and cost_basis_per_share > 0:
+        profit_threshold = initial_target_price or (
+            cost_basis_per_share * (Decimal("1") + profit_target_percent)
+        )
+        if reference_price >= profit_threshold:
+            return exit_(
+                DECISION_EXIT_PROFIT_TARGET,
+                f"reference_price {reference_price} >= profit threshold {profit_threshold}",
+            )
 
     return hold_or_skip(DECISION_HOLD, "no exit condition met")
 

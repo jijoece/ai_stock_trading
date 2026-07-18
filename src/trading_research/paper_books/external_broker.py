@@ -23,6 +23,7 @@ from ..storage.database import begin_immediate
 from ..storage.transactions import transaction
 from ..storage.shadow_alerts_repositories import list_alerts
 from . import cash_ledger, positions
+from . import lifecycle_state as lifecycle_state_module
 from .config import PaperBooksConfiguration
 from .exit_policy import EXIT_DECISIONS
 from .models import APPROVED_RISK_DECISIONS, BOOK_STATUS_ACTIVE
@@ -1130,6 +1131,31 @@ def apply_external_fills(
                     conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
                     release_event_id="fully-filled", event_type="CONSUMED_BY_FILL", commit=False,
                 )
+                exit_decision = repo.load_exit_decision(conn, intent["risk_decision_id"])
+                if exit_decision is not None and exit_decision.get("partial_stage_id") is not None:
+                    row = repo.latest_position_lifecycle_state(
+                        conn, intent["book_id"], intent["symbol"],
+                    )
+                    if row is not None:
+                        prior_state = lifecycle_state_module.lifecycle_state_from_row(row)
+                        completed_state = lifecycle_state_module.apply_completed_partial_stage(
+                            prior_state, stage_id=int(exit_decision["partial_stage_id"]),
+                            filled_quantity=approved, as_of=now,
+                            source_market_data_id=prior_state.source_market_data_id,
+                        )
+                        repo.save_position_lifecycle_state(conn, completed_state, commit=False)
+                        lifecycle_event_id = "pb-lifecycle-event-" + hashlib.sha256(
+                            f"{prior_state.lifecycle_state_id}:{completed_state.lifecycle_state_id}:external".encode()
+                        ).hexdigest()[:40]
+                        repo.save_lifecycle_state_event(
+                            conn, lifecycle_event_id=lifecycle_event_id,
+                            book_id=intent["book_id"], symbol=intent["symbol"],
+                            previous_state_id=prior_state.lifecycle_state_id,
+                            resulting_state_id=completed_state.lifecycle_state_id,
+                            event_type="EXTERNAL_PARTIAL_STAGE_COMPLETED", complete=True,
+                            reasons=("intended external partial SELL quantity fully accounted for",),
+                            created_at=now, commit=False,
+                        )
     return applied
 
 

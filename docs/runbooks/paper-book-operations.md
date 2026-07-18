@@ -10,6 +10,14 @@ exists.
 This is a **LOCAL-SIMULATED-PAPER** system only — there is no live-trading path, no external
 paper-broker submission by default, and no way to reach one from this configuration file.
 
+Milestone 13 controls also ship dormant. Before enabling them in a paper-only
+evaluation profile, capture a complete start-of-day snapshot, reconcile the
+book, verify fresh point-in-time ATR bars, and run the offline backtest
+fixtures. A daily-loss or drawdown breach creates an append-only advanced-risk
+pause; clear it only through `paper_books.safety_pause.resume` with an explicit
+operator and reason. Risk-reducing SELL exits remain eligible while new BUY
+entries are paused.
+
 ## Enable paper books
 
 1. Open `config/paper_books.yaml`. The shipped defaults:

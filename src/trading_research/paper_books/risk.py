@@ -28,6 +28,12 @@ from .models import (
     RISK_REJECTED_MAX_SYMBOL_CONCENTRATION,
     RISK_REJECTED_MISSING_PRICE,
     RISK_REJECTED_STALE_PRICE,
+    RISK_REJECTED_DAILY_LOSS_LIMIT,
+    RISK_REJECTED_DRAWDOWN_LIMIT,
+    RISK_REJECTED_RISK_STATE_UNAVAILABLE,
+    RISK_REJECTED_RISK_STATE_STALE,
+    RISK_REJECTED_RISK_STATE_UNRECONCILED,
+    RISK_REJECTED_ECONOMIC_EVENT_BLACKOUT,
     VALUATION_COMPLETE,
     VALUATION_PARTIAL_STALE_PRICE,
     BOOK_STATUS_ACTIVE,
@@ -65,6 +71,8 @@ def evaluate_paper_risk(
     requested_quantity_hint: Decimal | None, reference_price: Decimal | None,
     reference_price_age_seconds: int | None, reference_price_point_in_time_safe: bool | None,
     risk_config: RiskSection, policy_version: str = POLICY_VERSION,
+    daily_risk_state=None, economic_blackout_decision=None,
+    enforce_authoritative_state: bool = False,
 ) -> PaperRiskDecision:
     def rejected(decision: str, *reasons: str) -> PaperRiskDecision:
         return PaperRiskDecision(
@@ -79,6 +87,43 @@ def evaluate_paper_risk(
         )
     if book_status != BOOK_STATUS_ACTIVE:
         return rejected(RISK_REJECTED_BOOK_PAUSED, f"book status is {book_status!r}, not ACTIVE")
+    if enforce_authoritative_state:
+        if daily_risk_state is None:
+            return rejected(
+                RISK_REJECTED_RISK_STATE_UNAVAILABLE,
+                "authoritative daily risk state is unavailable",
+            )
+        age_seconds = int((context.as_of - daily_risk_state.as_of).total_seconds())
+        if age_seconds < 0 or age_seconds > risk_config.maximum_risk_state_age_seconds:
+            return rejected(
+                RISK_REJECTED_RISK_STATE_STALE,
+                f"risk state age {age_seconds}s exceeds maximum {risk_config.maximum_risk_state_age_seconds}s",
+            )
+        if daily_risk_state.valuation_status != VALUATION_COMPLETE:
+            return rejected(
+                RISK_REJECTED_RISK_STATE_UNAVAILABLE,
+                f"risk state valuation is {daily_risk_state.valuation_status}, not COMPLETE",
+            )
+        if risk_config.require_reconciled_risk_state and daily_risk_state.reconciliation_status != "MATCHED":
+            return rejected(
+                RISK_REJECTED_RISK_STATE_UNRECONCILED,
+                f"risk state reconciliation is {daily_risk_state.reconciliation_status}, not MATCHED",
+            )
+        if daily_risk_state.daily_loss_fraction <= -risk_config.max_daily_loss_fraction:
+            return rejected(
+                RISK_REJECTED_DAILY_LOSS_LIMIT,
+                f"daily loss {daily_risk_state.daily_loss_fraction} breached {-risk_config.max_daily_loss_fraction}",
+            )
+        if daily_risk_state.current_drawdown_fraction <= -risk_config.max_drawdown_fraction:
+            return rejected(
+                RISK_REJECTED_DRAWDOWN_LIMIT,
+                f"drawdown {daily_risk_state.current_drawdown_fraction} breached {-risk_config.max_drawdown_fraction}",
+            )
+        if economic_blackout_decision is not None and not economic_blackout_decision.allowed:
+            return rejected(
+                RISK_REJECTED_ECONOMIC_EVENT_BLACKOUT,
+                *economic_blackout_decision.reason_codes,
+            )
     if reference_price is None or reference_price <= 0:
         return rejected(RISK_REJECTED_MISSING_PRICE, "reference_price is unavailable")
     if reference_price_point_in_time_safe is False:

@@ -274,6 +274,7 @@ CREATE TABLE IF NOT EXISTS paper_book_exit_decisions (
     reference_price TEXT,
     reasons_json TEXT NOT NULL DEFAULT '[]',
     policy_version TEXT NOT NULL,
+    partial_stage_id INTEGER,
     manual_exit_request_id TEXT,
     created_at TEXT NOT NULL
 );
@@ -744,6 +745,202 @@ CREATE TABLE IF NOT EXISTS paper_order_execution_claims (
     claimed_by TEXT NOT NULL,
     PRIMARY KEY (book_id, paper_order_intent_id)
 );
+
+-- Milestone 13 advanced deterministic risk controls. All financial and
+-- ratio columns are exact Decimal TEXT, never SQLite REAL.
+CREATE TABLE IF NOT EXISTS paper_book_daily_risk_states (
+    risk_state_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    market_date TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    start_of_day_equity TEXT NOT NULL,
+    current_equity TEXT NOT NULL,
+    realized_pnl_today TEXT NOT NULL,
+    unrealized_pnl_today TEXT NOT NULL,
+    total_pnl_today TEXT NOT NULL,
+    net_external_cash_flow TEXT NOT NULL,
+    daily_loss_fraction TEXT NOT NULL,
+    historical_peak_equity TEXT NOT NULL,
+    current_drawdown_fraction TEXT NOT NULL,
+    valuation_status TEXT NOT NULL,
+    source_snapshot_ids_json TEXT NOT NULL,
+    reconciliation_status TEXT NOT NULL,
+    calculation_policy_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (book_id, market_date, as_of, config_hash)
+);
+
+CREATE TABLE IF NOT EXISTS paper_book_position_lifecycle_states (
+    lifecycle_state_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    originating_intent_id TEXT NOT NULL,
+    entry_fill_id TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    original_quantity TEXT NOT NULL,
+    remaining_quantity TEXT NOT NULL,
+    average_entry_price TEXT NOT NULL,
+    entry_atr TEXT NOT NULL,
+    atr_period INTEGER NOT NULL,
+    initial_stop_price TEXT NOT NULL,
+    current_stop_price TEXT NOT NULL,
+    initial_target_price TEXT NOT NULL,
+    highest_eligible_price_since_entry TEXT NOT NULL,
+    trailing_stop_active INTEGER NOT NULL,
+    breakeven_active INTEGER NOT NULL,
+    partial_profit_stage INTEGER NOT NULL,
+    policy_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    last_evaluated_at TEXT NOT NULL,
+    source_market_data_id TEXT NOT NULL,
+    stop_change_reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_book_lifecycle_state_events (
+    lifecycle_event_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    previous_state_id TEXT,
+    resulting_state_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    complete INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_book_partial_exit_stages (
+    partial_stage_event_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    symbol TEXT NOT NULL,
+    stage_id INTEGER NOT NULL,
+    trigger_r_multiple TEXT NOT NULL,
+    evaluated_price TEXT NOT NULL,
+    quantity_before TEXT NOT NULL,
+    quantity_requested TEXT NOT NULL,
+    quantity_approved TEXT NOT NULL,
+    quantity_filled TEXT NOT NULL,
+    quantity_remaining TEXT NOT NULL,
+    resulting_stop_state_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    lifecycle_evaluation_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (book_id, symbol, stage_id, lifecycle_evaluation_id)
+);
+
+CREATE TABLE IF NOT EXISTS economic_calendar_events (
+    event_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    title TEXT NOT NULL,
+    category TEXT NOT NULL,
+    market TEXT NOT NULL,
+    scheduled_at TEXT NOT NULL,
+    originally_published_at TEXT NOT NULL,
+    last_updated_at TEXT NOT NULL,
+    importance TEXT NOT NULL,
+    status TEXT NOT NULL,
+    actual_value TEXT,
+    forecast_value TEXT,
+    previous_value TEXT,
+    source_provider TEXT NOT NULL,
+    source_locator TEXT NOT NULL,
+    retrieved_at TEXT NOT NULL,
+    available_at TEXT NOT NULL,
+    point_in_time_safe INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (event_id, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS economic_blackout_decisions (
+    blackout_decision_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    order_evaluation_id TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    allowed INTEGER NOT NULL,
+    matched_event_ids_json TEXT NOT NULL,
+    blackout_start TEXT,
+    blackout_end TEXT,
+    reason_codes_json TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    configuration_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (book_id, order_evaluation_id, policy_version, configuration_hash)
+);
+
+CREATE TABLE IF NOT EXISTS paper_book_safety_events (
+    safety_event_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    state TEXT NOT NULL CHECK (state IN ('PAUSED', 'RESUMED')),
+    reason_code TEXT NOT NULL,
+    source_risk_state_id TEXT,
+    operator TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    backtest_run_id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    symbols_json TEXT NOT NULL,
+    initial_cash TEXT NOT NULL,
+    ending_equity TEXT NOT NULL,
+    configuration_hash TEXT NOT NULL,
+    code_version TEXT NOT NULL,
+    ambiguity_policy TEXT NOT NULL,
+    status TEXT NOT NULL,
+    report_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS backtest_daily_states (
+    backtest_run_id TEXT NOT NULL REFERENCES backtest_runs(backtest_run_id),
+    market_date TEXT NOT NULL,
+    cash TEXT NOT NULL,
+    equity TEXT NOT NULL,
+    realized_pnl TEXT NOT NULL,
+    unrealized_pnl TEXT NOT NULL,
+    drawdown_fraction TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    PRIMARY KEY (backtest_run_id, market_date)
+);
+
+CREATE TABLE IF NOT EXISTS backtest_orders (
+    backtest_run_id TEXT NOT NULL REFERENCES backtest_runs(backtest_run_id),
+    order_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    limit_price TEXT NOT NULL,
+    eligible_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    rejection_reason TEXT,
+    PRIMARY KEY (backtest_run_id, order_id)
+);
+
+CREATE TABLE IF NOT EXISTS backtest_fills (
+    backtest_run_id TEXT NOT NULL REFERENCES backtest_runs(backtest_run_id),
+    fill_id TEXT NOT NULL,
+    order_id TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    quantity TEXT NOT NULL,
+    fill_price TEXT NOT NULL,
+    fees TEXT NOT NULL,
+    slippage TEXT NOT NULL,
+    market_date TEXT NOT NULL,
+    exit_reason TEXT,
+    PRIMARY KEY (backtest_run_id, fill_id)
+);
+
+CREATE TABLE IF NOT EXISTS backtest_metrics (
+    backtest_run_id TEXT PRIMARY KEY REFERENCES backtest_runs(backtest_run_id),
+    metrics_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 PAPER_BOOKS_INDEXES = """
@@ -814,6 +1011,16 @@ CREATE INDEX IF NOT EXISTS idx_paper_external_reservation_events_symbol
     ON paper_external_position_reservation_events(book_id, symbol, created_at);
 CREATE INDEX IF NOT EXISTS idx_paper_external_order_leases_client_order
     ON paper_external_order_leases(book_id, client_order_id);
+CREATE INDEX IF NOT EXISTS idx_daily_risk_book_asof
+    ON paper_book_daily_risk_states(book_id, as_of);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_state_book_symbol
+    ON paper_book_position_lifecycle_states(book_id, symbol, last_evaluated_at);
+CREATE INDEX IF NOT EXISTS idx_partial_stage_book_symbol
+    ON paper_book_partial_exit_stages(book_id, symbol, stage_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_economic_events_schedule
+    ON economic_calendar_events(market, scheduled_at, available_at);
+CREATE INDEX IF NOT EXISTS idx_safety_events_book
+    ON paper_book_safety_events(book_id, created_at);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -1097,6 +1304,34 @@ BEGIN SELECT RAISE(ABORT, 'paper external position reservation events are append
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_order_leases_no_delete
 BEFORE DELETE ON paper_external_order_leases
 BEGIN SELECT RAISE(ABORT, 'paper external order leases are auditable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_daily_risk_states_no_update
+BEFORE UPDATE ON paper_book_daily_risk_states
+BEGIN SELECT RAISE(ABORT, 'daily risk states are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_daily_risk_states_no_delete
+BEFORE DELETE ON paper_book_daily_risk_states
+BEGIN SELECT RAISE(ABORT, 'daily risk states are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_lifecycle_states_no_update
+BEFORE UPDATE ON paper_book_position_lifecycle_states
+BEGIN SELECT RAISE(ABORT, 'lifecycle states are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_lifecycle_states_no_delete
+BEFORE DELETE ON paper_book_position_lifecycle_states
+BEGIN SELECT RAISE(ABORT, 'lifecycle states are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_lifecycle_state_events_no_update
+BEFORE UPDATE ON paper_book_lifecycle_state_events
+BEGIN SELECT RAISE(ABORT, 'lifecycle state events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_partial_exit_stages_no_delete
+BEFORE DELETE ON paper_book_partial_exit_stages
+BEGIN SELECT RAISE(ABORT, 'partial exit stage evidence is auditable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_economic_events_no_update
+BEFORE UPDATE ON economic_calendar_events
+BEGIN SELECT RAISE(ABORT, 'economic calendar versions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_blackout_decisions_no_update
+BEFORE UPDATE ON economic_blackout_decisions
+BEGIN SELECT RAISE(ABORT, 'blackout decisions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trg_safety_events_no_update
+BEFORE UPDATE ON paper_book_safety_events
+BEGIN SELECT RAISE(ABORT, 'safety events are append-only'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing
@@ -1105,6 +1340,9 @@ BEGIN SELECT RAISE(ABORT, 'paper external order leases are auditable'); END;
 # pre-existing operator-run row predating this milestone simply reads back
 # with both columns NULL, never fabricated.
 _PAPER_BOOKS_COLUMN_UPGRADES = {
+    "paper_book_exit_decisions": {
+        "partial_stage_id": "INTEGER",
+    },
     "paper_soak_operator_runs": {
         "cross_book_verification_id": "TEXT",
         "cross_book_verification_status": "TEXT",

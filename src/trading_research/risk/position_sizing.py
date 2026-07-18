@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from decimal import ROUND_FLOOR, Decimal
+
+from ..analysis.indicators import atr_risk_levels
 
 
 class IncompleteStateError(RuntimeError):
@@ -112,6 +115,51 @@ class PositionPlan:
     @property
     def actionable(self) -> bool:
         return self.shares > 0
+
+
+@dataclass(frozen=True)
+class DecimalAtrPositionPlan:
+    shares: Decimal
+    entry_price: Decimal
+    atr: Decimal
+    stop_price: Decimal
+    target_price: Decimal
+    risk_per_share: Decimal
+    dollars_at_risk: Decimal
+
+
+def compute_atr_position_plan(
+    *, account_equity: Decimal, settled_cash: Decimal, entry_price: Decimal,
+    atr: Decimal, risk_fraction: Decimal, max_position_fraction: Decimal,
+    initial_stop_multiple: Decimal, initial_target_multiple: Decimal,
+    minimum_atr_percent: Decimal, maximum_atr_percent: Decimal,
+) -> DecimalAtrPositionPlan:
+    """Exact whole-share ATR sizing used at the deterministic risk boundary."""
+    if account_equity <= 0 or settled_cash < 0 or entry_price <= 0:
+        raise IncompleteStateError("account, cash, and entry state must be known and valid")
+    if atr <= 0:
+        raise IncompleteStateError("ATR is unavailable or non-positive")
+    atr_percent = atr / entry_price
+    if not minimum_atr_percent <= atr_percent <= maximum_atr_percent:
+        raise IncompleteStateError("ATR percentage is outside configured bounds")
+    stop, target = atr_risk_levels(
+        entry_price=entry_price, atr=atr, stop_multiple=initial_stop_multiple,
+        target_multiple=initial_target_multiple,
+    )
+    risk_per_share = entry_price - stop
+    risk_cap = (account_equity * risk_fraction / risk_per_share).to_integral_value(rounding=ROUND_FLOOR)
+    position_cap = (
+        account_equity * max_position_fraction / entry_price
+    ).to_integral_value(rounding=ROUND_FLOOR)
+    cash_cap = (settled_cash / entry_price).to_integral_value(rounding=ROUND_FLOOR)
+    shares = min(risk_cap, position_cap, cash_cap)
+    if shares <= 0:
+        raise IncompleteStateError("ATR risk sizing rounds to zero whole shares")
+    return DecimalAtrPositionPlan(
+        shares=shares, entry_price=entry_price, atr=atr, stop_price=stop,
+        target_price=target, risk_per_share=risk_per_share,
+        dollars_at_risk=shares * risk_per_share,
+    )
 
 
 def _require(value: float | None, name: str) -> float:

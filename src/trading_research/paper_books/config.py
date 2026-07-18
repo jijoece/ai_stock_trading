@@ -25,6 +25,10 @@ import yaml
 
 from ..config import REPO_ROOT
 from ..hashing import hash_config
+from ..evidence_providers.economic_calendar import (
+    EconomicEventBlackoutConfiguration,
+    KNOWN_IMPORTANCE,
+)
 
 DEFAULT_PAPER_BOOKS_CONFIG_PATH = REPO_ROOT / "config" / "paper_books.yaml"
 
@@ -38,6 +42,7 @@ KNOWN_EXTERNAL_ORDER_TYPES = ("limit",)
 KNOWN_EXTERNAL_TIME_IN_FORCE = ("day",)
 KNOWN_PRICE_SOURCES = ("evidence_snapshot", "persisted_market_bar")
 KNOWN_MISSING_PRICE_POLICIES = ("MARK_UNVALUED",)
+KNOWN_RISK_ACTIONS = ("PAUSE_NEW_ENTRIES",)
 
 
 class PaperBooksConfigError(RuntimeError):
@@ -206,6 +211,12 @@ class RiskSection:
     max_open_positions: int
     max_symbol_concentration_weight: Decimal
     reject_stale_market_price_seconds: int
+    max_daily_loss_fraction: Decimal = Decimal("0.03")
+    max_drawdown_fraction: Decimal = Decimal("0.15")
+    daily_loss_action: str = "PAUSE_NEW_ENTRIES"
+    drawdown_action: str = "PAUSE_NEW_ENTRIES"
+    require_reconciled_risk_state: bool = True
+    maximum_risk_state_age_seconds: int = 900
 
     def __post_init__(self) -> None:
         for field_name in ("max_position_weight", "minimum_cash_buffer_weight", "max_symbol_concentration_weight"):
@@ -219,6 +230,16 @@ class RiskSection:
             raise PaperBooksConfigError("risk.max_open_positions must be > 0")
         if self.reject_stale_market_price_seconds <= 0:
             raise PaperBooksConfigError("risk.reject_stale_market_price_seconds must be > 0")
+        for field_name in ("max_daily_loss_fraction", "max_drawdown_fraction"):
+            value = getattr(self, field_name)
+            if not (Decimal("0") < value < Decimal("1")):
+                raise PaperBooksConfigError(f"risk.{field_name} must be in (0,1) — got {value}")
+        for field_name in ("daily_loss_action", "drawdown_action"):
+            value = getattr(self, field_name)
+            if value not in KNOWN_RISK_ACTIONS:
+                raise PaperBooksConfigError(f"risk.{field_name} must be one of {KNOWN_RISK_ACTIONS}")
+        if self.maximum_risk_state_age_seconds <= 0:
+            raise PaperBooksConfigError("risk.maximum_risk_state_age_seconds must be > 0")
 
 
 @dataclass(frozen=True)
@@ -285,6 +306,86 @@ class ExitsSection:
 
 
 @dataclass(frozen=True)
+class AtrSection:
+    enabled: bool = False
+    period: int = 14
+    initial_stop_multiple: Decimal = Decimal("2.0")
+    initial_target_multiple: Decimal = Decimal("3.0")
+    minimum_atr_percent: Decimal = Decimal("0.005")
+    maximum_atr_percent: Decimal = Decimal("0.20")
+
+    def __post_init__(self) -> None:
+        if self.period <= 0:
+            raise PaperBooksConfigError("lifecycle.atr.period must be > 0")
+        if self.initial_stop_multiple <= 0 or self.initial_target_multiple <= 0:
+            raise PaperBooksConfigError("lifecycle.atr multiples must be > 0")
+        if not (Decimal("0") < self.minimum_atr_percent <= self.maximum_atr_percent < Decimal("1")):
+            raise PaperBooksConfigError("lifecycle.atr percentage bounds are invalid")
+
+
+@dataclass(frozen=True)
+class TrailingStopSection:
+    enabled: bool = False
+    activation_r_multiple: Decimal = Decimal("1.5")
+    atr_multiple: Decimal = Decimal("2.0")
+    never_loosen_stop: bool = True
+
+    def __post_init__(self) -> None:
+        if self.activation_r_multiple <= 0 or self.atr_multiple <= 0:
+            raise PaperBooksConfigError("lifecycle.trailing_stop multiples must be > 0")
+        if not self.never_loosen_stop:
+            raise PaperBooksConfigError("lifecycle.trailing_stop.never_loosen_stop must be true")
+
+
+@dataclass(frozen=True)
+class BreakevenSection:
+    enabled: bool = False
+    activation_r_multiple: Decimal = Decimal("1.0")
+    offset_bps: Decimal = Decimal("0")
+    never_loosen_stop: bool = True
+
+    def __post_init__(self) -> None:
+        if self.activation_r_multiple <= 0 or self.offset_bps < 0:
+            raise PaperBooksConfigError("lifecycle.breakeven thresholds are invalid")
+        if not self.never_loosen_stop:
+            raise PaperBooksConfigError("lifecycle.breakeven.never_loosen_stop must be true")
+
+
+@dataclass(frozen=True)
+class PartialProfitStage:
+    stage: int
+    trigger_r_multiple: Decimal
+    close_fraction: Decimal
+
+    def __post_init__(self) -> None:
+        if self.stage <= 0 or self.trigger_r_multiple <= 0:
+            raise PaperBooksConfigError("partial-profit stage and trigger must be positive")
+        if not (Decimal("0") < self.close_fraction <= Decimal("1")):
+            raise PaperBooksConfigError("partial-profit close_fraction must be in (0,1]")
+
+
+@dataclass(frozen=True)
+class PartialProfitSection:
+    enabled: bool = False
+    stages: tuple[PartialProfitStage, ...] = ()
+    minimum_remaining_quantity: Decimal = Decimal("1")
+
+    def __post_init__(self) -> None:
+        if self.minimum_remaining_quantity < 0 or self.minimum_remaining_quantity != self.minimum_remaining_quantity.to_integral_value():
+            raise PaperBooksConfigError("partial_profit.minimum_remaining_quantity must be whole shares")
+        ids = [item.stage for item in self.stages]
+        triggers = [item.trigger_r_multiple for item in self.stages]
+        if len(ids) != len(set(ids)):
+            raise PaperBooksConfigError("partial-profit stage IDs must be unique")
+        if triggers != sorted(triggers) or len(triggers) != len(set(triggers)):
+            raise PaperBooksConfigError("partial-profit triggers must be strictly increasing")
+        if sum((item.close_fraction for item in self.stages), Decimal("0")) > Decimal("1"):
+            raise PaperBooksConfigError("cumulative partial-profit close fractions cannot exceed one")
+        if self.enabled and not self.stages:
+            raise PaperBooksConfigError("enabled partial-profit policy requires at least one stage")
+
+
+@dataclass(frozen=True)
 class SoakSection:
     minimum_completed_cycles: int
     minimum_market_days: int
@@ -310,6 +411,16 @@ class LifecycleSection:
     pending_orders: PendingOrdersSection
     exits: ExitsSection
     soak: SoakSection
+    atr: AtrSection = AtrSection()
+    trailing_stop: TrailingStopSection = TrailingStopSection()
+    breakeven: BreakevenSection = BreakevenSection()
+    partial_profit: PartialProfitSection = PartialProfitSection()
+    economic_event_blackout: EconomicEventBlackoutConfiguration = EconomicEventBlackoutConfiguration(
+        enabled=False, before_minutes=30, after_minutes=30, minimum_importance="HIGH",
+        markets=("US",), blocked_categories=(
+            "FOMC", "CPI", "PPI", "NONFARM_PAYROLLS", "GDP", "RETAIL_SALES", "UNEMPLOYMENT",
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -489,7 +600,9 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         {
             "max_position_weight", "max_order_notional_usd", "max_daily_new_notional_usd",
             "minimum_cash_buffer_weight", "max_open_positions", "max_symbol_concentration_weight",
-            "reject_stale_market_price_seconds",
+            "reject_stale_market_price_seconds", "max_daily_loss_fraction", "max_drawdown_fraction",
+            "daily_loss_action", "drawdown_action", "require_reconciled_risk_state",
+            "maximum_risk_state_age_seconds",
         },
         "risk",
     )
@@ -530,6 +643,21 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
                 risk["max_symbol_concentration_weight"], "risk.max_symbol_concentration_weight"
             ),
             reject_stale_market_price_seconds=int(risk["reject_stale_market_price_seconds"]),
+            max_daily_loss_fraction=_decimal(
+                risk.get("max_daily_loss_fraction", "0.03"), "risk.max_daily_loss_fraction"
+            ),
+            max_drawdown_fraction=_decimal(
+                risk.get("max_drawdown_fraction", "0.15"), "risk.max_drawdown_fraction"
+            ),
+            daily_loss_action=str(risk.get("daily_loss_action", "PAUSE_NEW_ENTRIES")),
+            drawdown_action=str(risk.get("drawdown_action", "PAUSE_NEW_ENTRIES")),
+            require_reconciled_risk_state=_strict_bool(
+                risk.get("require_reconciled_risk_state", True), "risk.require_reconciled_risk_state"
+            ),
+            maximum_risk_state_age_seconds=_strict_int(
+                risk.get("maximum_risk_state_age_seconds", risk["reject_stale_market_price_seconds"]),
+                "risk.maximum_risk_state_age_seconds", minimum=1,
+            ),
         )
         valuation_section = ValuationSection(
             price_source=str(valuation["price_source"]),
@@ -548,7 +676,12 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
         lifecycle_raw = pb.get("lifecycle", {})
         if not isinstance(lifecycle_raw, dict):
             raise PaperBooksConfigError("paper_books.lifecycle must be a mapping")
-        _require_no_unknown_keys(lifecycle_raw, {"enabled", "pending_orders", "exits", "soak"}, "lifecycle")
+        _require_no_unknown_keys(
+            lifecycle_raw,
+            {"enabled", "pending_orders", "exits", "soak", "atr", "trailing_stop", "breakeven",
+             "partial_profit", "economic_event_blackout"},
+            "lifecycle",
+        )
 
         pending_orders_raw = lifecycle_raw.get("pending_orders", {})
         if not isinstance(pending_orders_raw, dict):
@@ -591,9 +724,144 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             minimum_market_days=int(soak_raw.get("minimum_market_days", 5)),
         )
 
+        atr_raw = lifecycle_raw.get("atr", {})
+        if not isinstance(atr_raw, dict):
+            raise PaperBooksConfigError("lifecycle.atr must be a mapping")
+        _require_no_unknown_keys(
+            atr_raw,
+            {"enabled", "period", "initial_stop_multiple", "initial_target_multiple",
+             "minimum_atr_percent", "maximum_atr_percent"},
+            "lifecycle.atr",
+        )
+        atr_section = AtrSection(
+            enabled=_strict_bool(atr_raw.get("enabled", False), "lifecycle.atr.enabled"),
+            period=_strict_int(atr_raw.get("period", 14), "lifecycle.atr.period", minimum=1),
+            initial_stop_multiple=_decimal(
+                atr_raw.get("initial_stop_multiple", "2.0"), "lifecycle.atr.initial_stop_multiple"
+            ),
+            initial_target_multiple=_decimal(
+                atr_raw.get("initial_target_multiple", "3.0"), "lifecycle.atr.initial_target_multiple"
+            ),
+            minimum_atr_percent=_decimal(
+                atr_raw.get("minimum_atr_percent", "0.005"), "lifecycle.atr.minimum_atr_percent"
+            ),
+            maximum_atr_percent=_decimal(
+                atr_raw.get("maximum_atr_percent", "0.20"), "lifecycle.atr.maximum_atr_percent"
+            ),
+        )
+
+        trailing_raw = lifecycle_raw.get("trailing_stop", {})
+        if not isinstance(trailing_raw, dict):
+            raise PaperBooksConfigError("lifecycle.trailing_stop must be a mapping")
+        _require_no_unknown_keys(
+            trailing_raw, {"enabled", "activation_r_multiple", "atr_multiple", "never_loosen_stop"},
+            "lifecycle.trailing_stop",
+        )
+        trailing_section = TrailingStopSection(
+            enabled=_strict_bool(trailing_raw.get("enabled", False), "lifecycle.trailing_stop.enabled"),
+            activation_r_multiple=_decimal(
+                trailing_raw.get("activation_r_multiple", "1.5"), "lifecycle.trailing_stop.activation_r_multiple"
+            ),
+            atr_multiple=_decimal(trailing_raw.get("atr_multiple", "2.0"), "lifecycle.trailing_stop.atr_multiple"),
+            never_loosen_stop=_strict_bool(
+                trailing_raw.get("never_loosen_stop", True), "lifecycle.trailing_stop.never_loosen_stop"
+            ),
+        )
+
+        breakeven_raw = lifecycle_raw.get("breakeven", {})
+        if not isinstance(breakeven_raw, dict):
+            raise PaperBooksConfigError("lifecycle.breakeven must be a mapping")
+        _require_no_unknown_keys(
+            breakeven_raw, {"enabled", "activation_r_multiple", "offset_bps", "never_loosen_stop"},
+            "lifecycle.breakeven",
+        )
+        breakeven_section = BreakevenSection(
+            enabled=_strict_bool(breakeven_raw.get("enabled", False), "lifecycle.breakeven.enabled"),
+            activation_r_multiple=_decimal(
+                breakeven_raw.get("activation_r_multiple", "1.0"), "lifecycle.breakeven.activation_r_multiple"
+            ),
+            offset_bps=_decimal(breakeven_raw.get("offset_bps", "0"), "lifecycle.breakeven.offset_bps"),
+            never_loosen_stop=_strict_bool(
+                breakeven_raw.get("never_loosen_stop", True), "lifecycle.breakeven.never_loosen_stop"
+            ),
+        )
+
+        partial_raw = lifecycle_raw.get("partial_profit", {})
+        if not isinstance(partial_raw, dict):
+            raise PaperBooksConfigError("lifecycle.partial_profit must be a mapping")
+        _require_no_unknown_keys(
+            partial_raw, {"enabled", "stages", "minimum_remaining_quantity"}, "lifecycle.partial_profit"
+        )
+        raw_stages = partial_raw.get("stages", [])
+        if not isinstance(raw_stages, list):
+            raise PaperBooksConfigError("lifecycle.partial_profit.stages must be a list")
+        stages: list[PartialProfitStage] = []
+        for index, stage_raw in enumerate(raw_stages):
+            if not isinstance(stage_raw, dict):
+                raise PaperBooksConfigError("each partial-profit stage must be a mapping")
+            _require_no_unknown_keys(
+                stage_raw, {"stage", "trigger_r_multiple", "close_fraction"},
+                f"lifecycle.partial_profit.stages[{index}]",
+            )
+            stages.append(PartialProfitStage(
+                stage=_strict_int(stage_raw.get("stage"), f"partial_profit.stages[{index}].stage", minimum=1),
+                trigger_r_multiple=_decimal(
+                    stage_raw.get("trigger_r_multiple"), f"partial_profit.stages[{index}].trigger_r_multiple"
+                ),
+                close_fraction=_decimal(
+                    stage_raw.get("close_fraction"), f"partial_profit.stages[{index}].close_fraction"
+                ),
+            ))
+        partial_section = PartialProfitSection(
+            enabled=_strict_bool(partial_raw.get("enabled", False), "lifecycle.partial_profit.enabled"),
+            stages=tuple(stages),
+            minimum_remaining_quantity=_decimal(
+                partial_raw.get("minimum_remaining_quantity", "1"),
+                "lifecycle.partial_profit.minimum_remaining_quantity",
+            ),
+        )
+
+        blackout_raw = lifecycle_raw.get("economic_event_blackout", {})
+        if not isinstance(blackout_raw, dict):
+            raise PaperBooksConfigError("lifecycle.economic_event_blackout must be a mapping")
+        _require_no_unknown_keys(
+            blackout_raw,
+            {"enabled", "before_minutes", "after_minutes", "minimum_importance", "markets",
+             "blocked_categories", "unknown_event_state_action", "maximum_data_age_minutes"},
+            "lifecycle.economic_event_blackout",
+        )
+        markets = blackout_raw.get("markets", ["US"])
+        categories = blackout_raw.get("blocked_categories", [
+            "FOMC", "CPI", "PPI", "NONFARM_PAYROLLS", "GDP", "RETAIL_SALES", "UNEMPLOYMENT",
+        ])
+        if not isinstance(markets, list) or not all(isinstance(item, str) for item in markets):
+            raise PaperBooksConfigError("economic_event_blackout.markets must be a list of strings")
+        if not isinstance(categories, list) or not all(isinstance(item, str) for item in categories):
+            raise PaperBooksConfigError("economic_event_blackout.blocked_categories must be a list of strings")
+        blackout_section = EconomicEventBlackoutConfiguration(
+            enabled=_strict_bool(blackout_raw.get("enabled", False), "economic_event_blackout.enabled"),
+            before_minutes=_strict_int(
+                blackout_raw.get("before_minutes", 30), "economic_event_blackout.before_minutes", minimum=0
+            ),
+            after_minutes=_strict_int(
+                blackout_raw.get("after_minutes", 30), "economic_event_blackout.after_minutes", minimum=0
+            ),
+            minimum_importance=str(blackout_raw.get("minimum_importance", "HIGH")),
+            markets=tuple(markets), blocked_categories=tuple(categories),
+            unknown_event_state_action=str(
+                blackout_raw.get("unknown_event_state_action", "BLOCK_NEW_ENTRIES")
+            ),
+            maximum_data_age_minutes=_strict_int(
+                blackout_raw.get("maximum_data_age_minutes", 1440),
+                "economic_event_blackout.maximum_data_age_minutes", minimum=1,
+            ),
+        )
+
         lifecycle_section = LifecycleSection(
             enabled=_strict_bool(lifecycle_raw.get("enabled", False), "lifecycle.enabled"),
             pending_orders=pending_orders_section, exits=exits_section, soak=soak_section,
+            atr=atr_section, trailing_stop=trailing_section, breakeven=breakeven_section,
+            partial_profit=partial_section, economic_event_blackout=blackout_section,
         )
 
         campaign_raw = pb.get("soak_campaign", {})
