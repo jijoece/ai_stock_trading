@@ -8,6 +8,9 @@ A personal AI-assisted stock research and paper-trading desk that combines a **d
 
 The ruling principle: **Python computes; Claude explains; you decide and approve.**
 
+For the canonical map of current, operational, architectural, and historical
+documentation, see [`docs/INDEX.md`](docs/INDEX.md).
+
 ---
 
 ## Table of Contents

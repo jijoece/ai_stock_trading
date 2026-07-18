@@ -3,18 +3,11 @@ name: run-agentic-trading-desk
 description: Build, run, and smoke-test agentic-trading-desk's deterministic scoring scripts (indicators.py, score.py, macro_pillar.py). Use when asked to run agentic-trading-desk, verify a change to the scoring/indicator logic, score a ticker, compute the macro pillar, or check the CLI/JSON output of these scripts.
 ---
 
-There is no server or GUI here — `agentic-trading-desk` is three stdlib-only
-Python CLI scripts (`agentic-trading-desk/scripts/indicators.py`,
-`scripts/score.py`, `scripts/macro_pillar.py`) that the trading-desk agent
-shells out to with a JSON file and reads back a table or `--json` blob.
-Drive it with `.claude/skills/run-agentic-trading-desk/driver.py`, which
-exercises all three scripts via subprocess (CLI surface) and via direct
-import (`score_symbol`, `compute`, `score_macro` — the surface most PRs
-actually touch).
-
-All paths below are relative to the workspace root (this skill lives at
-`.claude/skills/run-agentic-trading-desk/`; the app itself lives in the
-sibling `agentic-trading-desk/` directory).
+The repository includes three stdlib-only deterministic scoring scripts:
+`scripts/indicators.py`, `scripts/score.py`, and `scripts/macro_pillar.py`.
+Use `.claude/skills/run-agentic-trading-desk/driver.py` to exercise their CLI
+and direct-import surfaces. All paths below are relative to the repository
+root.
 
 ## Prerequisites
 
@@ -32,13 +25,13 @@ python3 .claude/skills/run-agentic-trading-desk/driver.py
 
 This generates synthetic ticker/macro data on the fly (no fixture files to
 keep in sync), then:
-- runs `agentic-trading-desk/scripts/indicators.py` with no args
+- runs `scripts/indicators.py` with no args
   (self-test), with a 291-bar file, and with an 8-bar file (checks the
   short-series warning + null EMA200 path)
-- runs `agentic-trading-desk/scripts/macro_pillar.py` with no args
+- runs `scripts/macro_pillar.py` with no args
   (self-test) and with a synthetic 8-ETF series file in both table and
   `--json` mode
-- runs `agentic-trading-desk/scripts/score.py` with no args (self-test),
+- runs `scripts/score.py` with no args (self-test),
   with a synthetic ticker in `--json` mode, and with a missing file
   (checks nonzero exit)
 - imports `score_symbol`, `compute`, and `score_macro` directly and calls
@@ -53,7 +46,7 @@ If a change only touches scoring/indicator logic, importing is faster than
 shelling out and is the same path the driver uses:
 
 ```bash
-cd agentic-trading-desk && python3 -c "
+python3 -c "
 import sys; sys.path.insert(0, 'scripts')
 from score import score_symbol
 card = score_symbol([100.0 + i*0.3 for i in range(300)], macro_score=1, holding=True)
@@ -64,18 +57,16 @@ print(card['decision']['action'], card['pillar_total'])
 ## Run (human path — individual scripts)
 
 Each script also has a synthetic self-test with no args, useful for a quick
-sanity check (run from `agentic-trading-desk/`):
+sanity check from the repository root:
 
 ```bash
-cd agentic-trading-desk
 python3 scripts/indicators.py      # synthetic 290-bar indicator dump (JSON)
 python3 scripts/macro_pillar.py    # synthetic macro regime read
 python3 scripts/score.py           # synthetic three-pillar scorecard + decision
 ```
 
-Against real data, each takes a JSON file (see `agentic-trading-desk/README.md`
-for the exact schemas) and an optional `--json` flag for machine-readable
-output:
+Against real data, each takes a JSON file (see `README.md` for the exact
+schemas) and an optional `--json` flag for machine-readable output:
 
 ```bash
 python3 scripts/indicators.py ticker.json
