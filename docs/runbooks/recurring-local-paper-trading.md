@@ -6,7 +6,7 @@ Milestone 10 runs only the repository's local simulated BASELINE and ENHANCED pa
 
 Recurring execution has independent controls. `paper_books.enabled`, `paper_books.lifecycle.enabled`, and `paper_books.recurring.enabled` must be true; execution must remain `local_simulated`; and activation must be `ACTIVE`. Configuration never creates an activation event.
 
-The referenced immutable Milestone 9.3 review must belong to a completed-ready campaign, recommend `READY_FOR_RECURRING_ACTIVATION_REVIEW`, contain no final failed checks, contain a successful fresh cross-book verification, meet the configured successful-real-provider floor, remain within the configured market-day age, and have no newer blocking critical alert, reconciliation, or cross-book evidence.
+The referenced immutable Milestone 9.3 review must reference a *campaign attempt* whose status is `COMPLETED_READY_FOR_REVIEW` (the campaign definition itself stays `DEFINED` forever, per Milestone 9.3.1's immutable-definition/resumable-attempt split — validation checks the attempt, never the definition row), belong to that same campaign, have matching manifest/config hashes, be the latest non-superseded review for its campaign, recommend `READY_FOR_RECURRING_ACTIVATION_REVIEW`, contain no final failed checks, contain a successful fresh cross-book verification, meet the configured successful-real-provider floor, remain within the configured market-day age, and have no newer blocking critical alert, reconciliation, or cross-book evidence. (Milestone 11.1 fixed a bug where this validation checked the immutable campaign-definition row instead of the attempt, which made real activation impossible — see the closure doc §1.)
 
 ## Two-step activation
 

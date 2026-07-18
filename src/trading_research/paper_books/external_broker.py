@@ -7,6 +7,7 @@ runtime client; credentials and Alpaca/LumiBot imports remain in the child
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -26,6 +27,12 @@ from .models import APPROVED_RISK_DECISIONS, BOOK_STATUS_ACTIVE
 
 POLICY_VERSION = "external-alpaca-paper-v1"
 
+# Part 10: bounded allowance for clock skew between this process and the
+# isolated runtime/broker when judging whether a supplied timestamp is
+# "in the future". Documented and small — never used to silently accept a
+# materially future timestamp.
+_CLOCK_SKEW = timedelta(seconds=5)
+
 STATE_NOT_SUBMITTED = "NOT_SUBMITTED"
 STATE_PREVIEWED = "PREVIEWED"
 STATE_SUBMISSION_REQUESTED = "SUBMISSION_REQUESTED"
@@ -44,6 +51,9 @@ CRITICAL_RECONCILIATION_STATUSES = frozenset({
     "BROKER_ORDER_DUPLICATE", "BOOK_NAMESPACE_MISMATCH", "ACCOUNT_FINGERPRINT_MISMATCH",
     "SYMBOL_MISMATCH", "SIDE_MISMATCH", "QUANTITY_MISMATCH", "FILL_QUANTITY_MISMATCH",
     "PRICE_MISMATCH", "CASH_MISMATCH", "POSITION_MISMATCH", "UNKNOWN",
+    "FILL_APPLICATION_FAILED", "MALFORMED_BROKER_ORDER", "MALFORMED_BROKER_FILL",
+    "BROKER_STATE_UNKNOWN", "RECONCILIATION_INTERNAL_ERROR", "RESERVATION_MISMATCH",
+    "SHARE_RESERVATION_MISMATCH", "FROZEN_INTENT_MISMATCH", "EXTERNAL_NOTIONAL_LIMIT",
 })
 
 _TRANSITIONS = {
@@ -80,6 +90,7 @@ class ExternalPaperRuntime(Protocol):
     def list_order_fills(self, book_id: str, client_order_id: str) -> list[dict]: ...
     def get_external_positions(self, book_id: str) -> dict: ...
     def get_external_account_snapshot(self, book_id: str) -> dict: ...
+    def list_recent_external_orders(self, book_id: str, *, limit: int = 50) -> list[dict]: ...
 
 
 class ExternalPaperError(RuntimeError):
@@ -106,6 +117,55 @@ def _bounded(value: str, name: str, maximum: int = 256) -> str:
 def _digest(prefix: str, payload: object, length: int = 32) -> str:
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return f"{prefix}{hashlib.sha256(encoded).hexdigest()[:length]}"
+
+
+def _exact_int(value: object, name: str) -> int:
+    """Part 13: never truncate a safety-sensitive quantity via
+    `int(Decimal(...))`/`int(float(...))` — require an exact, finite whole
+    number or fail closed."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError) as exc:
+        raise ExternalPaperError("QUANTITY_NOT_WHOLE", f"{name} is not a valid number: {value!r}") from exc
+    if not parsed.is_finite():
+        raise ExternalPaperError("QUANTITY_NOT_WHOLE", f"{name} must be finite, got {value!r}")
+    if parsed != parsed.to_integral_value():
+        raise ExternalPaperError("QUANTITY_NOT_WHOLE", f"{name} must be a whole number, got {value!r}")
+    return int(parsed)
+
+
+def _validate_frozen_notional(intent: dict, cfg: PaperBooksConfiguration, risk: dict | None) -> None:
+    """Part 14: never trust the persisted `notional_usd` alone — recompute
+    `quantity * limit_price` from the frozen intent and require it to match
+    exactly, match the approved risk decision's notional (when the BUY path
+    approved via a risk decision), and pass the strictest configured cap
+    applied to the *recomputed* value. A stored row with a tampered/stale
+    low `notional_usd` next to a high quantity/limit_price fails closed here
+    rather than only being checked against its own (possibly wrong) field.
+    """
+    try:
+        quantity = Decimal(intent["quantity"])
+        limit_price = Decimal(intent["limit_price"])
+        notional_usd = Decimal(intent["notional_usd"])
+    except (InvalidOperation, TypeError) as exc:
+        raise ExternalPaperError("FROZEN_INTENT_MISMATCH", "intent notional fields are not valid decimals") from exc
+    if not (quantity.is_finite() and limit_price.is_finite() and notional_usd.is_finite()):
+        raise ExternalPaperError("FROZEN_INTENT_MISMATCH", "intent quantity/limit_price/notional_usd must be finite")
+    recomputed = quantity * limit_price
+    if recomputed != notional_usd:
+        raise ExternalPaperError(
+            "FROZEN_INTENT_MISMATCH", "recomputed notional does not match the frozen intent notional_usd",
+        )
+    if (
+        intent["side"] == "BUY" and risk is not None and risk.get("decision") in APPROVED_RISK_DECISIONS
+        and risk.get("approved_notional_usd") is not None
+        and recomputed != Decimal(risk["approved_notional_usd"])
+    ):
+        raise ExternalPaperError(
+            "FROZEN_INTENT_MISMATCH", "recomputed notional does not match the approved risk decision notional",
+        )
+    if recomputed > min(cfg.risk.max_order_notional_usd, cfg.external_broker.maximum_order_notional_usd):
+        raise ExternalPaperError("EXTERNAL_NOTIONAL_LIMIT", "recomputed notional exceeds the strictest configured cap")
 
 
 def derive_external_order_identity(intent: dict) -> tuple[str, str]:
@@ -138,6 +198,8 @@ def _append_event(
     previous = current["new_state"] if current else STATE_NOT_SUBMITTED
     if new_state not in _TRANSITIONS.get(previous, set()):
         raise ExternalPaperError("INVALID_STATE_TRANSITION", f"cannot transition {previous} -> {new_state}")
+    previous_sequence = current.get("scope_sequence") if current else None
+    next_sequence = (previous_sequence + 1) if previous_sequence is not None else 0
     event = {
         "external_order_event_id": _digest(
             "peoe_", [client_order_id, previous, new_state, now.isoformat(), runtime_request_id, attempt_number], 40,
@@ -150,8 +212,14 @@ def _append_event(
         "operator": operator, "reason": reason, "runtime_request_id": runtime_request_id,
         "error_code": error_code, "created_at": now.isoformat(), "policy_version": POLICY_VERSION,
         "config_hash": intent["_external_config_hash"], "attempt_number": attempt_number,
+        "scope_sequence": next_sequence,
     }
-    repo.save_external_order_event(conn, event)
+    inserted = repo.save_external_order_event(conn, event)
+    if not inserted:
+        raise ExternalPaperError(
+            "EVENT_CHAIN_CONFLICT",
+            "external order event insertion did not occur; a concurrent writer already claimed this transition",
+        )
     return event
 
 
@@ -202,15 +270,20 @@ def _intent(conn: sqlite3.Connection, cfg: PaperBooksConfiguration, book_id: str
         raise ExternalPaperError("QUANTITY_NOT_WHOLE", "external quantity must be positive whole shares")
     if intent["side"] not in ("BUY", "SELL"):
         raise ExternalPaperError("SIDE_NOT_ALLOWED", "external execution is long-only BUY/closing SELL")
-    if Decimal(intent["notional_usd"]) > min(
-        cfg.risk.max_order_notional_usd, cfg.external_broker.maximum_order_notional_usd,
-    ):
-        raise ExternalPaperError("EXTERNAL_NOTIONAL_LIMIT", "order notional exceeds the strictest configured cap")
+    _validate_frozen_notional(intent, cfg, risk)
     as_of = datetime.fromisoformat(intent["as_of"])
-    if as_of.tzinfo is None or now - as_of.astimezone(timezone.utc) > timedelta(
-        seconds=cfg.risk.reject_stale_market_price_seconds
-    ):
+    if as_of.tzinfo is None:
+        raise ExternalPaperError("INVALID_TIMESTAMP", "paper intent as_of must be timezone-aware")
+    as_of = as_of.astimezone(timezone.utc)
+    if as_of > now + _CLOCK_SKEW:
+        raise ExternalPaperError("FUTURE_TIMESTAMP", "paper intent as_of is in the future")
+    if now - as_of > timedelta(seconds=cfg.risk.reject_stale_market_price_seconds):
         raise ExternalPaperError("STALE_INTENT", "paper intent is stale for external submission")
+    created_at = datetime.fromisoformat(intent["created_at"])
+    if created_at.tzinfo is None:
+        raise ExternalPaperError("INVALID_TIMESTAMP", "paper intent created_at must be timezone-aware")
+    if created_at.astimezone(timezone.utc) > now + _CLOCK_SKEW:
+        raise ExternalPaperError("FUTURE_TIMESTAMP", "paper intent created_at is in the future")
     if intent["side"] == "SELL":
         position = repo.load_position(conn, book_id, intent["symbol"])
         confirmed = Decimal(position["available_quantity"]) if position else Decimal("0")
@@ -273,7 +346,7 @@ def _payload(intent: dict, client_order_id: str, payload_hash: str, fingerprint:
     return {
         "book_id": intent["book_id"], "paper_order_intent_id": intent["paper_order_intent_id"],
         "client_order_id": client_order_id, "symbol": intent["symbol"], "side": intent["side"],
-        "quantity": int(Decimal(intent["quantity"])), "limit_price": str(intent["limit_price"]),
+        "quantity": _exact_int(intent["quantity"], "intent quantity"), "limit_price": str(intent["limit_price"]),
         "time_in_force": "DAY", "asset_type": "equity", "extended_hours": False,
         "payload_hash": payload_hash, "account_fingerprint": fingerprint,
         "expires_at": (now + timedelta(seconds=300)).isoformat(),
@@ -298,6 +371,37 @@ def _verify_fingerprint_history(conn: sqlite3.Connection, book_id: str, fingerpr
         )
 
 
+_ORDER_LEASE_TTL_SECONDS = 30
+
+
+@contextlib.contextmanager
+def _order_lease(conn: sqlite3.Connection, book_id: str, client_order_id: str, *, operation: str, now: datetime):
+    """Atomic order-scope claim keyed by (book_id, client_order_id).
+
+    Prevents concurrent preview/submit/retry/cancel/reconciliation calls on
+    the same external order from forking the event chain: acquisition is a
+    single conditional SQL write (`acquire_external_order_lease`), a stale
+    lease (past `expires_at`) is recoverable by a new owner, and failure to
+    acquire raises immediately rather than waiting. Released in `finally` so
+    a raised exception never leaves the lease held.
+    """
+    lease_key = f"{book_id}:{client_order_id}"
+    owner_id = f"call_{uuid.uuid4().hex}"
+    expires_at = (now + timedelta(seconds=_ORDER_LEASE_TTL_SECONDS)).isoformat()
+    acquired = repo.acquire_external_order_lease(
+        conn, lease_key=lease_key, book_id=book_id, client_order_id=client_order_id,
+        owner_id=owner_id, operation=operation, now=now.isoformat(), expires_at=expires_at,
+    )
+    if not acquired:
+        raise ExternalPaperError(
+            "ORDER_LEASE_HELD", f"another operation holds the order-scope lease for {client_order_id!r}",
+        )
+    try:
+        yield
+    finally:
+        repo.release_external_order_lease(conn, lease_key=lease_key, owner_id=owner_id, now=now.isoformat())
+
+
 def preview_external_paper_order(
     conn: sqlite3.Connection, *, book_id: str, paper_order_intent_id: str, operator: str,
     runtime: ExternalPaperRuntime, config: PaperBooksConfiguration, clock=None,
@@ -307,40 +411,43 @@ def preview_external_paper_order(
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     _safety_checks(conn, book_id)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    current = _current_event(conn, book_id, client_order_id)
-    if current and current["new_state"] not in (STATE_PREVIEWED,):
-        raise ExternalPaperError("ORDER_ALREADY_EXTERNAL", f"external order is already {current['new_state']}")
-    account = _account_check(runtime, book_id)
-    fingerprint = account["account_fingerprint"]
-    _verify_fingerprint_history(conn, book_id, fingerprint)
-    runtime_result = runtime.preview_limit_order(_payload(intent, client_order_id, payload_hash, fingerprint, now))
-    if not isinstance(runtime_result, dict) or set(runtime_result) != {
-        "provider", "environment", "book_id", "client_order_id", "account_fingerprint", "result", "reasons",
-    }:
-        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime preview response shape is invalid")
-    if (
-        runtime_result.get("provider") != "alpaca_paper" or runtime_result.get("environment") != "paper"
-        or runtime_result.get("book_id") != book_id or runtime_result.get("client_order_id") != client_order_id
-        or not isinstance(runtime_result.get("reasons"), list)
-        or runtime_result.get("result") != "APPROVED" or runtime_result.get("account_fingerprint") != fingerprint
-    ):
-        raise ExternalPaperError("RUNTIME_PREVIEW_REJECTED", "isolated runtime rejected the paper preflight")
-    expires = now + timedelta(seconds=config.external_broker.require_recent_preview_seconds)
-    preview_id = _digest("pepv_", [book_id, paper_order_intent_id, payload_hash, fingerprint, now.isoformat()], 40)
-    record = {
-        "preview_id": preview_id, "paper_order_intent_id": paper_order_intent_id,
-        "payload_hash": payload_hash, "book_id": book_id, "client_order_id": client_order_id,
-        "account_fingerprint": fingerprint, "previewed_at": now.isoformat(), "expires_at": expires.isoformat(),
-        "operator": operator, "result": "APPROVED", "reasons": (), "config_hash": config.config_hash,
-        "policy_version": POLICY_VERSION,
-    }
-    repo.save_external_preview(conn, record)
-    _append_event(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        account_fingerprint=fingerprint, new_state=STATE_PREVIEWED, operator=operator,
-        reason="explicit external paper preview approved", now=now,
-    )
-    return record
+    with _order_lease(conn, book_id, client_order_id, operation="PREVIEW", now=now):
+        current = _current_event(conn, book_id, client_order_id)
+        if current and current["new_state"] not in (STATE_PREVIEWED,):
+            raise ExternalPaperError("ORDER_ALREADY_EXTERNAL", f"external order is already {current['new_state']}")
+        account = _account_check(runtime, book_id)
+        fingerprint = account["account_fingerprint"]
+        _verify_fingerprint_history(conn, book_id, fingerprint)
+        runtime_result = runtime.preview_limit_order(
+            _payload(intent, client_order_id, payload_hash, fingerprint, now)
+        )
+        if not isinstance(runtime_result, dict) or set(runtime_result) != {
+            "provider", "environment", "book_id", "client_order_id", "account_fingerprint", "result", "reasons",
+        }:
+            raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime preview response shape is invalid")
+        if (
+            runtime_result.get("provider") != "alpaca_paper" or runtime_result.get("environment") != "paper"
+            or runtime_result.get("book_id") != book_id or runtime_result.get("client_order_id") != client_order_id
+            or not isinstance(runtime_result.get("reasons"), list)
+            or runtime_result.get("result") != "APPROVED" or runtime_result.get("account_fingerprint") != fingerprint
+        ):
+            raise ExternalPaperError("RUNTIME_PREVIEW_REJECTED", "isolated runtime rejected the paper preflight")
+        expires = now + timedelta(seconds=config.external_broker.require_recent_preview_seconds)
+        preview_id = _digest("pepv_", [book_id, paper_order_intent_id, payload_hash, fingerprint, now.isoformat()], 40)
+        record = {
+            "preview_id": preview_id, "paper_order_intent_id": paper_order_intent_id,
+            "payload_hash": payload_hash, "book_id": book_id, "client_order_id": client_order_id,
+            "account_fingerprint": fingerprint, "previewed_at": now.isoformat(), "expires_at": expires.isoformat(),
+            "operator": operator, "result": "APPROVED", "reasons": (), "config_hash": config.config_hash,
+            "policy_version": POLICY_VERSION,
+        }
+        repo.save_external_preview(conn, record)
+        _append_event(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            account_fingerprint=fingerprint, new_state=STATE_PREVIEWED, operator=operator,
+            reason="explicit external paper preview approved", now=now,
+        )
+        return record
 
 
 def _validated_preview(
@@ -380,7 +487,74 @@ def _state_from_order(order: dict) -> str:
     return mapping[status]
 
 
-def _validate_order_response(order: dict, intent: dict, client_order_id: str, fingerprint: str) -> None:
+_DUPLICATE_WINDOW_SECONDS = 300
+
+
+def _detect_duplicate_broker_order(
+    runtime: ExternalPaperRuntime, *, book_id: str, intent: dict, client_order_id: str, order: dict,
+) -> dict:
+    """Bounded, offline-safe duplicate check (Part 9): compares recent broker
+    orders against the frozen external intent. Returns a bounded, non-secret
+    details dict (never a raw broker object) when a duplicate is found, or
+    an empty dict otherwise. Never flags an ordinary unrelated order.
+    """
+    try:
+        recent = runtime.list_recent_external_orders(book_id, limit=100)
+    except AttributeError:
+        return {}
+    if not isinstance(recent, list) or len(recent) > 200:
+        return {}
+    try:
+        own_submitted_at = datetime.fromisoformat(str(order["submitted_at"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError, TypeError):
+        own_submitted_at = None
+    same_client_id_other_broker_ids: set[str] = set()
+    other_client_order_id: str | None = None
+    for candidate in recent:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_client_id = candidate.get("client_order_id")
+        candidate_broker_id = candidate.get("broker_order_id")
+        if not isinstance(candidate_client_id, str):
+            continue
+        if candidate_client_id == client_order_id:
+            if candidate_broker_id and candidate_broker_id != order.get("broker_order_id"):
+                same_client_id_other_broker_ids.add(str(candidate_broker_id))
+            continue
+        if not candidate_client_id.startswith(f"epb-{book_id.lower()}-"):
+            continue  # a different book's namespace — not a duplicate of this order
+        try:
+            same_shape = (
+                candidate.get("symbol") == intent["symbol"] and candidate.get("side") == intent["side"]
+                and Decimal(str(candidate.get("quantity"))) == Decimal(intent["quantity"])
+                and Decimal(str(candidate.get("limit_price"))) == Decimal(intent["limit_price"])
+            )
+        except (InvalidOperation, TypeError, KeyError):
+            same_shape = False
+        if not same_shape or own_submitted_at is None:
+            continue
+        try:
+            candidate_time = datetime.fromisoformat(str(candidate.get("submitted_at", "")).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        if abs((candidate_time - own_submitted_at).total_seconds()) <= _DUPLICATE_WINDOW_SECONDS:
+            other_client_order_id = str(candidate_client_id)
+    if same_client_id_other_broker_ids:
+        return {
+            "duplicate_broker_order_ids": sorted(same_client_id_other_broker_ids)[:5],
+            "duplicate_reason": "same client_order_id mapped to more than one broker order",
+        }
+    if other_client_order_id is not None:
+        return {
+            "duplicate_client_order_id": other_client_order_id,
+            "duplicate_reason": "materially identical order under a different client_order_id",
+        }
+    return {}
+
+
+def _validate_order_response(
+    order: dict, intent: dict, client_order_id: str, fingerprint: str, now: datetime,
+) -> None:
     expected_fields = {
         "provider", "environment", "account_fingerprint", "book_id", "client_order_id",
         "broker_order_id", "symbol", "side", "quantity", "limit_price", "time_in_force",
@@ -410,6 +584,10 @@ def _validate_order_response(order: dict, intent: dict, client_order_id: str, fi
         updated_at = datetime.fromisoformat(str(order["updated_at"]).replace("Z", "+00:00"))
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime order values are malformed") from exc
+    if not quantity.is_finite() or not limit_price.is_finite() or not filled_quantity.is_finite():
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime order values must be finite")
+    if quantity != quantity.to_integral_value() or filled_quantity != filled_quantity.to_integral_value():
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime order quantities must be whole numbers")
     if quantity != Decimal(intent["quantity"]):
         raise ExternalPaperError("BROKER_ORDER_MISMATCH", "broker order quantity does not match approved intent")
     if limit_price != Decimal(intent["limit_price"]):
@@ -420,6 +598,11 @@ def _validate_order_response(order: dict, intent: dict, client_order_id: str, fi
         raise ExternalPaperError("BROKER_ORDER_MISMATCH", "broker filled quantity exceeds approved quantity")
     if submitted_at.tzinfo is None or updated_at.tzinfo is None:
         raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "runtime order timestamps must be timezone aware")
+    submitted_at, updated_at = submitted_at.astimezone(timezone.utc), updated_at.astimezone(timezone.utc)
+    if submitted_at > now + _CLOCK_SKEW or updated_at > now + _CLOCK_SKEW:
+        raise ExternalPaperError("FUTURE_TIMESTAMP", "runtime order timestamp is in the future")
+    if submitted_at > updated_at:
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "broker order submitted_at is after updated_at")
 
 
 def _record_unknown(
@@ -440,9 +623,15 @@ def _submit_once(
 ) -> dict:
     runtime_request_id = f"m11_{uuid.uuid4().hex}"
     reservation_inserted = False
+    share_reservation_inserted = False
     if intent["side"] == "BUY":
         reservation_inserted = cash_ledger.reserve_for_order(
             conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
+        )
+    else:
+        share_reservation_inserted = positions.reserve_shares_for_sell(
+            conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], client_order_id,
+            Decimal(intent["quantity"]), now,
         )
     try:
         _append_event(
@@ -456,10 +645,15 @@ def _submit_once(
                 conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]),
                 now, reason="submission-event-failed",
             )
+        if share_reservation_inserted:
+            positions.release_remaining_share_reservation(
+                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
+                release_event_id="submission-event-failed", event_type="RELEASED_CANCELLED",
+            )
         raise
     try:
         order = runtime.submit_limit_order(_payload(intent, client_order_id, payload_hash, fingerprint, now))
-        _validate_order_response(order, intent, client_order_id, fingerprint)
+        _validate_order_response(order, intent, client_order_id, fingerprint, now)
         new_state = _state_from_order(order)
     except Exception as exc:
         code = getattr(exc, "code", "RUNTIME_OUTCOME_UNKNOWN")
@@ -477,19 +671,38 @@ def _submit_once(
         runtime_request_id=runtime_request_id, attempt_number=attempt_number,
     )
     repo.update_order_status(conn, intent["book_id"], intent["paper_order_intent_id"], new_state)
+    order_submitted_at = datetime.fromisoformat(str(order["submitted_at"]).replace("Z", "+00:00")).astimezone(timezone.utc)
     fills = apply_external_fills(
         conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        fingerprint=fingerprint, runtime=runtime, now=now,
+        fingerprint=fingerprint, runtime=runtime, now=now, not_before=order_submitted_at,
     )
-    _release_terminal_buy_reservation(conn, intent, new_state, now)
+    _release_terminal_reservation(conn, intent, new_state, now)
     return {"status": new_state, "event": event, "order": order, "new_fills": fills}
 
 
-def _release_terminal_buy_reservation(conn, intent: dict, state: str, now: datetime) -> None:
-    if intent["side"] == "BUY" and state in TERMINAL_STATES:
-        cash_ledger.release_reservation(
-            conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]),
-            now, reason="external-terminal",
+_RELEASE_EVENT_TYPE_FOR_STATE = {
+    STATE_CANCELLED: "RELEASED_CANCELLED", STATE_REJECTED: "RELEASED_REJECTED", STATE_EXPIRED: "RELEASED_EXPIRED",
+}
+
+
+def _release_terminal_reservation(conn, intent: dict, state: str, now: datetime) -> None:
+    """Release whatever remains reserved once the broker confirms no more fills will arrive.
+
+    FILLED is deliberately excluded here: it is only ever released inside
+    ``apply_external_fills`` once the full approved quantity is durably
+    applied locally, so an empty or delayed fill response for a broker-FILLED
+    order leaves the reservation intact rather than releasing it on trust.
+    """
+    if state not in _RELEASE_EVENT_TYPE_FOR_STATE:
+        return
+    if intent["side"] == "BUY":
+        cash_ledger.release_remaining_buy_reservation(
+            conn, intent["book_id"], intent["paper_order_intent_id"], now, release_event_id="terminal-closed",
+        )
+    else:
+        positions.release_remaining_share_reservation(
+            conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
+            release_event_id="terminal-closed", event_type=_RELEASE_EVENT_TYPE_FOR_STATE[state],
         )
 
 
@@ -503,37 +716,39 @@ def submit_external_paper_order(
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     _safety_checks(conn, book_id)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    account = _account_check(runtime, book_id)
-    fingerprint = account["account_fingerprint"]
-    _verify_fingerprint_history(conn, book_id, fingerprint)
-    _validated_preview(
-        conn, preview_id=preview_id, intent=intent, client_order_id=client_order_id,
-        payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
-    )
-    current = _current_event(conn, book_id, client_order_id)
-    if current and current["new_state"] == STATE_UNKNOWN:
-        raise ExternalPaperError("AMBIGUOUS_SUBMISSION", "broker lookup is required before any retry")
-    if current and current["new_state"] not in (STATE_PREVIEWED,):
-        order = runtime.get_order_by_client_order_id(book_id, client_order_id)
-        if order is None:
-            raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
-        return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
-    result = _submit_once(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
-        config=config, now=now, attempt_number=0,
-    )
-    if result["status"] != STATE_UNKNOWN:
-        result["reconciliation"] = reconcile_external_paper_order(
-            conn, book_id=book_id, client_order_id=client_order_id,
-            runtime=runtime, config=config, clock=lambda: now,
+    with _order_lease(conn, book_id, client_order_id, operation="SUBMIT", now=now):
+        account = _account_check(runtime, book_id)
+        fingerprint = account["account_fingerprint"]
+        _verify_fingerprint_history(conn, book_id, fingerprint)
+        _validated_preview(
+            conn, preview_id=preview_id, intent=intent, client_order_id=client_order_id,
+            payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
         )
-    return result
+        current = _current_event(conn, book_id, client_order_id)
+        if current and current["new_state"] == STATE_UNKNOWN:
+            raise ExternalPaperError("AMBIGUOUS_SUBMISSION", "broker lookup is required before any retry")
+        if current and current["new_state"] not in (STATE_PREVIEWED,):
+            order = runtime.get_order_by_client_order_id(book_id, client_order_id)
+            if order is None:
+                raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
+            return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
+        result = _submit_once(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
+            config=config, now=now, attempt_number=0,
+        )
+        if result["status"] != STATE_UNKNOWN:
+            result["reconciliation"] = _reconcile_locked(
+                conn, book_id=book_id, client_order_id=client_order_id,
+                runtime=runtime, config=config, now=now,
+            )
+        return result
 
 
 def apply_external_fills(
     conn: sqlite3.Connection, *, intent: dict, client_order_id: str, payload_hash: str,
     fingerprint: str, runtime: ExternalPaperRuntime, now: datetime,
+    not_before: datetime | None = None,
 ) -> list[dict]:
     try:
         fills = runtime.list_order_fills(intent["book_id"], client_order_id)
@@ -568,6 +783,10 @@ def apply_external_fills(
             quantity, price = Decimal(str(fill["quantity"])), Decimal(str(fill["price"]))
         except (KeyError, InvalidOperation) as exc:
             raise ExternalPaperError("MALFORMED_FILL", "runtime fill has invalid quantity/price") from exc
+        if not quantity.is_finite() or not price.is_finite():
+            raise ExternalPaperError("MALFORMED_FILL", "runtime fill quantity/price must be finite")
+        if quantity != quantity.to_integral_value():
+            raise ExternalPaperError("MALFORMED_FILL", "runtime fill quantity must be a whole number")
         if external_identity.startswith("alpaca-cumulative-"):
             cumulative_quantity = quantity
             if cumulative_quantity <= existing_total:
@@ -590,6 +809,11 @@ def apply_external_fills(
         filled_at = datetime.fromisoformat(str(fill["filled_at"]).replace("Z", "+00:00"))
         if filled_at.tzinfo is None:
             raise ExternalPaperError("MALFORMED_FILL", "fill timestamp must be timezone aware")
+        filled_at = filled_at.astimezone(timezone.utc)
+        if filled_at > now + _CLOCK_SKEW:
+            raise ExternalPaperError("FUTURE_TIMESTAMP", "fill timestamp is in the future")
+        if not_before is not None and filled_at < not_before - _CLOCK_SKEW:
+            raise ExternalPaperError("MALFORMED_FILL", "fill timestamp precedes the order's own submission")
         record = {
             "external_fill_id": external_fill_id, "book_id": intent["book_id"],
             "paper_order_intent_id": intent["paper_order_intent_id"], "client_order_id": client_order_id,
@@ -620,14 +844,22 @@ def apply_external_fills(
                         conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
                         Decimal("0"), filled_at, commit=False,
                     )
+                    cash_ledger.release_settled_buy_reservation(
+                        conn, intent["book_id"], intent["paper_order_intent_id"], local_fill_id,
+                        quantity * price, filled_at, commit=False,
+                    )
                 else:
                     positions.apply_sell_fill(
                         conn, intent["book_id"], intent["symbol"], local_fill_id, quantity, price,
-                        filled_at, commit=False,
+                        filled_at, commit=False, already_reserved=True,
                     )
                     cash_ledger.settle_sell(
                         conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
                         Decimal("0"), filled_at, commit=False,
+                    )
+                    positions.consume_share_reservation_for_fill(
+                        conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"],
+                        local_fill_id, quantity, filled_at, commit=False,
                     )
             conn.commit()
         except Exception:
@@ -649,7 +881,15 @@ def apply_external_fills(
             )
             repo.update_order_status(conn, intent["book_id"], intent["paper_order_intent_id"], state)
     if existing_total == approved:
-        _release_terminal_buy_reservation(conn, intent, STATE_FILLED, now)
+        if intent["side"] == "BUY":
+            cash_ledger.release_remaining_buy_reservation(
+                conn, intent["book_id"], intent["paper_order_intent_id"], now, release_event_id="fully-filled",
+            )
+        else:
+            positions.release_remaining_share_reservation(
+                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
+                release_event_id="fully-filled", event_type="CONSUMED_BY_FILL",
+            )
     return applied
 
 
@@ -662,45 +902,57 @@ def retry_external_paper_order(
     _require_external_config(config, book_id, submission=True)
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    current = _current_event(conn, book_id, client_order_id)
-    if current is None or current["new_state"] != STATE_UNKNOWN:
-        raise ExternalPaperError("RETRY_NOT_ALLOWED", "retry requires an ambiguous submission state")
-    lookup = repo.load_latest_external_lookup(conn, book_id, client_order_id)
-    if lookup is None or lookup["result"] != "NOT_FOUND" or not lookup["authoritative"]:
-        raise ExternalPaperError("NOT_FOUND_NOT_CONFIRMED", "authoritative broker NOT_FOUND evidence is required")
-    _safety_checks(
-        conn, book_id, allow_confirmed_not_found_retry=True, retry_client_order_id=client_order_id,
-    )
-    retries = max(event["attempt_number"] for event in repo.list_external_order_events(
-        conn, book_id=book_id, client_order_id=client_order_id,
-    ))
-    if retries >= config.external_broker.maximum_retry_attempts:
-        raise ExternalPaperError("RETRY_LIMIT_REACHED", "external submission retry limit reached")
-    account = _account_check(runtime, book_id)
-    fingerprint = account["account_fingerprint"]
-    if fingerprint != current["account_fingerprint"]:
-        raise ExternalPaperError("ACCOUNT_FINGERPRINT_MISMATCH", "account changed before retry")
-    preview = conn.execute(
-        "SELECT preview_id FROM paper_external_order_previews WHERE book_id = ? AND paper_order_intent_id = ? "
-        "AND result = 'APPROVED' ORDER BY previewed_at DESC LIMIT 1", (book_id, paper_order_intent_id),
-    ).fetchone()
-    if preview is None:
-        raise ExternalPaperError("PREVIEW_NOT_FOUND", "retry requires a matching explicit preview")
-    _validated_preview(
-        conn, preview_id=preview["preview_id"], intent=intent, client_order_id=client_order_id,
-        payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
-    )
-    result = _submit_once(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
-        now=now, attempt_number=retries + 1,
-    )
-    if result["status"] != STATE_UNKNOWN:
-        result["reconciliation"] = reconcile_external_paper_order(
-            conn, book_id=book_id, client_order_id=client_order_id,
-            runtime=runtime, config=config, clock=lambda: now,
+    with _order_lease(conn, book_id, client_order_id, operation="RETRY", now=now):
+        current = _current_event(conn, book_id, client_order_id)
+        if current is None or current["new_state"] != STATE_UNKNOWN:
+            raise ExternalPaperError("RETRY_NOT_ALLOWED", "retry requires an ambiguous submission state")
+        lookup = repo.load_latest_external_lookup(conn, book_id, client_order_id)
+        if (
+            lookup is None or lookup["result"] != "NOT_FOUND" or not lookup["authoritative"]
+            or lookup.get("consumed_by_retry_event_id") is not None
+            or lookup.get("ambiguous_event_id") != current["external_order_event_id"]
+            or lookup.get("attempt_number") != current["attempt_number"]
+            or lookup.get("payload_hash") != current["payload_hash"]
+            or lookup.get("account_fingerprint") != current["account_fingerprint"]
+        ):
+            raise ExternalPaperError(
+                "NOT_FOUND_NOT_CONFIRMED",
+                "fresh, unconsumed authoritative broker NOT_FOUND evidence for this exact ambiguous attempt is required",
+            )
+        _safety_checks(
+            conn, book_id, allow_confirmed_not_found_retry=True, retry_client_order_id=client_order_id,
         )
-    return result
+        retries = max(event["attempt_number"] for event in repo.list_external_order_events(
+            conn, book_id=book_id, client_order_id=client_order_id,
+        ))
+        if retries >= config.external_broker.maximum_retry_attempts:
+            raise ExternalPaperError("RETRY_LIMIT_REACHED", "external submission retry limit reached")
+        account = _account_check(runtime, book_id)
+        fingerprint = account["account_fingerprint"]
+        if fingerprint != current["account_fingerprint"]:
+            raise ExternalPaperError("ACCOUNT_FINGERPRINT_MISMATCH", "account changed before retry")
+        preview = conn.execute(
+            "SELECT preview_id FROM paper_external_order_previews WHERE book_id = ? AND paper_order_intent_id = ? "
+            "AND result = 'APPROVED' ORDER BY previewed_at DESC LIMIT 1", (book_id, paper_order_intent_id),
+        ).fetchone()
+        if preview is None:
+            raise ExternalPaperError("PREVIEW_NOT_FOUND", "retry requires a matching explicit preview")
+        _validated_preview(
+            conn, preview_id=preview["preview_id"], intent=intent, client_order_id=client_order_id,
+            payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
+        )
+        result = _submit_once(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
+            now=now, attempt_number=retries + 1,
+        )
+        repo.consume_external_lookup(conn, lookup["lookup_id"], result["event"]["external_order_event_id"])
+        if result["status"] != STATE_UNKNOWN:
+            result["reconciliation"] = _reconcile_locked(
+                conn, book_id=book_id, client_order_id=client_order_id,
+                runtime=runtime, config=config, now=now,
+            )
+        return result
 
 
 def cancel_external_paper_order(
@@ -713,46 +965,105 @@ def cancel_external_paper_order(
     # create exposure. Keep it available after new submission is disabled and
     # while a reconciliation/safety incident is active.
     _require_external_config(config, book_id)
-    current = _current_event(conn, book_id, client_order_id)
-    if current is None:
-        raise ExternalPaperError("ORDER_NOT_FOUND", "no local external order exists")
-    if current["new_state"] in TERMINAL_STATES or current["new_state"] == STATE_UNKNOWN:
-        raise ExternalPaperError("CANCEL_NOT_ALLOWED", f"cannot cancel order in {current['new_state']} state")
-    intent = repo.load_order_intent(conn, book_id, current["paper_order_intent_id"])
-    if intent is None:
-        raise ExternalPaperError("INTENT_NOT_FOUND", "the external order's frozen intent was not found")
-    intent["_external_config_hash"] = config.config_hash
-    _append_event(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-        account_fingerprint=current["account_fingerprint"], new_state=STATE_CANCEL_REQUESTED,
-        operator=operator, reason=reason, now=now, broker_order_id=current.get("broker_order_id"),
-        attempt_number=current["attempt_number"],
-    )
-    request_id = f"m11_{uuid.uuid4().hex}"
-    try:
-        order = runtime.cancel_external_order(
-            book_id, client_order_id, current["account_fingerprint"],
-        )
-        _validate_order_response(order, intent, client_order_id, current["account_fingerprint"])
-        state = _state_from_order(order)
-    except Exception as exc:
-        event = _record_unknown(
+    with _order_lease(conn, book_id, client_order_id, operation="CANCEL", now=now):
+        current = _current_event(conn, book_id, client_order_id)
+        if current is None:
+            raise ExternalPaperError("ORDER_NOT_FOUND", "no local external order exists")
+        if current["new_state"] in TERMINAL_STATES or current["new_state"] == STATE_UNKNOWN:
+            raise ExternalPaperError("CANCEL_NOT_ALLOWED", f"cannot cancel order in {current['new_state']} state")
+        intent = repo.load_order_intent(conn, book_id, current["paper_order_intent_id"])
+        if intent is None:
+            raise ExternalPaperError("INTENT_NOT_FOUND", "the external order's frozen intent was not found")
+        intent["_external_config_hash"] = config.config_hash
+        _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-            fingerprint=current["account_fingerprint"], operator=operator,
-            reason="cancellation outcome is ambiguous; reconciliation required", now=now,
-            runtime_request_id=request_id, error_code=getattr(exc, "code", "CANCEL_UNKNOWN"),
+            account_fingerprint=current["account_fingerprint"], new_state=STATE_CANCEL_REQUESTED,
+            operator=operator, reason=reason, now=now, broker_order_id=current.get("broker_order_id"),
             attempt_number=current["attempt_number"],
         )
-        return {"status": STATE_UNKNOWN, "event": event}
-    event = _append_event(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-        account_fingerprint=current["account_fingerprint"], new_state=state, operator=operator,
-        reason="explicit cancellation broker response", now=now, broker_order_id=order.get("broker_order_id"),
-        runtime_request_id=request_id, attempt_number=current["attempt_number"],
-    )
-    _release_terminal_buy_reservation(conn, intent, state, now)
-    repo.update_order_status(conn, book_id, intent["paper_order_intent_id"], state)
-    return {"status": state, "event": event, "order": order}
+        request_id = f"m11_{uuid.uuid4().hex}"
+        try:
+            order = runtime.cancel_external_order(
+                book_id, client_order_id, current["account_fingerprint"],
+            )
+            _validate_order_response(order, intent, client_order_id, current["account_fingerprint"], now)
+            state = _state_from_order(order)
+        except Exception as exc:
+            event = _record_unknown(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                fingerprint=current["account_fingerprint"], operator=operator,
+                reason="cancellation outcome is ambiguous; reconciliation required", now=now,
+                runtime_request_id=request_id, error_code=getattr(exc, "code", "CANCEL_UNKNOWN"),
+                attempt_number=current["attempt_number"],
+            )
+            return {"status": STATE_UNKNOWN, "event": event}
+        event = _append_event(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+            account_fingerprint=current["account_fingerprint"], new_state=state, operator=operator,
+            reason="explicit cancellation broker response", now=now, broker_order_id=order.get("broker_order_id"),
+            runtime_request_id=request_id, attempt_number=current["attempt_number"],
+        )
+        order_submitted_at = datetime.fromisoformat(
+            str(order["submitted_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        apply_external_fills(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+            fingerprint=current["account_fingerprint"], runtime=runtime, now=now, not_before=order_submitted_at,
+        )
+        _release_terminal_reservation(conn, intent, state, now)
+        repo.update_order_status(conn, book_id, intent["paper_order_intent_id"], state)
+        return {"status": state, "event": event, "order": order}
+
+
+QUEUE_STATUS_AWAITING_SUBMISSION = "AWAITING_OPERATOR_EXTERNAL_SUBMISSION"
+QUEUE_STATUS_BLOCKED_BY_RECONCILIATION = "BLOCKED_BY_RECONCILIATION"
+QUEUE_STATUSES = (
+    QUEUE_STATUS_AWAITING_SUBMISSION, STATE_PREVIEWED, STATE_SUBMISSION_REQUESTED, STATE_SUBMITTED,
+    STATE_PARTIALLY_FILLED, STATE_FILLED, STATE_CANCELLED, STATE_REJECTED, STATE_EXPIRED,
+    STATE_UNKNOWN, QUEUE_STATUS_BLOCKED_BY_RECONCILIATION,
+)
+
+
+def derive_external_queue_status(conn: sqlite3.Connection, *, book_id: str, paper_order_intent_id: str) -> dict:
+    """Part 16: the queue status is always derived fresh from the external
+    order-event chain (never a separately-maintained column, which is
+    exactly what let the queue silently stay `AWAITING_OPERATOR_EXTERNAL_
+    SUBMISSION` forever regardless of what actually happened at the
+    broker). Terminal states (FILLED/CANCELLED/REJECTED/EXPIRED) are
+    immutable once reached; a non-terminal order with an active critical
+    reconciliation is surfaced as `BLOCKED_BY_RECONCILIATION` rather than
+    its raw (stale-looking) last event state, so the block is visible.
+    """
+    event = repo.load_latest_external_order_event_for_intent(conn, book_id, paper_order_intent_id)
+    client_order_id = event["client_order_id"] if event else None
+    status = event["new_state"] if event else QUEUE_STATUS_AWAITING_SUBMISSION
+    if client_order_id is not None and status not in TERMINAL_STATES:
+        reconciliations = repo.list_external_reconciliations(conn, book_id, client_order_id)
+        if reconciliations and reconciliations[-1]["critical"]:
+            status = QUEUE_STATUS_BLOCKED_BY_RECONCILIATION
+    return {
+        "book_id": book_id, "paper_order_intent_id": paper_order_intent_id,
+        "client_order_id": client_order_id, "status": status,
+        "external_state": event["new_state"] if event else None,
+    }
+
+
+def list_external_submission_queue_view(conn: sqlite3.Connection, *, book_id: str) -> list[dict]:
+    """Read-only queue display (no mutation, no order-scope lease needed):
+    one row per queued intent, each linked to its client_order_id and
+    current derived external status. Never stores or returns credentials or
+    raw broker response bodies."""
+    view = []
+    for row in repo.list_external_submission_queue(conn, book_id):
+        derived = derive_external_queue_status(
+            conn, book_id=book_id, paper_order_intent_id=row["paper_order_intent_id"],
+        )
+        view.append({
+            "queue_id": row["queue_id"], "paper_order_intent_id": row["paper_order_intent_id"],
+            "source": row["source"], "created_at": row["created_at"],
+            "client_order_id": derived["client_order_id"], "status": derived["status"],
+        })
+    return view
 
 
 def show_external_paper_order(conn: sqlite3.Connection, *, book_id: str, client_order_id: str) -> dict:
@@ -766,9 +1077,17 @@ def reconcile_external_paper_order(
     conn: sqlite3.Connection, *, book_id: str, runtime: ExternalPaperRuntime,
     config: PaperBooksConfiguration, client_order_id: str | None = None, clock=None,
 ) -> dict:
+    """Public entry point: resolves the target order (if unspecified) and
+    acquires the order-scope lease before reconciling. Internal callers that
+    already hold the lease for this client_order_id (submit/retry, right
+    after their own submission) call `_reconcile_locked` directly instead —
+    re-entering this wrapper would try to acquire a lease already held by the
+    same logical call and fail closed rather than deadlock or double-acquire.
+    """
     now = _now(clock)
     _require_external_config(config, book_id)
-    if client_order_id is None:
+    resolved_client_order_id = client_order_id
+    if resolved_client_order_id is None:
         row = conn.execute(
             "SELECT client_order_id FROM paper_external_order_events WHERE book_id = ? "
             "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id,),
@@ -778,7 +1097,45 @@ def reconcile_external_paper_order(
                 conn, book_id=book_id, intent=None, client_order_id=None, fingerprint=None,
                 statuses=("ORDER_MISSING_LOCALLY",), details={}, now=now, config=config,
             )
-        client_order_id = row["client_order_id"]
+        resolved_client_order_id = row["client_order_id"]
+    with _order_lease(conn, book_id, resolved_client_order_id, operation="RECONCILE", now=now):
+        return _reconcile_locked(
+            conn, book_id=book_id, runtime=runtime, config=config,
+            client_order_id=resolved_client_order_id, now=now,
+        )
+
+
+def _reconcile_locked(
+    conn: sqlite3.Connection, *, book_id: str, runtime: ExternalPaperRuntime,
+    config: PaperBooksConfiguration, client_order_id: str, now: datetime,
+) -> dict:
+    """Fail-safe wrapper: reconciliation must never exit on an unexpected
+    exception without persisting critical evidence first (Part 8). Known,
+    precisely-classified failures are handled inline inside
+    `_run_reconciliation` and never reach this except-clause; only a truly
+    unexpected exception (a bug, a malformed value that slipped past the
+    inline checks, a storage error) does.
+    """
+    try:
+        return _run_reconciliation(
+            conn, book_id=book_id, runtime=runtime, config=config, client_order_id=client_order_id, now=now,
+        )
+    except Exception as exc:
+        try:
+            return _persist_reconciliation(
+                conn, book_id=book_id, intent=None, client_order_id=client_order_id, fingerprint=None,
+                statuses=("RECONCILIATION_INTERNAL_ERROR",), details={}, now=now, config=config,
+            )
+        except Exception as persist_exc:
+            raise ExternalPaperError(
+                "RECONCILIATION_PERSIST_FAILED", "failed to persist critical reconciliation evidence",
+            ) from persist_exc
+
+
+def _run_reconciliation(
+    conn: sqlite3.Connection, *, book_id: str, runtime: ExternalPaperRuntime,
+    config: PaperBooksConfiguration, client_order_id: str, now: datetime,
+) -> dict:
     current = _current_event(conn, book_id, client_order_id)
     if current is None:
         return _persist_reconciliation(
@@ -793,6 +1150,14 @@ def reconcile_external_paper_order(
             details={}, now=now, config=config,
         )
     intent["_external_config_hash"] = config.config_hash
+    try:
+        risk_for_notional = repo.load_risk_decision(conn, intent["risk_decision_id"])
+        _validate_frozen_notional(intent, config, risk_for_notional)
+    except ExternalPaperError as exc:
+        return _persist_reconciliation(
+            conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
+            fingerprint=current["account_fingerprint"], statuses=(exc.code,), details={}, now=now, config=config,
+        )
     account_check = _account_check(runtime, book_id)
     fingerprint = account_check["account_fingerprint"]
     statuses: list[str] = []
@@ -806,11 +1171,16 @@ def reconcile_external_paper_order(
         statuses.append("UNKNOWN")
     lookup_result = "FOUND" if order else "NOT_FOUND"
     repo.save_external_lookup(conn, {
-        "lookup_id": _digest("peol_", [client_order_id, lookup_result, now.isoformat()], 40),
+        "lookup_id": _digest(
+            "peol_", [client_order_id, current["external_order_event_id"], lookup_result, request_id], 40,
+        ),
         "book_id": book_id, "paper_order_intent_id": intent["paper_order_intent_id"],
         "client_order_id": client_order_id, "account_fingerprint": fingerprint,
         "result": lookup_result, "authoritative": int(order is None and "UNKNOWN" not in statuses),
         "runtime_request_id": request_id, "created_at": now.isoformat(),
+        "attempt_number": current["attempt_number"], "ambiguous_event_id": current["external_order_event_id"],
+        "payload_hash": current["payload_hash"], "lookup_started_at": now.isoformat(),
+        "lookup_completed_at": now.isoformat(),
     })
     if order is None:
         if "UNKNOWN" not in statuses:
@@ -823,18 +1193,15 @@ def reconcile_external_paper_order(
         )
     order_valid = True
     try:
-        _validate_order_response(order, intent, client_order_id, fingerprint)
-    except ExternalPaperError as exc:
+        _validate_order_response(order, intent, client_order_id, fingerprint, now)
+    except ExternalPaperError:
         order_valid = False
-        mapping = {
-            "BROKER_ORDER_MISMATCH": "UNKNOWN", "MALFORMED_RUNTIME_RESPONSE": "UNKNOWN",
-        }
-        statuses.append(mapping.get(exc.code, "UNKNOWN"))
+        statuses.append("MALFORMED_BROKER_ORDER")
     try:
         broker_state = _state_from_order(order)
     except ExternalPaperError:
         broker_state = None
-        statuses.append("UNKNOWN")
+        statuses.append("BROKER_STATE_UNKNOWN")
     if order_valid and broker_state is not None and broker_state != current["new_state"] and broker_state in _TRANSITIONS.get(
         current["new_state"], set()
     ):
@@ -847,11 +1214,32 @@ def reconcile_external_paper_order(
         )
         current = _current_event(conn, book_id, client_order_id)
     if order_valid:
-        apply_external_fills(
-            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-            fingerprint=fingerprint, runtime=runtime, now=now,
-        )
-        _release_terminal_buy_reservation(conn, intent, broker_state or current["new_state"], now)
+        fill_error_codes = {
+            "MALFORMED_FILL", "FILL_QUANTITY_INVALID", "FILL_NAMESPACE_MISMATCH",
+            "FILL_PRICE_INVALID", "MALFORMED_RUNTIME_RESPONSE", "FUTURE_TIMESTAMP",
+        }
+        order_submitted_at = datetime.fromisoformat(
+            str(order["submitted_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        try:
+            apply_external_fills(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                fingerprint=fingerprint, runtime=runtime, now=now, not_before=order_submitted_at,
+            )
+        except ExternalPaperError as exc:
+            statuses.append("MALFORMED_BROKER_FILL" if exc.code in fill_error_codes else "FILL_APPLICATION_FAILED")
+        except Exception:
+            statuses.append("FILL_APPLICATION_FAILED")
+        else:
+            _release_terminal_reservation(conn, intent, broker_state or current["new_state"], now)
+            reservation_status = "RESERVATION_MISMATCH" if intent["side"] == "BUY" else "SHARE_RESERVATION_MISMATCH"
+            remaining = (
+                cash_ledger.remaining_buy_reservation(conn, book_id, intent["paper_order_intent_id"])
+                if intent["side"] == "BUY"
+                else positions.remaining_share_reservation(conn, book_id, intent["paper_order_intent_id"])
+            )
+            if remaining < 0:
+                statuses.append(reservation_status)
     if not client_order_id.startswith(f"epb-{book_id.lower()}-") or order.get("book_id") not in (None, book_id):
         statuses.append("BOOK_NAMESPACE_MISMATCH")
     if order.get("symbol") not in (None, intent["symbol"]):
@@ -868,6 +1256,11 @@ def reconcile_external_paper_order(
     broker_filled = Decimal(str(order.get("filled_quantity", local_fill_qty)))
     if local_fill_qty != broker_filled:
         statuses.append("FILL_QUANTITY_MISMATCH")
+    duplicate_details = _detect_duplicate_broker_order(
+        runtime, book_id=book_id, intent=intent, client_order_id=client_order_id, order=order,
+    )
+    if duplicate_details:
+        statuses.append("BROKER_ORDER_DUPLICATE")
     try:
         broker_positions_payload = runtime.get_external_positions(book_id)
         broker_account = runtime.get_external_account_snapshot(book_id)
@@ -896,6 +1289,10 @@ def reconcile_external_paper_order(
             statuses.append("POSITION_MISMATCH")
         if cash_ledger.settled_cash(conn, book_id) != Decimal(str(broker_account["cash"])):
             statuses.append("CASH_MISMATCH")
+    except ExternalPaperError:
+        statuses.append("UNKNOWN")
+    except (InvalidOperation, ValueError, TypeError, KeyError, AttributeError):
+        statuses.append("RECONCILIATION_INTERNAL_ERROR")
     except Exception:
         statuses.append("UNKNOWN")
     if not statuses:
@@ -903,7 +1300,10 @@ def reconcile_external_paper_order(
     return _persist_reconciliation(
         conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
         fingerprint=fingerprint, statuses=tuple(dict.fromkeys(statuses)),
-        details={"local_fill_quantity": str(local_fill_qty), "broker_filled_quantity": str(broker_filled)},
+        details={
+            "local_fill_quantity": str(local_fill_qty), "broker_filled_quantity": str(broker_filled),
+            **duplicate_details,
+        },
         now=now, config=config,
     )
 

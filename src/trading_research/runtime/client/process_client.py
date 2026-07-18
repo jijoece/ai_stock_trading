@@ -307,3 +307,10 @@ class RuntimeClient:
 
     def get_external_account_snapshot(self, book_id: str) -> dict:
         return self._request("GET_ACCOUNT_SNAPSHOT", {"book_id": book_id})
+
+    def list_recent_external_orders(self, book_id: str, *, limit: int = 50) -> list[dict]:
+        """Bounded read-only duplicate-detection support (Part 9). Distinct
+        method name from the pre-existing `list_recent_orders(limit)` above,
+        which is book-agnostic and takes a positional `limit` — reusing that
+        name here would silently pass `book_id` where `limit` is expected."""
+        return self._request("LIST_RECENT_ORDERS", {"book_id": book_id, "limit": limit})["orders"]

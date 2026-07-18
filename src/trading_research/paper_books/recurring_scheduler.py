@@ -237,8 +237,29 @@ def validate_activation_review(
 
     reasons: list[str] = []
     campaign = pb_repo.load_soak_campaign(conn, review["campaign_id"])
-    if campaign is None or campaign["status"] != CAMPAIGN_COMPLETED_READY:
-        reasons.append("activation review does not belong to a completed ready campaign")
+    if campaign is None:
+        reasons.append(f"activation review references an unknown campaign {review['campaign_id']!r}")
+
+    attempt_id = review.get("campaign_attempt_id")
+    attempt = pb_repo.load_soak_campaign_attempt(conn, attempt_id) if attempt_id else None
+    if attempt is None:
+        reasons.append(f"activation review references an unknown campaign attempt {attempt_id!r}")
+    elif attempt["campaign_id"] != review["campaign_id"]:
+        reasons.append("activation review's campaign attempt does not belong to the review's campaign")
+    else:
+        if attempt["status"] != CAMPAIGN_COMPLETED_READY:
+            reasons.append(
+                f"campaign attempt status is {attempt['status']!r}, not a terminal "
+                f"{CAMPAIGN_COMPLETED_READY!r} attempt"
+            )
+        if (attempt["manifest_hash"] != review["campaign_manifest_hash"]
+                or attempt["config_hash"] != review.get("config_hash")):
+            reasons.append("activation review hashes do not match the referenced campaign attempt")
+
+    latest_reviews = pb_repo.list_soak_activation_reviews(conn, review["campaign_id"])
+    if latest_reviews and latest_reviews[-1]["activation_review_id"] != activation_review_id:
+        reasons.append(f"activation review {activation_review_id!r} has been superseded by a newer review")
+
     if review["final_recommendation"] != RECOMMENDATION_READY:
         reasons.append(f"final recommendation is {review['final_recommendation']!r}, not {RECOMMENDATION_READY}")
 

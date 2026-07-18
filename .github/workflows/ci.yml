@@ -1,0 +1,119 @@
+name: CI
+
+# Offline-only CI: no credentials are configured anywhere in this workflow,
+# so every opt-in real-provider/broker smoke test (gated on RUN_*_TESTS env
+# vars that are never set here) stays skipped automatically.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  main-tests:
+    name: main-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Run main test suite
+        run: pytest tests/ -q --tb=short
+
+  paper-runtime-tests:
+    name: paper-runtime-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install paper_runtime dependencies
+        working-directory: paper_runtime
+        run: pip install -e ".[dev]"
+      - name: Run paper_runtime test suite
+        working-directory: paper_runtime
+        run: pytest tests/ -q --tb=short
+
+  type-check:
+    name: type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install main package + pyright
+        run: |
+          pip install -e ".[dev]"
+          pip install pyright
+      # Non-blocking: the codebase has a large pre-existing pyright error
+      # baseline (mostly implicit-Optional narrowing in test fixtures,
+      # predating this milestone) that a hard gate would fail on
+      # unconditionally. This still runs on every PR and surfaces the
+      # count so regressions are visible, without turning every build red
+      # for a pre-existing condition unrelated to the change under review.
+      - name: Run pyright (main package)
+        run: pyright
+        continue-on-error: true
+      - name: Install paper_runtime package
+        working-directory: paper_runtime
+        run: pip install -e ".[dev]"
+      - name: Run pyright (paper_runtime)
+        working-directory: paper_runtime
+        run: pyright
+        continue-on-error: true
+
+  migration-smoke:
+    name: migration-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+      - name: Fresh database schema applies cleanly
+        run: |
+          python -c "
+          import tempfile
+          from pathlib import Path
+          from trading_research.storage.database import connect
+
+          with tempfile.TemporaryDirectory() as tmp:
+              conn = connect(Path(tmp) / 'fresh.sqlite3')
+              tables = {
+                  row[0] for row in conn.execute(
+                      \"SELECT name FROM sqlite_master WHERE type='table'\"
+                  ).fetchall()
+              }
+              assert 'paper_external_order_leases' in tables
+              assert 'paper_external_position_reservation_events' in tables
+              conn.close()
+          print('fresh schema smoke OK')
+          "
+      - name: Reopening an existing database re-applies additive upgrades idempotently
+        run: |
+          python -c "
+          import tempfile
+          from pathlib import Path
+          from trading_research.storage.database import connect
+
+          with tempfile.TemporaryDirectory() as tmp:
+              db_path = Path(tmp) / 'existing.sqlite3'
+              first = connect(db_path)
+              first.close()
+              second = connect(db_path)
+              cols = {
+                  row[1] for row in second.execute(
+                      'PRAGMA table_info(paper_external_order_events)'
+                  ).fetchall()
+              }
+              assert 'scope_sequence' in cols
+              second.close()
+          print('upgrade schema smoke OK')
+          "

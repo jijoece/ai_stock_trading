@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 
-from trading_research.paper_books import cash_ledger, execution
+from trading_research.paper_books import cash_ledger, execution, positions
 from trading_research.paper_books.config import (
     ExecutionSection, ExternalBrokerSection, PaperBookDefinition,
     PaperBooksConfiguration, RiskSection, ScheduledIntegrationSection, ValuationSection,
@@ -25,7 +25,7 @@ NOW = datetime(2026, 7, 15, 20, 0, tzinfo=timezone.utc)
 FINGERPRINT = "acct_0123456789abcdef0123456789abcdef"
 
 
-def _config(*, submission: bool = True, external_enabled: bool = True, books=("BASELINE",)):
+def _config(*, submission: bool = True, external_enabled: bool = True, books=("BASELINE",), maximum_retry_attempts=1):
     return PaperBooksConfiguration(
         version=1, enabled=True,
         baseline=PaperBookDefinition(True, "BASELINE", Decimal("100000")),
@@ -39,7 +39,7 @@ def _config(*, submission: bool = True, external_enabled: bool = True, books=("B
         scheduled_integration=ScheduledIntegrationSection(False), config_hash="cfg-m11", raw={},
         external_broker=ExternalBrokerSection(
             external_enabled, "alpaca_paper", submission, tuple(books), True, 300,
-            Decimal("100"), ("limit",), ("day",), 1,
+            Decimal("100"), ("limit",), ("day",), maximum_retry_attempts,
         ),
     )
 
@@ -71,6 +71,29 @@ def _seed(conn):
     return repo.load_order_intent(conn, "BASELINE", "intent-1")
 
 
+def _seed_sell(conn, quantity=Decimal("10"), *, sell_quantity=Decimal("4"), limit_price=Decimal("20")):
+    """Seed a confirmed long AAPL position plus one approved external SELL intent."""
+    _seed(conn)
+    positions.apply_buy_fill(conn, "BASELINE", "AAPL", "seed-fill", quantity, Decimal("30"), NOW)
+    intent = PaperBookOrderIntent(
+        paper_order_intent_id="intent-sell", book_id="BASELINE", experiment_arm="BASELINE",
+        cycle_id="cycle-1", recommendation_id="rec-1", symbol="AAPL", side="SELL",
+        order_type="LIMIT", quantity=sell_quantity, limit_price=limit_price,
+        notional_usd=sell_quantity * limit_price, time_in_force="DAY", as_of=NOW,
+        risk_decision_id="risk-1", portfolio_snapshot_id="snap-1", config_hash="cfg-m11",
+        created_at=NOW,
+    )
+    repo.save_order_intent(conn, intent)
+    return repo.load_order_intent(conn, "BASELINE", "intent-sell")
+
+
+def _preview_sell(conn, runtime, cfg):
+    return preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-sell", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+
+
 class FakeRuntime:
     def __init__(self):
         self.submit_calls = 0
@@ -82,6 +105,7 @@ class FakeRuntime:
         self.fills = []
         self.cash = Decimal("100000")
         self.position = Decimal("0")
+        self.recent_orders = []
 
     def account_check(self, book_id):
         return {
@@ -125,18 +149,22 @@ class FakeRuntime:
     def add_fill(self, quantity):
         quantity = Decimal(str(quantity))
         index = len(self.fills) + 1
+        side = self.order["side"]
+        price = str(self.order["limit_price"])
         self.fills.append({
             "fill_id": f"fill-{index}", "broker_order_id": "broker-1",
             "client_order_id": self.order["client_order_id"], "book_id": "BASELINE",
-            "symbol": "AAPL", "side": "BUY", "quantity": str(quantity), "price": "40",
+            "symbol": "AAPL", "side": side, "quantity": str(quantity), "price": price,
             "filled_at": NOW.isoformat(), "account_fingerprint": FINGERPRINT,
         })
-        self.cash -= quantity * Decimal("40")
-        self.position += quantity
+        delta_cash = quantity * Decimal(price)
+        self.cash += delta_cash if side == "SELL" else -delta_cash
+        self.position += quantity if side == "BUY" else -quantity
         cumulative = sum(Decimal(fill["quantity"]) for fill in self.fills)
+        total_quantity = Decimal(str(self.order["quantity"]))
         self.order["filled_quantity"] = int(cumulative)
-        self.order["average_fill_price"] = "40"
-        self.order["status"] = "FILLED" if cumulative == 2 else "PARTIALLY_FILLED"
+        self.order["average_fill_price"] = price
+        self.order["status"] = "FILLED" if cumulative == total_quantity else "PARTIALLY_FILLED"
 
     def get_external_positions(self, book_id):
         positions = [] if self.position == 0 else [{
@@ -156,6 +184,9 @@ class FakeRuntime:
         self.cancel_calls += 1
         self.order["status"] = "CANCELLED"
         return dict(self.order)
+
+    def list_recent_external_orders(self, book_id, *, limit=50):
+        return [dict(o) for o in self.recent_orders][:limit]
 
 
 def _preview(conn, runtime, cfg):
@@ -258,6 +289,771 @@ def test_authoritative_not_found_allows_one_explicit_retry():
             conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
             reason="second retry blocked", runtime=runtime, config=cfg, clock=lambda: NOW,
         )
+
+
+def test_consumed_lookup_cannot_authorize_a_second_retry_until_fresh_evidence():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(maximum_retry_attempts=2), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN  # attempt 0 UNKNOWN
+
+    lookup0 = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert lookup0["status"] == "ORDER_MISSING_AT_BROKER"  # lookup 0 authoritative NOT_FOUND
+
+    retry1 = retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="retry 1", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert retry1["status"] == STATE_UNKNOWN  # retry 1 also ambiguous; lookup 0 now consumed
+
+    with pytest.raises(ExternalPaperError, match="fresh, unconsumed"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry 2 without fresh lookup", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+    lookup1 = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert lookup1["status"] == "ORDER_MISSING_AT_BROKER"  # fresh lookup 1 for attempt 1
+
+    runtime.raise_submit = False
+    retry2 = retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="retry 2 with fresh lookup", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert retry2["status"] == STATE_SUBMITTED
+    assert runtime.submit_calls == 3
+
+
+def test_stale_and_mismatched_lookup_evidence_rejected():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    # a non-authoritative NOT_FOUND (from an uncertain runtime request) never authorizes a retry.
+    repo.save_external_lookup(conn, {
+        "lookup_id": "lookup-nonauthoritative", "book_id": "BASELINE",
+        "paper_order_intent_id": "intent-1", "client_order_id": preview["client_order_id"],
+        "account_fingerprint": FINGERPRINT, "result": "NOT_FOUND", "authoritative": 0,
+        "runtime_request_id": "req-1", "created_at": NOW.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError, match="fresh, unconsumed"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry blocked by nonauthoritative lookup", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+    # a lookup tied to a different (stale) ambiguous event never authorizes this attempt.
+    current = repo.load_latest_external_order_event(conn, "BASELINE", preview["client_order_id"])
+    repo.save_external_lookup(conn, {
+        "lookup_id": "lookup-stale-event", "book_id": "BASELINE",
+        "paper_order_intent_id": "intent-1", "client_order_id": preview["client_order_id"],
+        "account_fingerprint": FINGERPRINT, "result": "NOT_FOUND", "authoritative": 1,
+        "runtime_request_id": "req-2", "created_at": NOW.isoformat(),
+        "attempt_number": current["attempt_number"], "ambiguous_event_id": "some-other-event-id",
+        "payload_hash": current["payload_hash"], "lookup_started_at": NOW.isoformat(),
+        "lookup_completed_at": NOW.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError, match="fresh, unconsumed"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry blocked by stale-event lookup", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+
+def test_concurrent_submit_blocked_by_order_lease_performs_no_runtime_mutation():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    client_order_id = preview["client_order_id"]
+    lease_key = f"BASELINE:{client_order_id}"
+    held = repo.acquire_external_order_lease(
+        conn, lease_key=lease_key, book_id="BASELINE", client_order_id=client_order_id,
+        owner_id="other-caller", operation="SUBMIT", now=NOW.isoformat(),
+        expires_at=(NOW + timedelta(seconds=30)).isoformat(),
+    )
+    assert held is True
+    with pytest.raises(ExternalPaperError, match="lease"):
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+            operator="alice", reason="blocked by concurrent lease", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert runtime.submit_calls == 0
+
+
+def test_stale_order_lease_recovers_for_new_owner():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    client_order_id = preview["client_order_id"]
+    lease_key = f"BASELINE:{client_order_id}"
+    expired_at = (NOW - timedelta(seconds=1)).isoformat()
+    repo.acquire_external_order_lease(
+        conn, lease_key=lease_key, book_id="BASELINE", client_order_id=client_order_id,
+        owner_id="dead-owner", operation="SUBMIT", now=(NOW - timedelta(seconds=60)).isoformat(), expires_at=expired_at,
+    )
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="recovers stale lease", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_SUBMITTED
+    assert runtime.submit_calls == 1
+
+
+def test_wrong_owner_cannot_release_order_lease():
+    conn = connect(":memory:")
+    _seed(conn)
+    repo.acquire_external_order_lease(
+        conn, lease_key="BASELINE:cid", book_id="BASELINE", client_order_id="cid",
+        owner_id="real-owner", operation="SUBMIT", now=NOW.isoformat(),
+        expires_at=(NOW + timedelta(seconds=30)).isoformat(),
+    )
+    released = repo.release_external_order_lease(conn, lease_key="BASELINE:cid", owner_id="wrong-owner", now=NOW.isoformat())
+    assert released is False
+    released = repo.release_external_order_lease(conn, lease_key="BASELINE:cid", owner_id="real-owner", now=NOW.isoformat())
+    assert released is True
+
+
+def test_event_chain_cannot_fork_on_duplicate_scope_sequence():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    current = repo.load_latest_external_order_event(conn, "BASELINE", preview["client_order_id"])
+    assert current["scope_sequence"] == 0
+    forked = dict(current)
+    forked["external_order_event_id"] = "forked-event-id"
+    forked["new_state"] = "SUBMISSION_REQUESTED"
+    with pytest.raises(Exception):
+        conn.execute(
+            "INSERT INTO paper_external_order_events "
+            "(external_order_event_id, external_order_scope_id, book_id, paper_order_intent_id, "
+            "client_order_id, account_fingerprint, previous_state, new_state, payload_hash, quantity, "
+            "limit_price, operator, reason, created_at, policy_version, config_hash, attempt_number, "
+            "scope_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                forked["external_order_event_id"], forked["external_order_scope_id"], forked["book_id"],
+                forked["paper_order_intent_id"], forked["client_order_id"], forked["account_fingerprint"],
+                forked["previous_state"], forked["new_state"], forked["payload_hash"], forked["quantity"],
+                forked["limit_price"], forked["operator"], forked["reason"], forked["created_at"],
+                forked["policy_version"], forked["config_hash"], forked["attempt_number"],
+                forked["scope_sequence"],
+            ),
+        )
+        conn.commit()
+
+
+def test_malformed_broker_fill_persists_critical_reconciliation():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    # malformed fill: negative quantity is rejected by apply_external_fills as FILL_QUANTITY_INVALID.
+    runtime.fills = [{
+        "fill_id": "fill-bad", "broker_order_id": "broker-1", "client_order_id": preview["client_order_id"],
+        "book_id": "BASELINE", "symbol": "AAPL", "side": "BUY", "quantity": "-1", "price": "40",
+        "filled_at": NOW.isoformat(), "account_fingerprint": FINGERPRINT,
+    }]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_FILL"
+    assert result["critical"] == 1
+    # blocked from further external submission by the persisted critical evidence.
+    with pytest.raises(ExternalPaperError, match="critical"):
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+            operator="alice", reason="blocked by critical reconciliation", runtime=runtime, config=cfg,
+            clock=lambda: NOW,
+        )
+
+
+def test_malformed_broker_order_persists_critical_reconciliation():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.order["quantity"] = 999  # no longer matches the frozen approved intent
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_ORDER"
+    assert result["critical"] == 1
+
+
+def test_fill_application_internal_failure_persists_critical_reconciliation(monkeypatch):
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.add_fill(1)
+    import trading_research.paper_books.external_broker as external_broker_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("unexpected failure while applying a fill")
+
+    monkeypatch.setattr(external_broker_module.positions, "apply_buy_fill", _boom)
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "FILL_APPLICATION_FAILED"
+    assert result["critical"] == 1
+
+
+def test_reconciliation_internal_error_from_numeric_conversion_is_critical(monkeypatch):
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.get_external_account_snapshot = lambda book_id: {
+        "provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+        "account_fingerprint": FINGERPRINT, "cash": "not-a-number", "equity": "100000",
+        "buying_power": None, "currency": "USD", "as_of": NOW.isoformat(),
+    }
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "RECONCILIATION_INTERNAL_ERROR"
+    assert result["critical"] == 1
+
+
+def test_one_matching_broker_order_is_not_flagged_duplicate():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.recent_orders = [dict(runtime.order)]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MATCHED"
+    assert result["critical"] == 0
+
+
+def test_same_client_order_id_mapped_to_two_broker_orders_is_duplicate():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    duplicate = dict(runtime.order)
+    duplicate["broker_order_id"] = "broker-DUPLICATE"
+    runtime.recent_orders = [dict(runtime.order), duplicate]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "BROKER_ORDER_DUPLICATE"
+    assert result["critical"] == 1
+    assert "broker-DUPLICATE" in result["details"]["duplicate_broker_order_ids"]
+
+    # later external submissions in this book are blocked by the critical evidence.
+    with pytest.raises(ExternalPaperError, match="critical"):
+        preview_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+
+def test_materially_identical_order_under_another_client_id_is_duplicate():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    shadow = dict(runtime.order)
+    shadow["client_order_id"] = "epb-baseline-shadowdupe0000000000000000"
+    shadow["broker_order_id"] = "broker-shadow"
+    runtime.recent_orders = [dict(runtime.order), shadow]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "BROKER_ORDER_DUPLICATE"
+    assert result["critical"] == 1
+    assert result["details"]["duplicate_client_order_id"] == shadow["client_order_id"]
+
+
+def test_unrelated_recent_order_is_not_flagged_duplicate():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    unrelated = dict(runtime.order)
+    unrelated["client_order_id"] = "epb-baseline-unrelated00000000000000000"
+    unrelated["broker_order_id"] = "broker-unrelated"
+    unrelated["symbol"] = "MSFT"
+    unrelated["quantity"] = 5
+    runtime.recent_orders = [dict(runtime.order), unrelated]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MATCHED"
+    assert result["critical"] == 0
+
+
+def test_future_intent_as_of_is_rejected():
+    conn = connect(":memory:")
+    _seed(conn)
+    future_as_of = NOW + timedelta(hours=1)
+    conn.execute(
+        "UPDATE paper_book_orders SET as_of = ? WHERE paper_order_intent_id = 'intent-1'",
+        (future_as_of.isoformat(),),
+    )
+    conn.commit()
+    cfg, runtime = _config(), FakeRuntime()
+    with pytest.raises(ExternalPaperError, match="future"):
+        _preview(conn, runtime, cfg)
+
+
+def test_broker_order_submitted_after_updated_is_rejected():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.order["updated_at"] = (NOW - timedelta(seconds=5)).isoformat()
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_ORDER"
+    assert result["critical"] == 1
+
+
+def test_broker_order_equivalent_offset_timestamps_are_accepted():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+
+    def _make_order_offset(payload):
+        order = FakeRuntime._make_order(runtime, payload)
+        # same instant as NOW, expressed with a non-UTC numeric offset.
+        offset_time = NOW.astimezone(timezone(timedelta(hours=-5)))
+        order["submitted_at"] = offset_time.isoformat()
+        order["updated_at"] = offset_time.isoformat()
+        return order
+
+    runtime._make_order = _make_order_offset
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_SUBMITTED
+
+
+def test_broker_order_naive_timestamp_is_rejected():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.order["submitted_at"] = NOW.replace(tzinfo=None).isoformat()
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_ORDER"
+    assert result["critical"] == 1
+
+
+def test_future_fill_timestamp_persists_critical_reconciliation():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.fills = [{
+        "fill_id": "fill-future", "broker_order_id": "broker-1", "client_order_id": preview["client_order_id"],
+        "book_id": "BASELINE", "symbol": "AAPL", "side": "BUY", "quantity": "2", "price": "40",
+        "filled_at": (NOW + timedelta(hours=1)).isoformat(), "account_fingerprint": FINGERPRINT,
+    }]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_FILL"
+    assert result["critical"] == 1
+
+
+@pytest.mark.parametrize("bad_quantity", ["1.5", "NaN", "Infinity", "-Infinity"])
+def test_fractional_or_nonfinite_broker_fill_quantity_rejected(bad_quantity):
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.fills = [{
+        "fill_id": "fill-bad-qty", "broker_order_id": "broker-1", "client_order_id": preview["client_order_id"],
+        "book_id": "BASELINE", "symbol": "AAPL", "side": "BUY", "quantity": bad_quantity, "price": "40",
+        "filled_at": NOW.isoformat(), "account_fingerprint": FINGERPRINT,
+    }]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_FILL"
+    assert result["critical"] == 1
+
+
+@pytest.mark.parametrize("bad_quantity", ["1.5", "NaN", "Infinity"])
+def test_fractional_or_nonfinite_broker_order_quantity_rejected(bad_quantity):
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.order["quantity"] = bad_quantity
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_ORDER"
+    assert result["critical"] == 1
+
+
+def test_corrupted_low_notional_with_high_quantity_times_price_fails_closed():
+    conn = connect(":memory:")
+    _seed(conn)
+    # A hand-crafted row simulating a corrupted/tampered intent: notional_usd
+    # stays low (80, matching the approved risk decision) but quantity *
+    # limit_price would actually be 400 if the stored notional were trusted
+    # naively instead of recomputed.
+    conn.execute(
+        "INSERT INTO paper_book_orders (book_id, paper_order_intent_id, experiment_arm, cycle_id, "
+        "recommendation_id, symbol, side, order_type, quantity, limit_price, notional_usd, "
+        "time_in_force, as_of, risk_decision_id, portfolio_snapshot_id, config_hash, created_at, status) "
+        "VALUES ('BASELINE', 'intent-corrupted', 'BASELINE', 'cycle-1', 'rec-1', 'AAPL', 'BUY', 'LIMIT', "
+        "'10', '40', '80', 'DAY', ?, 'risk-1', 'snap-1', 'cfg-m11', ?, 'PENDING_SUBMISSION')",
+        (NOW.isoformat(), NOW.isoformat()),
+    )
+    conn.commit()
+    cfg, runtime = _config(), FakeRuntime()
+    with pytest.raises(ExternalPaperError, match="recomputed notional"):
+        preview_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-corrupted", operator="alice",
+            runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+
+class _TransactionAssertingRuntime(FakeRuntime):
+    """Wraps every runtime call to assert the connection has no open write
+    transaction at call time (Part 15: the runtime call must never happen
+    inside a held DB transaction)."""
+
+    def __init__(self, conn):
+        super().__init__()
+        self._conn = conn
+
+    def _assert_no_open_transaction(self, label):
+        assert self._conn.in_transaction is False, f"{label} was called with an open transaction"
+
+    def account_check(self, book_id):
+        self._assert_no_open_transaction("account_check")
+        return super().account_check(book_id)
+
+    def preview_limit_order(self, payload):
+        self._assert_no_open_transaction("preview_limit_order")
+        return super().preview_limit_order(payload)
+
+    def submit_limit_order(self, payload):
+        self._assert_no_open_transaction("submit_limit_order")
+        return super().submit_limit_order(payload)
+
+    def get_order_by_client_order_id(self, book_id, client_order_id):
+        self._assert_no_open_transaction("get_order_by_client_order_id")
+        return super().get_order_by_client_order_id(book_id, client_order_id)
+
+    def list_order_fills(self, book_id, client_order_id):
+        self._assert_no_open_transaction("list_order_fills")
+        return super().list_order_fills(book_id, client_order_id)
+
+    def cancel_external_order(self, book_id, client_order_id, account_fingerprint):
+        self._assert_no_open_transaction("cancel_external_order")
+        return super().cancel_external_order(book_id, client_order_id, account_fingerprint)
+
+    def get_external_positions(self, book_id):
+        self._assert_no_open_transaction("get_external_positions")
+        return super().get_external_positions(book_id)
+
+    def get_external_account_snapshot(self, book_id):
+        self._assert_no_open_transaction("get_external_account_snapshot")
+        return super().get_external_account_snapshot(book_id)
+
+
+def test_runtime_calls_never_occur_inside_an_open_db_transaction():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), _TransactionAssertingRuntime(conn)
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.add_fill(1)
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert conn.in_transaction is False
+
+
+def test_cancel_runtime_call_never_occurs_inside_an_open_db_transaction():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), _TransactionAssertingRuntime(conn)
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    cancel_external_paper_order(
+        conn, book_id="BASELINE", client_order_id=preview["client_order_id"], operator="alice",
+        reason="risk-reducing cancellation", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert conn.in_transaction is False
+
+
+def test_queue_status_derived_from_events_never_stuck_awaiting_after_submission():
+    from trading_research.paper_books.external_broker import derive_external_queue_status
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    repo.enqueue_external_submission(
+        conn, queue_id="q1", book_id="BASELINE", paper_order_intent_id="intent-1",
+        source="RECURRING_LOCAL_PAPER", created_at=NOW.isoformat(),
+    )
+    before = derive_external_queue_status(conn, book_id="BASELINE", paper_order_intent_id="intent-1")
+    assert before["status"] == "AWAITING_OPERATOR_EXTERNAL_SUBMISSION"
+
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    after = derive_external_queue_status(conn, book_id="BASELINE", paper_order_intent_id="intent-1")
+    assert after["status"] == STATE_SUBMITTED
+    assert after["client_order_id"] == preview["client_order_id"]
+
+
+def test_queue_status_reflects_blocked_by_reconciliation_for_nonterminal_order():
+    from trading_research.paper_books.external_broker import derive_external_queue_status
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.order["quantity"] = 999  # forces a critical MALFORMED_BROKER_ORDER reconciliation
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    status = derive_external_queue_status(conn, book_id="BASELINE", paper_order_intent_id="intent-1")
+    assert status["status"] == "BLOCKED_BY_RECONCILIATION"
+
+
+def test_queue_status_stays_terminal_after_full_fill():
+    from trading_research.paper_books.external_broker import derive_external_queue_status
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.add_fill(2)
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    status = derive_external_queue_status(conn, book_id="BASELINE", paper_order_intent_id="intent-1")
+    assert status["status"] == STATE_FILLED
+
+
+def test_integration_scenario_sell_isolation_partial_fill_cancel_and_reopen():
+    """Part 19 integration scenario: long 10 -> external SELL 10 submitted ->
+    shares reserved -> a second exit cycle creates no second SELL -> broker
+    partially fills 4 -> reservation remaining 6 -> order cancelled ->
+    remaining 6 released -> position now 6."""
+    from trading_research.paper_books.lifecycle import _has_unresolved_pending_sell
+
+    conn = connect(":memory:")
+    _seed_sell(conn, quantity=Decimal("10"), sell_quantity=Decimal("10"), limit_price=Decimal("9"))
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview_sell(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-sell", preview_id=preview["preview_id"],
+        operator="alice", reason="closing sell", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == Decimal("10")
+
+    # a second exit-evaluation cycle must not create a second SELL for this symbol.
+    assert _has_unresolved_pending_sell(conn, "BASELINE", "AAPL") is True
+
+    runtime.add_fill(4)
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == Decimal("6")
+    position = repo.load_position(conn, "BASELINE", "AAPL")
+    assert Decimal(position["quantity"]) == Decimal("6")
+
+    cancelled = cancel_external_paper_order(
+        conn, book_id="BASELINE", client_order_id=preview["client_order_id"], operator="alice",
+        reason="risk-reducing cancellation", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert cancelled["status"] == "CANCELLED"
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == 0
+    position = repo.load_position(conn, "BASELINE", "AAPL")
+    assert Decimal(position["quantity"]) == Decimal("6")
+    assert Decimal(position["available_quantity"]) == Decimal("6")
+
+    # the exit is now fully resolved — a later exit cycle could create a new SELL.
+    assert _has_unresolved_pending_sell(conn, "BASELINE", "AAPL") is False
+
+
+def test_ambiguous_sell_submission_keeps_shares_reserved():
+    conn = connect(":memory:")
+    _seed_sell(conn, quantity=Decimal("10"), sell_quantity=Decimal("4"))
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview_sell(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-sell", preview_id=preview["preview_id"],
+        operator="alice", reason="closing sell", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == Decimal("4")
+
+
+def test_retry_rejects_lookup_with_mismatched_payload_hash():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    current = repo.load_latest_external_order_event(conn, "BASELINE", preview["client_order_id"])
+    repo.save_external_lookup(conn, {
+        "lookup_id": "lookup-bad-payload", "book_id": "BASELINE",
+        "paper_order_intent_id": "intent-1", "client_order_id": preview["client_order_id"],
+        "account_fingerprint": FINGERPRINT, "result": "NOT_FOUND", "authoritative": 1,
+        "runtime_request_id": "req-3", "created_at": NOW.isoformat(),
+        "attempt_number": current["attempt_number"], "ambiguous_event_id": current["external_order_event_id"],
+        "payload_hash": "wrong-payload-hash", "lookup_started_at": NOW.isoformat(),
+        "lookup_completed_at": NOW.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError, match="fresh, unconsumed"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry blocked by payload mismatch", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+
+
+def test_fill_before_submitted_at_is_rejected():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    stale_fill_time = NOW - timedelta(days=1)
+    runtime.fills = [{
+        "fill_id": "fill-before-submit", "broker_order_id": "broker-1",
+        "client_order_id": preview["client_order_id"], "book_id": "BASELINE", "symbol": "AAPL",
+        "side": "BUY", "quantity": "2", "price": "40", "filled_at": stale_fill_time.isoformat(),
+        "account_fingerprint": FINGERPRINT,
+    }]
+    runtime.order["submitted_at"] = NOW.isoformat()
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "MALFORMED_BROKER_FILL"
+    assert result["critical"] == 1
 
 
 def test_identity_is_deterministic_and_book_scoped():
@@ -368,6 +1164,144 @@ def test_critical_reconciliation_stays_active_per_order_scope():
     })
     with pytest.raises(ExternalPaperError, match="latest external reconciliation is critical"):
         _safety_checks(conn, "BASELINE")
+
+
+class ImmediateFilledRuntime(FakeRuntime):
+    """Broker reports FILLED on submit while /fills lags empty (Part 2 gap)."""
+
+    def _make_order(self, payload):
+        order = super()._make_order(payload)
+        order.update(status="FILLED", filled_quantity=2, average_fill_price="40")
+        return order
+
+
+def test_broker_filled_with_no_fills_retains_reservation_and_is_critical():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), ImmediateFilledRuntime()
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_FILLED
+    assert repo.list_fills_for_intent(conn, "BASELINE", "intent-1") == []
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == Decimal("80")
+    assert result["reconciliation"]["critical"] == 1
+    assert "FILL_QUANTITY_MISMATCH" in result["reconciliation"]["statuses"]
+
+    # delayed fills arrive later; reconciliation settles and releases in full.
+    runtime.fills = [{
+        "fill_id": "fill-1", "broker_order_id": "broker-1", "client_order_id": preview["client_order_id"],
+        "book_id": "BASELINE", "symbol": "AAPL", "side": "BUY", "quantity": "2", "price": "40",
+        "filled_at": NOW.isoformat(), "account_fingerprint": FINGERPRINT,
+    }]
+    runtime.cash, runtime.position = Decimal("99920"), Decimal("2")
+    settled = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert settled["status"] == "MATCHED"
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == 0
+    assert cash_ledger.available_cash(conn, "BASELINE") == Decimal("99920")
+
+
+def test_partial_fill_preserves_remaining_reservation_then_cancel_releases_only_remainder():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == Decimal("80")
+    runtime.add_fill(1)
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert cash_ledger.remaining_buy_reservation(conn, "BASELINE", "intent-1") == Decimal("40")
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == Decimal("40")
+
+    cancelled = cancel_external_paper_order(
+        conn, book_id="BASELINE", client_order_id=preview["client_order_id"], operator="alice",
+        reason="risk-reducing cancellation", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert cancelled["status"] == "CANCELLED"
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == 0
+    assert cash_ledger.available_cash(conn, "BASELINE") == Decimal("99960")
+
+
+def test_repeated_reconciliation_does_not_over_release_reservation():
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.add_fill(2)
+    for _ in range(3):
+        reconcile_external_paper_order(
+            conn, book_id="BASELINE", runtime=runtime, config=cfg,
+            client_order_id=preview["client_order_id"], clock=lambda: NOW,
+        )
+    assert cash_ledger.reserved_cash(conn, "BASELINE") == 0
+    assert cash_ledger.available_cash(conn, "BASELINE") == Decimal("99920")
+
+
+def test_external_sell_reserves_shares_and_blocks_second_sell():
+    conn = connect(":memory:")
+    _seed_sell(conn, sell_quantity=Decimal("4"))
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview_sell(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-sell", preview_id=preview["preview_id"],
+        operator="alice", reason="closing sell", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    position = repo.load_position(conn, "BASELINE", "AAPL")
+    assert Decimal(position["reserved_quantity"]) == Decimal("4")
+    assert Decimal(position["available_quantity"]) == Decimal("6")
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == Decimal("4")
+
+    # a second SELL for more than the unreserved remainder fails closed.
+    with pytest.raises(positions.InsufficientPositionError):
+        positions.reserve_shares_for_sell(
+            conn, "BASELINE", "AAPL", "intent-sell-2", "some-client-id", Decimal("7"), NOW,
+        )
+
+
+def test_partial_sell_fill_preserves_remainder_then_cancel_releases_rest():
+    conn = connect(":memory:")
+    _seed_sell(conn, sell_quantity=Decimal("4"))
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview_sell(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-sell", preview_id=preview["preview_id"],
+        operator="alice", reason="closing sell", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.add_fill(1)
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == Decimal("3")
+    position = repo.load_position(conn, "BASELINE", "AAPL")
+    assert Decimal(position["quantity"]) == Decimal("9")
+    assert Decimal(position["reserved_quantity"]) == Decimal("3")
+    assert Decimal(position["available_quantity"]) == Decimal("6")
+
+    cancelled = cancel_external_paper_order(
+        conn, book_id="BASELINE", client_order_id=preview["client_order_id"], operator="alice",
+        reason="risk-reducing cancellation", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert cancelled["status"] == "CANCELLED"
+    position = repo.load_position(conn, "BASELINE", "AAPL")
+    assert Decimal(position["reserved_quantity"]) == 0
+    assert Decimal(position["available_quantity"]) == Decimal("9")
+    assert positions.remaining_share_reservation(conn, "BASELINE", "intent-sell") == 0
 
 
 def test_external_evidence_permanently_blocks_local_simulated_fill():
