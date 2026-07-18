@@ -18,6 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Callable
 
+from ..research.model_provider_health_policy import STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES
 from ..research.orchestration import AttemptControlDecision, AttemptControlRequest, ResearchAttemptRecord
 from ..research.usage import PricingEntry
 from ..storage.shadow_operations_repositories import save_role_budget_check
@@ -32,30 +33,18 @@ Clock = Callable[[], datetime]
 # check below instead.
 _MANAGED_CLI_PROVIDERS = ("claude_code", "codex")
 
-# Milestone 12.1 Item 1: explicit allowlist of stable typed failure codes
-# (research/failure_taxonomy.py) that indicate a structural provider problem
-# — authentication, unexpected auth method, unsupported CLI version, or
-# credit/quota exhaustion — none of which will resolve themselves on the
-# next attempt. Deliberately NOT a free-text/substring check: a message that
-# happens to contain a word like "retry" (a transient, retryable failure)
-# must never trigger this pause, only an attempt whose `failure_code` is
-# exactly one of these values.
-IMMEDIATE_PROVIDER_PAUSE_CODES = frozenset(
-    {
-        "CODEX_NOT_AUTHENTICATED",
-        "CODEX_UNEXPECTED_AUTH_METHOD",
-        "CODEX_VERSION_UNSUPPORTED",
-        "CODEX_QUOTA_EXHAUSTED",
-        "CODEX_USAGE_METADATA_MISSING",
-        "CLAUDE_CODE_NOT_AUTHENTICATED",
-        "CLAUDE_CODE_AUTH_STATUS_FAILED",
-        "CLAUDE_CODE_UNEXPECTED_AUTH_METHOD",
-        "CLAUDE_CODE_OAUTH_TOKEN_MISSING",
-        "CLAUDE_CODE_VERSION_UNSUPPORTED",
-        "CLAUDE_CODE_CREDIT_EXHAUSTED",
-        "CLAUDE_CODE_USAGE_METADATA_MISSING",
-    }
-)
+# Milestone 12.1 Item 1, centralized by Milestone 12.1.1 Item 7: explicit
+# allowlist of stable typed failure codes (research/failure_taxonomy.py)
+# that indicate a structural provider problem — authentication, unexpected
+# auth method, unsupported CLI version, or credit/quota exhaustion — none of
+# which will resolve themselves on the next attempt. Deliberately NOT a
+# free-text/substring check: a message that happens to contain a word like
+# "retry" (a transient, retryable failure) must never trigger this pause,
+# only an attempt whose `failure_code` is exactly one of these values.
+# Sourced from `research/model_provider_health_policy.py` — the single
+# allowlist shared with the model-provider health hysteresis dimension,
+# never duplicated here.
+IMMEDIATE_PROVIDER_PAUSE_CODES = STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES
 
 
 def _compute_check_id(*, reservation_id: str, research_run_id: str, role: str, attempt_number: int) -> str:
@@ -106,6 +95,48 @@ class ShadowResearchAttemptController:
 
     def before_attempt(self, request: AttemptControlRequest) -> AttemptControlDecision:
         role_index = self._role_index(request.role)
+        # Milestone 12.1.1 Item 1: verify the persistent pause/kill state
+        # before every provider call, including a retry attempt within the
+        # same role invocation. `after_attempt` on an earlier attempt in this
+        # very loop may have just requested an automatic provider-health
+        # pause (see below) — that must block attempt 2, not only a future
+        # scheduled cycle. Checked fresh from the database every call, never
+        # cached, so it reflects a pause/kill made by any actor.
+        from . import pause as pause_mod
+
+        pause_state = pause_mod.current_state(self.conn)
+        if pause_state.is_blocking:
+            decision = role_budget_mod.RoleBudgetDecision(
+                decision=role_budget_mod.DECISION_SKIPPED_PAUSED_OR_KILLED,
+                role_name=request.role,
+                reason=f"system is {pause_state.state}: {pause_state.reason}",
+            )
+            remaining = remaining_reservation_budget(self.conn, self.reservation.reservation_id)
+            checked_at = self.clock()
+            check_id = _compute_check_id(
+                reservation_id=self.reservation.reservation_id, research_run_id=request.research_run_id,
+                role=request.role, attempt_number=request.attempt_number,
+            )
+            save_role_budget_check(
+                self.conn,
+                {
+                    "check_id": check_id, "reservation_id": self.reservation.reservation_id,
+                    "scheduler_run_id": self.scheduler_run_id, "cycle_id": self.cycle_id,
+                    "research_run_id": request.research_run_id, "symbol": request.symbol, "role": request.role,
+                    "attempt_number": request.attempt_number, "provider": self.provider, "model_name": request.model_name,
+                    "decision": decision.decision, "reason": decision.reason,
+                    "remaining_input_tokens": remaining["remaining_input_tokens"],
+                    "remaining_output_tokens": remaining["remaining_output_tokens"],
+                    "remaining_latency_ms": remaining["remaining_latency_seconds"] * 1000,
+                    "remaining_cost_usd": str(remaining["remaining_cost_usd"]),
+                    "maximum_attempt_input_tokens": self.max_input_tokens_per_role,
+                    "maximum_attempt_output_tokens": self.max_output_tokens_per_role,
+                    "maximum_attempt_latency_ms": self.max_latency_seconds_per_role * 1000,
+                    "maximum_attempt_cost_usd": "0",
+                    "checked_at": checked_at.isoformat(),
+                },
+            )
+            return AttemptControlDecision(allowed=False, code=decision.decision, reason=decision.reason)
         cost_per_output_token = (
             (self.pricing.output_price_per_million / Decimal(1_000_000)) if self.pricing is not None else Decimal("0")
         )

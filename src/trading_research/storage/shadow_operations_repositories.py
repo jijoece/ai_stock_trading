@@ -253,3 +253,28 @@ def save_budget_usage_attempt(conn: sqlite3.Connection, entry: dict) -> None:
         entry,
     )
     conn.commit()
+
+
+# --- Milestone 12.1.1 Item 7: model-provider health attempt lookup -----------
+
+
+def list_research_attempts_for_scheduler_run(conn: sqlite3.Connection, scheduler_run_id: str) -> list[dict]:
+    """Every `research_attempts` row that was actually gated/checked for
+    this scheduler run — joined via `shadow_role_budget_checks`, which is
+    the only table that records the (scheduler_run_id, research_run_id,
+    role, attempt_number) linkage (`research_attempts` itself has no
+    `scheduler_run_id` column; Milestone 12.1.1's persistence-minimality
+    requirement prefers this join over widening that core research table).
+    Excludes `failure_stage = 'BUDGET_GATED'` rows — a budget/pause/kill
+    gate denial never reached the provider at all, so it is not a
+    model-provider outcome (success or failure) by definition."""
+    rows = conn.execute(
+        "SELECT DISTINCT ra.attempt_id, ra.role, ra.attempt_number, ra.provider, ra.success, "
+        "ra.failure_code, ra.failure_stage, ra.failure_retryable "
+        "FROM research_attempts ra "
+        "JOIN shadow_role_budget_checks c "
+        "ON c.research_run_id = ra.research_run_id AND c.role = ra.role AND c.attempt_number = ra.attempt_number "
+        "WHERE c.scheduler_run_id = ? AND (ra.failure_stage IS NULL OR ra.failure_stage != 'BUDGET_GATED')",
+        (scheduler_run_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

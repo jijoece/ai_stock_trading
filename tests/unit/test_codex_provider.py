@@ -1020,3 +1020,88 @@ def test_local_schema_validation_is_mandatory(tmp_path):
     binary, _ = _normal_fake(tmp_path, structured={"value": "x" * 50})
     with pytest.raises(SchemaValidationError):
         CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+
+
+# --- Milestone 12.1.1 Item 6: configured codex.minimum_version is enforced ---
+
+
+def test_installed_version_below_configured_minimum_fails(tmp_path):
+    """Required test #1: installed 0.144.5 is within the adapter's supported
+    range, but the operator configured a higher minimum (0.144.9) — must fail."""
+    binary = _fake_binary(tmp_path, """
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 0.144.5")
+else:
+    print("Logged in using ChatGPT")
+""")
+    provider = CodexResearchProvider(_config(tmp_path, binary, minimum_version="0.144.9"))
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        provider.preflight()
+    assert exc_info.value.code == "CODEX_VERSION_UNSUPPORTED"
+    assert exc_info.value.metadata["configured_minimum_version"] == "0.144.9"
+    assert exc_info.value.metadata["cli_version"] == "0.144.5"
+
+
+def test_installed_version_equal_to_configured_minimum_passes(tmp_path):
+    """Required test #2."""
+    binary, _ = _normal_fake(tmp_path)  # reports 0.144.5
+    provider = CodexResearchProvider(_config(tmp_path, binary, minimum_version="0.144.5"))
+    result = provider.preflight()
+    assert result.ready is True
+    assert result.configured_minimum_version == "0.144.5"
+
+
+def test_installed_version_outside_adapter_policy_fails_even_if_above_configured_minimum(tmp_path):
+    """Required test #3: an installed version above the configured minimum
+    but outside the closed adapter-contract range must still fail — a
+    higher configured minimum never widens the adapter's own tested range."""
+    binary = _fake_binary(tmp_path, """
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 0.145.0")
+else:
+    print("Logged in using ChatGPT")
+""")
+    provider = CodexResearchProvider(_config(tmp_path, binary, minimum_version="0.144.5"))
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        provider.preflight()
+    assert exc_info.value.code == "CODEX_VERSION_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("version", ["not-a-version", "0.144.5-beta"])
+def test_malformed_and_prerelease_versions_fail_regardless_of_configured_minimum(tmp_path, version):
+    """Required test #4."""
+    binary = _fake_binary(tmp_path, f"""
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print({version!r})
+else:
+    print("Logged in using ChatGPT")
+""")
+    provider = CodexResearchProvider(_config(tmp_path, binary, minimum_version="0.144.5"))
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        provider.preflight()
+    assert exc_info.value.code in ("CODEX_VERSION_UNPARSABLE", "CODEX_VERSION_UNSUPPORTED")
+
+
+def test_no_inference_occurs_when_below_configured_minimum(tmp_path):
+    """Required test #5: mirrors `test_unsupported_version_fails_before_any_inference_subprocess`
+    but for the configured-minimum check specifically."""
+    binary = _fake_binary(tmp_path, """
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 0.144.5")
+elif args[:1] == ["exec"]:
+    sys.exit(99)  # must never be reached
+else:
+    print("Logged in using ChatGPT")
+""")
+    provider = CodexResearchProvider(_config(tmp_path, binary, minimum_version="0.144.9"))
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        provider.generate_structured(_request())
+    assert exc_info.value.code == "CODEX_VERSION_UNSUPPORTED"

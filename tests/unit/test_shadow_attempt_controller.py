@@ -336,3 +336,52 @@ def test_codex_quota_exhaustion_activates_provider_health_pause(conn):
     state = pause_mod.current_state(conn)
     assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
     assert state.source == pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE
+
+
+def test_before_attempt_blocked_by_manual_pause(conn):
+    """Milestone 12.1.1 Item 1, required test #7."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing)
+    pause_mod.request_pause(
+        conn, reason="operator paused", source=pause_mod.SOURCE_OPERATOR,
+        target_state=pause_mod.STATE_PAUSED_MANUAL, clock=lambda: NOW,
+    )
+    decision = controller.before_attempt(_request())
+    assert decision.allowed is False
+    assert decision.code == "SKIPPED_PAUSED_OR_KILLED"
+    checks = list_role_budget_checks(conn)
+    assert len(checks) == 1
+    assert checks[0]["decision"] == "SKIPPED_PAUSED_OR_KILLED"
+
+
+def test_before_attempt_blocked_by_kill(conn):
+    """Milestone 12.1.1 Item 1, required test #7."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing)
+    pause_mod.kill(conn, reason="operator killed", operator="op", clock=lambda: NOW)
+    decision = controller.before_attempt(_request())
+    assert decision.allowed is False
+    assert decision.code == "SKIPPED_PAUSED_OR_KILLED"
+
+
+def test_automatic_pause_after_attempt_one_blocks_attempt_two(conn):
+    """Milestone 12.1.1 Item 1, required test #6: an automatic pause created
+    by `after_attempt` on attempt 1 (a Codex/Claude Code structural failure)
+    must block `before_attempt` for attempt 2 of the very same role loop."""
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    decision_1 = controller.before_attempt(_request(attempt_number=1))
+    assert decision_1.allowed is True
+    failed = replace(
+        _attempt(
+            success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex",
+            failure_code="CODEX_NOT_AUTHENTICATED",
+        ),
+        failure_reason="Codex is not authenticated",
+    )
+    controller.after_attempt(_request(attempt_number=1), failed)
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+    decision_2 = controller.before_attempt(_request(attempt_number=2))
+    assert decision_2.allowed is False
+    assert decision_2.code == "SKIPPED_PAUSED_OR_KILLED"

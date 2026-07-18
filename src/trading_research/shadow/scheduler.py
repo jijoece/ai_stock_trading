@@ -59,6 +59,7 @@ from ..storage.research_repositories import compute_cycle_telemetry
 from ..storage.shadow_alerts_repositories import save_health_check, save_run_summary
 from ..storage.shadow_operations_repositories import (
     find_scheduler_run_by_intended_schedule,
+    list_research_attempts_for_scheduler_run,
     save_scheduler_run,
     update_scheduler_run,
 )
@@ -67,6 +68,7 @@ from . import attempt_controller as attempt_controller_mod
 from . import budget as budget_mod
 from . import health as health_mod
 from . import health_hysteresis as health_hysteresis_mod
+from . import model_provider_health as model_provider_health_mod
 from . import lease as lease_mod
 from . import pause as pause_mod
 from . import schedule as schedule_mod
@@ -334,6 +336,7 @@ def _build_health_inputs_from_cycle_result(
         "provider_missing_required_providers": provider_telemetry.required_providers_missing,
         "provider_missing_required_categories": provider_telemetry.missing_required_categories,
         "provider_unhealthy_required_categories": provider_telemetry.unhealthy_required_categories,
+        "provider_insufficient_required_categories": provider_telemetry.insufficient_required_categories,
         "provider_per_provider_metrics": provider_metrics,
         "provider_severe_error_categories": provider_telemetry.severe_error_categories,
         "provider_policy_version": provider_telemetry.policy_version,
@@ -1047,6 +1050,18 @@ def run_due_shadow_cycle(
             ),
             scheduler_run_id=scheduler_run_id,
         )
+        # Milestone 12.1.1 Item 7: independent model-provider health, from
+        # persisted `research_attempts` for THIS scheduler run only (never
+        # evidence-provider request rows, never another scheduler run's
+        # attempts — the join is scoped by `scheduler_run_id`).
+        model_provider_attempt_rows = list_research_attempts_for_scheduler_run(conn, scheduler_run_id)
+        model_provider_evidence = model_provider_health_mod.evaluate_model_provider_health(model_provider_attempt_rows)
+        health_inputs = dataclasses.replace(
+            health_inputs,
+            model_provider_success_rate=model_provider_evidence.success_rate,
+            model_provider_request_count=model_provider_evidence.attempt_count,
+            model_provider_structural_failure=model_provider_evidence.structural_failure,
+        )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)
         health_result = health_mod.evaluate_cycle_health(health_inputs, health_config)
         # Milestone 11.3.1 Item 8 Part C: fold this cycle's single-cycle
@@ -1086,7 +1101,8 @@ def run_due_shadow_cycle(
 
         evidence_provider_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_PROVIDER_FAILURE_RATE)
         evidence_provider_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
-            conn, scope=health_hysteresis_mod.DEFAULT_SCOPE, cycle_id=cycle_id or scheduler_run_id,
+            conn, scope=health_hysteresis_mod.DEFAULT_SCOPE, cycle_id=scheduler_run_id,
+            research_cycle_id=cycle_id,
             cycle_status=health_mod.dimension_cycle_status(evidence_provider_check),
             qualified=health_mod.dimension_is_qualified(evidence_provider_check),
             severe_error=health_inputs.provider_severe_error,
@@ -1109,7 +1125,7 @@ def run_due_shadow_cycle(
         retry_exhaustion_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE)
         retry_exhaustion_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
             conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_RETRY_EXHAUSTION}",
-            cycle_id=cycle_id or scheduler_run_id,
+            cycle_id=scheduler_run_id, research_cycle_id=cycle_id,
             cycle_status=health_mod.dimension_cycle_status(retry_exhaustion_check),
             qualified=health_mod.dimension_is_qualified(retry_exhaustion_check),
             config=_dimension_policy_config(shadow_config.health_hysteresis.retry_exhaustion), clock=clock,
@@ -1118,11 +1134,27 @@ def run_due_shadow_cycle(
         unsupported_claims_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_UNSUPPORTED_CLAIM_RATE)
         unsupported_claims_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
             conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_UNSUPPORTED_CLAIMS}",
-            cycle_id=cycle_id or scheduler_run_id,
+            cycle_id=scheduler_run_id, research_cycle_id=cycle_id,
             cycle_status=health_mod.dimension_cycle_status(unsupported_claims_check),
             qualified=health_mod.dimension_is_qualified(unsupported_claims_check),
             config=_dimension_policy_config(shadow_config.health_hysteresis.unsupported_claims), clock=clock,
             immediate_pause=_immediate_pause_for_hysteresis,
+        )
+        # Milestone 12.1.1 Item 7: independent model-provider hysteresis —
+        # its own scope/streak, never advanced or cleared by evidence-provider
+        # success/failure. `severe_error` (like the evidence-provider
+        # dimension's own `provider_severe_error`) forces PAUSE_REQUIRED
+        # immediately for a structural model-provider failure, bypassing the
+        # ordinary consecutive-failure streak.
+        model_provider_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE)
+        model_provider_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
+            conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}",
+            cycle_id=scheduler_run_id, research_cycle_id=cycle_id,
+            cycle_status=health_mod.dimension_cycle_status(model_provider_check),
+            qualified=health_mod.dimension_is_qualified(model_provider_check),
+            severe_error=model_provider_evidence.structural_failure,
+            config=_dimension_policy_config(shadow_config.health_hysteresis.model_provider), clock=clock,
+            immediate_pause=model_provider_evidence.structural_failure,
         )
         # The overall hysteresis status a scheduler-level pause decision acts
         # on is the worst of every independently-evaluated dimension — this
@@ -1132,7 +1164,7 @@ def run_due_shadow_cycle(
             evidence_provider_hysteresis,
             decision=health_mod.worst_health_status((
                 evidence_provider_hysteresis.decision, retry_exhaustion_hysteresis.decision,
-                unsupported_claims_hysteresis.decision,
+                unsupported_claims_hysteresis.decision, model_provider_hysteresis.decision,
             )),
         )
         effective_decision = health_mod.combine_effective_health_decision(

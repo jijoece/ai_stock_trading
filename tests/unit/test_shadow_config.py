@@ -412,10 +412,29 @@ def test_unknown_dimension_rejected():
     import copy
 
     bad = copy.deepcopy(_VALID_HYSTERESIS)
-    bad["model_provider"] = bad["evidence_provider"]
+    bad["totally_bogus_dimension"] = bad["evidence_provider"]
     path = _write_config(_with_hysteresis(bad))
     with pytest.raises(ShadowOperationsConfigError):
         load_shadow_operations_config(path)
+
+
+def test_optional_model_provider_dimension_accepted():
+    """Milestone 12.1.1 Item 7: `model_provider` is an optional dimension —
+    present-and-valid loads; absent uses the safe repository default."""
+    import copy
+
+    with_model_provider = copy.deepcopy(_VALID_HYSTERESIS)
+    with_model_provider["model_provider"] = {
+        "warning_after_failures": 1, "pause_recommended_after_failures": 2,
+        "pause_required_after_failures": 3, "recovery_streak": 2,
+    }
+    path = _write_config(_with_hysteresis(with_model_provider))
+    config = load_shadow_operations_config(path)
+    assert config.health_hysteresis.model_provider.pause_required_after_failures == 3
+
+    path_absent = _write_config(_with_hysteresis(_VALID_HYSTERESIS))
+    config_absent = load_shadow_operations_config(path_absent)
+    assert config_absent.health_hysteresis.model_provider.recovery_streak == 2
 
 
 def test_unknown_field_rejected():
@@ -470,3 +489,165 @@ def test_safe_repository_default_config_keeps_unattended_scheduling_disabled():
     assert config.health_hysteresis.policy_version == "persistent-health/v2"
     assert config.shadow_operations.enabled is False
     assert config.schedule.enabled is False
+
+
+# --- Milestone 12.1.1 Item 5: provider_health required-category policy -----
+
+_VALID_PROVIDER_HEALTH = {
+    "policy_version": "provider-coverage/v2",
+    "required_categories": {
+        "market_data": {"providers": ["alpaca-data"], "minimum_requests": 1, "minimum_success_rate": 1.0},
+        "corporate_filings": {"providers": ["sec-edgar"], "minimum_requests": 1, "minimum_success_rate": 1.0},
+    },
+}
+
+
+def _with_provider_health(section: dict) -> dict:
+    import copy
+
+    raw = copy.deepcopy(VALID_RAW)
+    raw["provider_health"] = section
+    return raw
+
+
+def test_valid_provider_health_configuration_loads():
+    path = _write_config(_with_provider_health(_VALID_PROVIDER_HEALTH))
+    config = load_shadow_operations_config(path)
+    assert config.provider_health.policy_version == "provider-coverage/v2"
+    assert config.provider_health.required_categories["market_data"].minimum_requests == 1
+    assert config.provider_health.required_categories["market_data"].providers == ("alpaca-data",)
+
+
+def test_absent_provider_health_section_is_none():
+    path = _write_config(VALID_RAW)
+    config = load_shadow_operations_config(path)
+    assert config.provider_health is None
+
+
+def test_provider_health_invalid_minimum_requests_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_PROVIDER_HEALTH)
+    bad["required_categories"]["market_data"]["minimum_requests"] = 0
+    path = _write_config(_with_provider_health(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_provider_health_invalid_success_rate_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_PROVIDER_HEALTH)
+    bad["required_categories"]["market_data"]["minimum_success_rate"] = 1.5
+    path = _write_config(_with_provider_health(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_provider_health_empty_providers_list_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_PROVIDER_HEALTH)
+    bad["required_categories"]["market_data"]["providers"] = []
+    path = _write_config(_with_provider_health(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_provider_health_unknown_field_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_PROVIDER_HEALTH)
+    bad["required_categories"]["market_data"]["unexpected_field"] = "x"
+    path = _write_config(_with_provider_health(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_provider_health_unknown_top_level_field_rejected():
+    import copy
+
+    bad = copy.deepcopy(_VALID_PROVIDER_HEALTH)
+    bad["unexpected_top_field"] = "x"
+    path = _write_config(_with_provider_health(bad))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_provider_health_empty_required_categories_rejected():
+    path = _write_config(_with_provider_health({"required_categories": {}}))
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_apply_provider_health_policy_overrides_unknown_category_fails_closed():
+    from trading_research.evidence_providers.health import (
+        ProviderCoveragePolicy,
+        ProviderHealthPolicyOverrideError,
+        apply_provider_health_policy_overrides,
+    )
+    from trading_research.shadow.config import ProviderHealthCategorySection, ProviderHealthSection
+
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    section = ProviderHealthSection(
+        policy_version="provider-coverage/v2",
+        required_categories={
+            "unknown_category": ProviderHealthCategorySection(
+                providers=("alpaca-data",), minimum_requests=1, minimum_success_rate=1.0,
+            ),
+        },
+    )
+    with pytest.raises(ProviderHealthPolicyOverrideError):
+        apply_provider_health_policy_overrides(policy, section)
+
+
+def test_apply_provider_health_policy_overrides_mismatched_providers_fails_closed():
+    from trading_research.evidence_providers.health import (
+        ProviderCoveragePolicy,
+        ProviderHealthPolicyOverrideError,
+        apply_provider_health_policy_overrides,
+    )
+    from trading_research.shadow.config import ProviderHealthCategorySection, ProviderHealthSection
+
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    section = ProviderHealthSection(
+        policy_version="provider-coverage/v2",
+        required_categories={
+            "market_data": ProviderHealthCategorySection(
+                providers=("some-other-provider",), minimum_requests=1, minimum_success_rate=1.0,
+            ),
+        },
+    )
+    with pytest.raises(ProviderHealthPolicyOverrideError):
+        apply_provider_health_policy_overrides(policy, section)
+
+
+def test_apply_provider_health_policy_overrides_applies_floors():
+    from trading_research.evidence_providers.health import (
+        ProviderCoveragePolicy,
+        apply_provider_health_policy_overrides,
+    )
+    from trading_research.shadow.config import ProviderHealthCategorySection, ProviderHealthSection
+
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    section = ProviderHealthSection(
+        policy_version="provider-coverage/v2",
+        required_categories={
+            "market_data": ProviderHealthCategorySection(
+                providers=("alpaca-data",), minimum_requests=3, minimum_success_rate=1.0,
+            ),
+        },
+    )
+    overridden = apply_provider_health_policy_overrides(policy, section)
+    assert overridden.category_minimum_requests["market_data"] == 3
+    assert overridden.policy_version == "provider-coverage/v2"
+
+
+def test_apply_provider_health_policy_overrides_none_is_a_no_op():
+    from trading_research.evidence_providers.health import (
+        ProviderCoveragePolicy,
+        apply_provider_health_policy_overrides,
+    )
+
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    assert apply_provider_health_policy_overrides(policy, None) is policy

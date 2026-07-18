@@ -1669,7 +1669,9 @@ def run_due_shadow_cycle_cli(
             telemetry_expected=False, configuration_hash=cycle_config.config_hash,
         )
         if provider_mode == PROVIDER_MODE_FIXTURE else
-        coverage_policy_from_configuration(load_evidence_provider_config())
+        coverage_policy_from_configuration(
+            load_evidence_provider_config(), provider_health_section=shadow_config.provider_health,
+        )
     )
 
     if provider_mode == PROVIDER_MODE_REAL:

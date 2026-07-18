@@ -230,6 +230,15 @@ REQUIRED_CATEGORY_STATUSES = (
 # observationally distinct from FAIL, never silently passing OR failing).
 _UNHEALTHY_REQUIRED_CATEGORY_STATUSES = (REQUIRED_CATEGORY_STATUS_FAIL, REQUIRED_CATEGORY_STATUS_MISSING)
 
+# Milestone 12.1.1 Item 5: a required category that is itself
+# INSUFFICIENT_DATA must never let the overall provider-health dimension
+# read as a computed PASS just because an unrelated required/optional
+# provider's requests happened to succeed in aggregate (e.g. SEC EDGAR 9/9
+# plus a single Alpaca request below its own 3-request floor must not read
+# as a healthy 100% aggregate) — distinct from `_UNHEALTHY_REQUIRED_CATEGORY_STATUSES`,
+# which drives an outright FAIL.
+_INSUFFICIENT_REQUIRED_CATEGORY_STATUSES = (REQUIRED_CATEGORY_STATUS_INSUFFICIENT_DATA,)
+
 # Category-specific sample floor defaults (docs' suggested
 # `provider_health.required_categories.*` shape) — most required categories
 # in this repository make exactly one request per cycle, so the default
@@ -367,7 +376,58 @@ class ProviderCoveragePolicy:
         })
 
 
-def coverage_policy_from_configuration(configuration, *, telemetry_expected: bool = True) -> ProviderCoveragePolicy:
+class ProviderHealthPolicyOverrideError(ValueError):
+    """A `shadow/config.py::ProviderHealthSection` override could not be
+    applied to an already-resolved `ProviderCoveragePolicy` — fails closed
+    rather than silently ignoring an inconsistent/unknown configuration."""
+
+
+def apply_provider_health_policy_overrides(policy: "ProviderCoveragePolicy", section) -> "ProviderCoveragePolicy":
+    """Milestone 12.1.1 Item 5: overlay strict, frozen `provider_health.
+    required_categories.*.minimum_requests`/`minimum_success_rate` config
+    (`shadow/config.py::ProviderHealthSection`) onto a policy whose
+    category->acceptable-provider mapping is already resolved from
+    evidence-provider enablement (`coverage_policy_from_configuration`).
+    `section` is `None` for "no override configured" — that keeps the
+    pre-existing `DEFAULT_CATEGORY_MINIMUM_REQUESTS`/
+    `DEFAULT_CATEGORY_MINIMUM_SUCCESS_RATE` behavior verbatim, never a
+    silent behavior change for a config file written before this section
+    existed. Every named category must already be one of `policy`'s
+    required categories, and its configured `providers` must exactly match
+    the already-resolved acceptable-provider set for that category —
+    an unknown category name or a mismatched provider list both fail
+    closed rather than silently accepting a stale/wrong override."""
+    if section is None:
+        return policy
+    import dataclasses
+
+    known_categories = {category: providers for category, providers in policy.required_categories}
+    minimum_requests = dict(policy.category_minimum_requests)
+    minimum_success_rate = dict(policy.category_minimum_success_rate)
+    for category, category_section in section.required_categories.items():
+        if category not in known_categories:
+            raise ProviderHealthPolicyOverrideError(
+                f"provider_health.required_categories.{category} is not a configured required category "
+                f"— known categories are {sorted(known_categories)}"
+            )
+        configured_providers = tuple(sorted(normalize_provider_name(p) for p in category_section.providers))
+        resolved_providers = tuple(sorted(known_categories[category]))
+        if configured_providers != resolved_providers:
+            raise ProviderHealthPolicyOverrideError(
+                f"provider_health.required_categories.{category}.providers {configured_providers} does not match "
+                f"the resolved acceptable-provider set {resolved_providers}"
+            )
+        minimum_requests[category] = category_section.minimum_requests
+        minimum_success_rate[category] = category_section.minimum_success_rate
+    return dataclasses.replace(
+        policy, policy_version=section.policy_version, category_minimum_requests=minimum_requests,
+        category_minimum_success_rate=minimum_success_rate,
+    )
+
+
+def coverage_policy_from_configuration(
+    configuration, *, telemetry_expected: bool = True, provider_health_section=None,
+) -> ProviderCoveragePolicy:
     """Resolve the versioned required-category policy from the frozen provider config."""
     required: list[tuple[str, tuple[str, ...]]] = []
     unavailable: list[str] = []
@@ -386,11 +446,12 @@ def coverage_policy_from_configuration(configuration, *, telemetry_expected: boo
         optional.append("reddit-mcp")
     if configuration.reddit_free.enabled:
         optional.append("reddit-free")
-    return ProviderCoveragePolicy(
+    policy = ProviderCoveragePolicy(
         required_categories=tuple(required), optional_providers=tuple(optional),
         unavailable_required_categories=tuple(sorted(unavailable)),
         configuration_hash=configuration.config_hash, telemetry_expected=telemetry_expected,
     )
+    return apply_provider_health_policy_overrides(policy, provider_health_section)
 
 
 @dataclass(frozen=True)
@@ -426,6 +487,12 @@ class CycleProviderTelemetry:
     # already covers the latter) — never derived from the aggregate rate.
     required_category_health: "tuple[RequiredCategoryHealth, ...]" = ()
     unhealthy_required_categories: tuple[str, ...] = ()
+    # Milestone 12.1.1 Item 5: required categories whose OWN request count is
+    # below their OWN sample floor (INSUFFICIENT_DATA) — disjoint from
+    # `unhealthy_required_categories` (FAIL/MISSING). Non-empty here, with
+    # `unhealthy_required_categories` empty, must produce an overall
+    # INSUFFICIENT_DATA provider-health dimension, never a fabricated PASS.
+    insufficient_required_categories: tuple[str, ...] = ()
 
 
 def compute_cycle_provider_telemetry(
@@ -454,6 +521,9 @@ def compute_cycle_provider_telemetry(
     unhealthy_required_categories = tuple(sorted(
         h.category for h in required_category_health if h.status in _UNHEALTHY_REQUIRED_CATEGORY_STATUSES
     ))
+    insufficient_required_categories = tuple(sorted(
+        h.category for h in required_category_health if h.status in _INSUFFICIENT_REQUIRED_CATEGORY_STATUSES
+    ))
     return CycleProviderTelemetry(
         total_requests=total, successful_requests=successes, aggregate_success_rate=aggregate_rate,
         per_provider=per_provider, required_providers_missing=missing,
@@ -465,6 +535,7 @@ def compute_cycle_provider_telemetry(
         telemetry_expected=policy.telemetry_expected,
         required_category_health=required_category_health,
         unhealthy_required_categories=unhealthy_required_categories,
+        insufficient_required_categories=insufficient_required_categories,
     )
 
 

@@ -436,3 +436,122 @@ def test_build_health_inputs_severe_provider_error_is_wired_through():
         bounded_symbols=("AAPL",), window_start=as_of, window_end=as_of + timedelta(minutes=5),
     )
     assert inputs.provider_severe_error is True
+
+
+# --- Milestone 12.1.1 Item 5: required-category INSUFFICIENT_DATA must not pass ---
+
+
+def test_required_category_insufficient_data_prevents_overall_pass():
+    """Required tests #4/#5 from the milestone: SEC has enough successful
+    requests, Alpaca has one successful request against a market_data
+    minimum_requests of three — market_data is INSUFFICIENT_DATA and the
+    overall provider dimension must read INSUFFICIENT_DATA, never PASS."""
+    policy = ProviderCoveragePolicy(
+        required_categories=(
+            ("corporate_filings", ("sec-edgar",)), ("market_data", ("alpaca-data",)),
+        ),
+        category_minimum_requests={"market_data": 3},
+    )
+    rows = [_row(provider="sec-edgar", success=True) for _ in range(9)] + [
+        _row(provider="alpaca-data", success=True),
+    ]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=policy)
+    assert telem.aggregate_success_rate == 1.0  # would read as a healthy 100% in aggregate
+    assert telem.unhealthy_required_categories == ()
+    assert telem.insufficient_required_categories == ("market_data",)
+
+    from trading_research.shadow.health import (
+        CHECK_STATUS_INSUFFICIENT_DATA,
+        CycleHealthInputs,
+        HealthPolicyConfig,
+        evaluate_cycle_health,
+        provider_health_check,
+    )
+
+    inputs = CycleHealthInputs(
+        provider_success_rate=telem.aggregate_success_rate, evidence_completeness_rate=None,
+        claude_role_success_rate=None, retry_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None,
+        output_truncation_rate=None, latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None,
+        pricing_configured=True, paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
+        cycle_duration_seconds=None, provider_insufficient_required_categories=telem.insufficient_required_categories,
+    )
+    config = HealthPolicyConfig(
+        policy_version="test", pause_on_provider_failure_rate=0.5, pause_on_retry_exhaustion_rate=0.5,
+        pause_on_unsupported_claim_rate=0.5, pause_on_reconciliation_mismatch=True, pause_on_budget_breach=True,
+    )
+    result = evaluate_cycle_health(inputs, config)
+    check = provider_health_check(result)
+    assert check.status == CHECK_STATUS_INSUFFICIENT_DATA
+    assert "market_data" in check.reason
+
+
+def test_required_category_pass():
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    rows = [_row(provider="alpaca-data", success=True)]
+    results = evaluate_required_category_health(rows, policy)
+    assert results[0].status == REQUIRED_CATEGORY_STATUS_PASS
+
+
+def test_required_category_fail():
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    rows = [_row(provider="alpaca-data", success=False)]
+    results = evaluate_required_category_health(rows, policy)
+    assert results[0].status == REQUIRED_CATEGORY_STATUS_FAIL
+
+
+def test_required_category_missing():
+    policy = ProviderCoveragePolicy(required_categories=(("market_data", ("alpaca-data",)),))
+    results = evaluate_required_category_health([], policy)
+    assert results[0].status == REQUIRED_CATEGORY_STATUS_MISSING
+
+
+def test_required_category_insufficient_data():
+    policy = ProviderCoveragePolicy(
+        required_categories=(("market_data", ("alpaca-data",)),), category_minimum_requests={"market_data": 3},
+    )
+    rows = [_row(provider="alpaca-data", success=True)]
+    results = evaluate_required_category_health(rows, policy)
+    assert results[0].status == "INSUFFICIENT_DATA"
+
+
+def test_fail_outranks_insufficient_data_when_both_required_categories_present():
+    """MISSING/FAIL must still dominate over INSUFFICIENT_DATA."""
+    policy = ProviderCoveragePolicy(
+        required_categories=(
+            ("corporate_filings", ("sec-edgar",)), ("market_data", ("alpaca-data",)),
+        ),
+        category_minimum_requests={"market_data": 3},
+    )
+    rows = [_row(provider="sec-edgar", success=False)] + [_row(provider="alpaca-data", success=True)]
+    telem = compute_cycle_provider_telemetry(rows, coverage_policy=policy)
+    assert telem.unhealthy_required_categories == ("corporate_filings",)
+    assert telem.insufficient_required_categories == ("market_data",)
+
+    from trading_research.shadow.health import (
+        CHECK_STATUS_FAIL, CycleHealthInputs, HealthPolicyConfig, evaluate_cycle_health, provider_health_check,
+    )
+
+    inputs = CycleHealthInputs(
+        provider_success_rate=telem.aggregate_success_rate, evidence_completeness_rate=None,
+        claude_role_success_rate=None, retry_rate=None, retry_exhaustion_rate=None, unsupported_claim_rate=None,
+        output_truncation_rate=None, latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None,
+        pricing_configured=True, paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
+        cycle_duration_seconds=None, provider_unhealthy_required_categories=telem.unhealthy_required_categories,
+        provider_insufficient_required_categories=telem.insufficient_required_categories,
+    )
+    config = HealthPolicyConfig(
+        policy_version="test", pause_on_provider_failure_rate=0.5, pause_on_retry_exhaustion_rate=0.5,
+        pause_on_unsupported_claim_rate=0.5, pause_on_reconciliation_mismatch=True, pause_on_budget_breach=True,
+    )
+    result = evaluate_cycle_health(inputs, config)
+    assert provider_health_check(result).status == CHECK_STATUS_FAIL
+
+
+def test_policy_change_alters_the_policy_hash():
+    base = ProviderCoveragePolicy(
+        required_categories=(("market_data", ("alpaca-data",)),), category_minimum_requests={"market_data": 1},
+    )
+    changed = ProviderCoveragePolicy(
+        required_categories=(("market_data", ("alpaca-data",)),), category_minimum_requests={"market_data": 3},
+    )
+    assert base.policy_hash != changed.policy_hash

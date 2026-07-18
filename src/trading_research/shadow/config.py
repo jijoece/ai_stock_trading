@@ -12,7 +12,7 @@ environment variable is read anywhere in this module to decide a capability
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -189,10 +189,18 @@ class SafetySection:
     # non-empty sample" behavior for configs written before this field
     # existed).
     minimum_requests_for_failure_rate: int = 1
+    # Milestone 12.1.1 Item 7: independent model-provider (Codex/Claude
+    # Code/Anthropic) threshold/sample floor — deliberately separate,
+    # independently-configurable fields from `pause_on_provider_failure_rate`
+    # (evidence providers). Not a required key (defaults preserve behavior
+    # for a config written before this dimension existed).
+    pause_on_model_provider_failure_rate: float = 0.5
+    minimum_requests_for_model_provider_failure_rate: int = 1
 
     def __post_init__(self) -> None:
         rate_fields = (
             "pause_on_provider_failure_rate", "pause_on_retry_exhaustion_rate", "pause_on_unsupported_claim_rate",
+            "pause_on_model_provider_failure_rate",
         )
         for field_name in rate_fields:
             value = getattr(self, field_name)
@@ -200,6 +208,13 @@ class SafetySection:
                 raise ShadowOperationsConfigError(f"safety.{field_name} must be in [0,1]")
         if type(self.minimum_requests_for_failure_rate) is not int or self.minimum_requests_for_failure_rate < 1:
             raise ShadowOperationsConfigError("safety.minimum_requests_for_failure_rate must be an integer >= 1")
+        if (
+            type(self.minimum_requests_for_model_provider_failure_rate) is not int
+            or self.minimum_requests_for_model_provider_failure_rate < 1
+        ):
+            raise ShadowOperationsConfigError(
+                "safety.minimum_requests_for_model_provider_failure_rate must be an integer >= 1"
+            )
 
 
 # Milestone 12.1 Item 9: hysteresis thresholds move from hard-coded Python
@@ -210,6 +225,10 @@ class SafetySection:
 # closed exactly like every other section in this module).
 HEALTH_HYSTERESIS_POLICY_VERSION = "persistent-health/v2"
 HEALTH_HYSTERESIS_DIMENSIONS = ("evidence_provider", "retry_exhaustion", "unsupported_claims")
+# Milestone 12.1.1 Item 7: optional (not required) dimension — a
+# `health_hysteresis` block predating this dimension keeps loading
+# unchanged; an operator can still configure it explicitly.
+OPTIONAL_HEALTH_HYSTERESIS_DIMENSIONS = ("model_provider",)
 
 
 @dataclass(frozen=True)
@@ -242,6 +261,16 @@ class HealthHysteresisSection:
     evidence_provider: HysteresisDimensionSection
     retry_exhaustion: HysteresisDimensionSection
     unsupported_claims: HysteresisDimensionSection
+    # Milestone 12.1.1 Item 7: OPTIONAL — absent means `_DEFAULT_HYSTERESIS_DIMENSION`,
+    # same repository-default thresholds as every other dimension had before
+    # this section existed. Kept optional (unlike the three REQUIRED
+    # dimensions above) so a `health_hysteresis` block written before this
+    # dimension existed keeps loading unchanged.
+    model_provider: HysteresisDimensionSection = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.model_provider is None:
+            object.__setattr__(self, "model_provider", _DEFAULT_HYSTERESIS_DIMENSION)
 
     @property
     def policy_hash(self) -> str:
@@ -250,6 +279,7 @@ class HealthHysteresisSection:
             "evidence_provider": _dimension_hash_payload(self.evidence_provider),
             "retry_exhaustion": _dimension_hash_payload(self.retry_exhaustion),
             "unsupported_claims": _dimension_hash_payload(self.unsupported_claims),
+            "model_provider": _dimension_hash_payload(self.model_provider),
         })
 
 
@@ -272,6 +302,7 @@ DEFAULT_HEALTH_HYSTERESIS = HealthHysteresisSection(
     evidence_provider=_DEFAULT_HYSTERESIS_DIMENSION,
     retry_exhaustion=_DEFAULT_HYSTERESIS_DIMENSION,
     unsupported_claims=_DEFAULT_HYSTERESIS_DIMENSION,
+    model_provider=_DEFAULT_HYSTERESIS_DIMENSION,
 )
 
 
@@ -317,7 +348,9 @@ def _parse_health_hysteresis(raw: dict) -> HealthHysteresisSection:
         return DEFAULT_HEALTH_HYSTERESIS
     if not isinstance(section, dict):
         raise ShadowOperationsConfigError("health_hysteresis must be a mapping")
-    unknown_top = section.keys() - ({"policy_version"} | set(HEALTH_HYSTERESIS_DIMENSIONS))
+    unknown_top = section.keys() - (
+        {"policy_version"} | set(HEALTH_HYSTERESIS_DIMENSIONS) | set(OPTIONAL_HEALTH_HYSTERESIS_DIMENSIONS)
+    )
     if unknown_top:
         raise ShadowOperationsConfigError(f"health_hysteresis has unknown dimensions/fields: {sorted(unknown_top)}")
     missing_dims = set(HEALTH_HYSTERESIS_DIMENSIONS) - section.keys()
@@ -326,12 +359,118 @@ def _parse_health_hysteresis(raw: dict) -> HealthHysteresisSection:
     policy_version = section.get("policy_version", HEALTH_HYSTERESIS_POLICY_VERSION)
     if type(policy_version) is not str or not policy_version.strip():
         raise ShadowOperationsConfigError("health_hysteresis.policy_version must be a non-empty string")
+    model_provider_raw = section.get("model_provider")
     return HealthHysteresisSection(
         policy_version=policy_version,
         evidence_provider=_parse_hysteresis_dimension(section["evidence_provider"], dimension="evidence_provider"),
         retry_exhaustion=_parse_hysteresis_dimension(section["retry_exhaustion"], dimension="retry_exhaustion"),
         unsupported_claims=_parse_hysteresis_dimension(section["unsupported_claims"], dimension="unsupported_claims"),
+        model_provider=(
+            _parse_hysteresis_dimension(model_provider_raw, dimension="model_provider")
+            if model_provider_raw is not None else _DEFAULT_HYSTERESIS_DIMENSION
+        ),
     )
+
+
+# Milestone 12.1.1 Item 5: required-category provider-health sample
+# floors/success thresholds move from hard-coded Python defaults
+# (`evidence_providers/health.py::DEFAULT_CATEGORY_MINIMUM_REQUESTS`/
+# `DEFAULT_CATEGORY_MINIMUM_SUCCESS_RATE`) into this strict, frozen,
+# versioned, OPTIONAL config surface — absent entirely preserves the exact
+# pre-existing Python-default behavior.
+PROVIDER_HEALTH_POLICY_VERSION = "provider-coverage/v2"
+
+
+@dataclass(frozen=True)
+class ProviderHealthCategorySection:
+    providers: tuple[str, ...]
+    minimum_requests: int
+    minimum_success_rate: float
+
+    def __post_init__(self) -> None:
+        if not self.providers:
+            raise ShadowOperationsConfigError("provider_health.required_categories.*.providers must be non-empty")
+        if type(self.minimum_requests) is not int or self.minimum_requests < 1:
+            raise ShadowOperationsConfigError(
+                "provider_health.required_categories.*.minimum_requests must be a positive integer"
+            )
+        if not (0.0 <= self.minimum_success_rate <= 1.0):
+            raise ShadowOperationsConfigError(
+                "provider_health.required_categories.*.minimum_success_rate must be in [0,1]"
+            )
+
+
+@dataclass(frozen=True)
+class ProviderHealthSection:
+    policy_version: str
+    required_categories: "dict[str, ProviderHealthCategorySection]"
+
+
+_PROVIDER_HEALTH_CATEGORY_KEYS = {"providers", "minimum_requests", "minimum_success_rate"}
+
+
+def _parse_provider_health_category(raw_section: object, *, category: str) -> ProviderHealthCategorySection:
+    if not isinstance(raw_section, dict):
+        raise ShadowOperationsConfigError(f"provider_health.required_categories.{category} must be a mapping")
+    missing = _PROVIDER_HEALTH_CATEGORY_KEYS - raw_section.keys()
+    if missing:
+        raise ShadowOperationsConfigError(
+            f"provider_health.required_categories.{category} missing keys: {sorted(missing)}"
+        )
+    unknown = raw_section.keys() - _PROVIDER_HEALTH_CATEGORY_KEYS
+    if unknown:
+        raise ShadowOperationsConfigError(
+            f"provider_health.required_categories.{category} has unknown fields: {sorted(unknown)}"
+        )
+    providers = raw_section["providers"]
+    if not isinstance(providers, list) or not all(isinstance(p, str) and p.strip() for p in providers):
+        raise ShadowOperationsConfigError(
+            f"provider_health.required_categories.{category}.providers must be a non-empty list of strings"
+        )
+    return ProviderHealthCategorySection(
+        providers=tuple(providers),
+        minimum_requests=_strict_positive_int(
+            raw_section["minimum_requests"], f"provider_health.required_categories.{category}.minimum_requests"
+        ),
+        minimum_success_rate=float(_strict_rate(
+            raw_section["minimum_success_rate"],
+            f"provider_health.required_categories.{category}.minimum_success_rate",
+        )),
+    )
+
+
+def _strict_rate(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0.0 <= float(value) <= 1.0):
+        raise ShadowOperationsConfigError(f"{field_name} must be a number in [0,1]")
+    return float(value)
+
+
+def _parse_provider_health(raw: dict) -> "ProviderHealthSection | None":
+    """`provider_health` is an OPTIONAL top-level section — absent entirely
+    means `None` (callers keep the pre-existing Python-default sample
+    floor/success-rate behavior). Present-but-malformed always fails closed:
+    an unknown category name, an empty providers list, an out-of-range
+    number, or an unrecognized field all raise rather than being silently
+    ignored or coerced."""
+    section = raw.get("provider_health")
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ShadowOperationsConfigError("provider_health must be a mapping")
+    unknown_top = section.keys() - {"policy_version", "required_categories"}
+    if unknown_top:
+        raise ShadowOperationsConfigError(f"provider_health has unknown fields: {sorted(unknown_top)}")
+    policy_version = section.get("policy_version", PROVIDER_HEALTH_POLICY_VERSION)
+    if type(policy_version) is not str or not policy_version.strip():
+        raise ShadowOperationsConfigError("provider_health.policy_version must be a non-empty string")
+    raw_categories = section.get("required_categories", {})
+    if not isinstance(raw_categories, dict) or not raw_categories:
+        raise ShadowOperationsConfigError("provider_health.required_categories must be a non-empty mapping")
+    required_categories = {
+        category: _parse_provider_health_category(raw_section, category=category)
+        for category, raw_section in raw_categories.items()
+    }
+    return ProviderHealthSection(policy_version=policy_version, required_categories=required_categories)
 
 
 @dataclass(frozen=True)
@@ -344,6 +483,7 @@ class ShadowOperationsConfiguration:
     config_hash: str
     raw: dict
     health_hysteresis: HealthHysteresisSection = DEFAULT_HEALTH_HYSTERESIS
+    provider_health: "ProviderHealthSection | None" = None
 
 
 def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOperationsConfiguration:
@@ -470,8 +610,13 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
             ),
             pause_on_budget_breach=_strict_bool(safety["pause_on_budget_breach"], "safety.pause_on_budget_breach"),
             minimum_requests_for_failure_rate=int(safety.get("minimum_requests_for_failure_rate", 1)),
+            pause_on_model_provider_failure_rate=float(safety.get("pause_on_model_provider_failure_rate", 0.5)),
+            minimum_requests_for_model_provider_failure_rate=int(
+                safety.get("minimum_requests_for_model_provider_failure_rate", 1)
+            ),
         )
         health_hysteresis_section = _parse_health_hysteresis(raw)
+        provider_health_section = _parse_provider_health(raw)
     except ShadowOperationsConfigError:
         raise
     except Exception as exc:
@@ -480,5 +625,5 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
     return ShadowOperationsConfiguration(
         version=raw.get("version", 1), shadow_operations=shadow_operations_section, schedule=schedule_section,
         budgets=budgets_section, safety=safety_section, config_hash=hash_config(raw), raw=raw,
-        health_hysteresis=health_hysteresis_section,
+        health_hysteresis=health_hysteresis_section, provider_health=provider_health_section,
     )

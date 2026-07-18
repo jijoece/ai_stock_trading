@@ -226,6 +226,11 @@ ALLOWED_METADATA_KEYS = frozenset(
         "usage_present",
         "event_count",
         "cli_version",
+        # Milestone 12.1.1 Item 6: safe version-preflight provenance — never a
+        # secret, always one of a bounded set of already-validated semver
+        # strings the operator or `codex_version_policy.py` itself supplied.
+        "configured_minimum_version",
+        "adapter_version",
     }
 )
 
@@ -401,6 +406,64 @@ def new_failure(
         field_path=field_path, claim_id=claim_id, evidence_ids=tuple(evidence_ids), retryable=retryable,
         model_name=model_name, prompt_version=prompt_version, schema_version=schema_version,
         occurred_at=occurred_at, metadata=dict(metadata or {}),
+    )
+
+
+# Milestone 12.1.1 Item 2: deterministic primary-failure selection. An attempt
+# can carry several independent `ResearchValidationFailure` rows (e.g. three
+# rejected claims, or a schema failure alongside a claim failure) — the
+# `ResearchAttemptRecord.failure_code`/`failure_stage`/`failure_retryable`
+# summary columns must pick exactly one of them the same way regardless of
+# the order the failures happened to be appended in. Never uses `message`
+# (free text) to rank or break ties — only the already-validated, allowlisted
+# `stage`/`code`/`retryable` fields.
+PRIMARY_FAILURE_POLICY_VERSION = "primary-failure-selection/v1"
+
+_PROVIDER_STAGES = (STAGE_PROVIDER_REQUEST, STAGE_PROVIDER_RESPONSE)
+_CONTRACT_STAGES = (STAGE_TOOL_USE_EXTRACTION, STAGE_JSON_DECODING, STAGE_STRUCTURED_SCHEMA, STAGE_ROLE_REPORT_VALIDATION)
+_CLAIM_STAGES = (STAGE_CLAIM_EVIDENCE_VALIDATION, STAGE_NUMERIC_CLAIM_VALIDATION, STAGE_PROMPT_INJECTION_VALIDATION)
+
+
+def _failure_tier(failure: ResearchValidationFailure) -> int:
+    """Lower number = higher priority. Every branch is derived only from the
+    already-typed/validated `stage` and `retryable` fields — never from
+    `code` free-form matching or `message` text. A stage this policy does not
+    otherwise recognize (including any future taxonomy addition) falls
+    through to the lowest-priority "diagnostic failure" tier rather than
+    raising or silently outranking a real provider/contract failure — fails
+    closed toward "least operationally alarming", never toward "most".
+    """
+    if failure.stage in _PROVIDER_STAGES and not failure.retryable:
+        return 0  # structural provider failure
+    if failure.stage in _CONTRACT_STAGES and not failure.retryable:
+        return 1  # non-retryable provider contract failure
+    if failure.stage == STAGE_BUDGET_GATED:
+        return 2  # budget or kill failure
+    if failure.stage in _PROVIDER_STAGES and failure.retryable:
+        return 3  # retryable provider failure
+    if failure.stage in _CONTRACT_STAGES and failure.retryable:
+        return 4  # schema validation
+    if failure.stage in _CLAIM_STAGES:
+        return 5  # claim validation
+    return 6  # diagnostic failure (RETRY_EXHAUSTED, REQUIRED_ROLE_FAILED, MANAGER_SKIPPED, PERSISTENCE, UNKNOWN, ...)
+
+
+def select_primary_failure(
+    failures: "list[ResearchValidationFailure] | tuple[ResearchValidationFailure, ...]",
+) -> ResearchValidationFailure | None:
+    """Deterministically picks the one failure that should drive
+    attempt-level operational behavior out of possibly several failures on
+    the same attempt. Stable under any reordering of `failures`: the
+    selection key is `(tier, stage, code, field_path, claim_id, failure_id)`
+    — every component already stage/code-validated or a deterministic hash
+    (`failure_id`), never the human-readable `message`."""
+    if not failures:
+        return None
+    return min(
+        failures,
+        key=lambda f: (
+            _failure_tier(f), f.stage, f.code, f.field_path or "", f.claim_id or "", f.failure_id,
+        ),
     )
 
 
