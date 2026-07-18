@@ -11,11 +11,11 @@ computation, or a value copied from an already-frozen recommendation
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from ..hashing import hash_config
 from ..research.models import EXPERIMENT_ARMS
 
 BOOK_STATUS_ACTIVE = "ACTIVE"
@@ -94,8 +94,6 @@ def derive_paper_order_intent_id(recommendation_id: str, book_id: str, execution
     return f"pb-intent-{digest}"
 
 
-def _content_hash(payload: dict) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -162,12 +160,18 @@ class PaperPortfolioSnapshot:
             raise PaperBookModelError("source_hash is required")
 
 
-def compute_snapshot_id(book_id: str, as_of: datetime, position_price_inputs: dict) -> str:
-    """Content hash over book_id + as_of + every position/price input feeding
-    the snapshot — identical inputs always reproduce the same ID; a changed
-    input always produces a different one (docs/milestone-8.md Step 8)."""
-    payload = {"book_id": book_id, "as_of": as_of.isoformat(), "inputs": position_price_inputs}
-    return f"pb-snap-{_content_hash(payload)}"
+def compute_snapshot_id(payload: dict) -> str:
+    """Content hash over the full canonical snapshot-identity payload
+    (`valuation.py::_snapshot_identity_payload` — book_id, as_of, and every
+    economically material cash/ledger/position/price input feeding the
+    snapshot). Identical inputs always reproduce the same ID; a changed
+    input always produces a different one (docs/milestone-8.md Step 8;
+    Milestone 11.3.1 Item 3 widened the payload to cover cash and ledger
+    state, not just position/price). Uses `hash_config` rather than
+    `json.dumps(..., default=str)`: an unsupported value fails loudly
+    instead of being silently stringified, and sorted keys make the result
+    independent of the caller's dict/insertion ordering."""
+    return f"pb-snap-{hash_config(payload)}"
 
 
 @dataclass(frozen=True)
