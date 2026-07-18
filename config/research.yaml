@@ -10,7 +10,7 @@
 version: 1
 
 research:
-  enabled: false
+  enabled: true
   provider: deterministic       # deterministic | scripted | anthropic | claude_code | codex
   model: null                   # use `sonnet` explicitly for provider: claude_code; an explicit
                                  # Codex model id (e.g. the configured chat model) for provider: codex
@@ -49,8 +49,8 @@ claude_code:
 # activate it. The operator should replace working_directory with a private
 # 0700 runtime directory outside the repository.
 codex:
-  binary_path: /opt/homebrew/bin/codex
-  minimum_version: "0.144.5"
+  binary_path: /Users/jijopaul/.npm-global/bin/codex
+  minimum_version: "0.144.6"
   terminate_grace_seconds: 5
   maximum_stdout_bytes: 1048576
   maximum_stderr_bytes: 65536
