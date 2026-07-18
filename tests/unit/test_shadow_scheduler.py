@@ -674,7 +674,8 @@ def test_completed_cycle_writes_health_summary_with_real_provider_success_rate(c
     from trading_research.storage.shadow_alerts_repositories import list_alerts, list_run_summaries
     summaries = list_run_summaries(conn)
     assert len(summaries) == 1
-    assert summaries[0]["provider_success_rate"] == 1.0
+    assert summaries[0]["provider_success_rate"] is None
+    assert summaries[0]["provider_health_mode"] == "NOT_APPLICABLE"
     assert summaries[0]["health_status"] == "HEALTHY"
     # No alert on a fully-healthy COMPLETED cycle.
     assert list_alerts(conn) == []
@@ -859,8 +860,9 @@ def test_degraded_cycle_raises_no_pause_alert_and_no_pause(conn):
     from trading_research.storage.shadow_alerts_repositories import list_run_summaries
 
     summary = [s for s in list_run_summaries(conn) if s["scheduler_run_id"] == result.scheduler_run_id][0]
-    assert summary["provider_success_rate"] == 0.5  # 1 of 2 symbols completed -> failure_rate 0.5
-    assert summary["health_status"] == "DEGRADED"  # 0.5 > degraded threshold 0.3, not > pause threshold 0.5
+    assert summary["provider_success_rate"] is None
+    assert summary["provider_health_mode"] == "NOT_APPLICABLE"
+    assert summary["health_status"] == "HEALTHY"
     assert pause_mod.current_state(conn).state == pause_mod.STATE_ACTIVE
 
     from trading_research.storage.shadow_alerts_repositories import list_alerts
@@ -989,4 +991,4 @@ def test_partially_complete_cycle_raises_partial_alert(conn):
     assert len(alerts) == 1
     assert alerts[0]["alert_type"] == "CYCLE_PARTIALLY_COMPLETE"
     summaries = list_run_summaries(conn)
-    assert summaries[0]["provider_success_rate"] == 0.5
+    assert summaries[0]["provider_success_rate"] is None

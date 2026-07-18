@@ -1108,6 +1108,7 @@ def _make_persist_hook(conn) -> "Callable[[dict], None] | None":
             cache_status=record["cache_status"], rate_limited=record["rate_limited"], retry_count=record["retry_count"],
             latency_ms=record["latency_ms"], success=record["success"], error_code=record["error_code"],
             retryable=record["retryable"], licensing_classification=licensing, raw_payload=None,
+            transport_failure_category=record.get("transport_failure_category", "NONE"),
         ))
 
     return _hook
@@ -1402,6 +1403,8 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
 
     from .analysis.scorer import load_scoring_config
     from .analysis.screener import load_screening_config
+    from .evidence_providers.config import load_evidence_provider_config
+    from .evidence_providers.health import ProviderCoveragePolicy, coverage_policy_from_configuration
     from .models.trading_models import PortfolioState
     from .research.configuration import load_research_config
     from .research.deterministic_provider import DeterministicResearchProvider
@@ -1608,6 +1611,8 @@ def run_due_shadow_cycle_cli(
 
     from .analysis.scorer import load_scoring_config
     from .analysis.screener import load_screening_config
+    from .evidence_providers.config import load_evidence_provider_config
+    from .evidence_providers.health import ProviderCoveragePolicy, coverage_policy_from_configuration
     from .models.trading_models import PortfolioState
     from .research.configuration import load_research_config
     from .research.deterministic_provider import DeterministicResearchProvider
@@ -1640,6 +1645,13 @@ def run_due_shadow_cycle_cli(
     research_config = load_research_config(research_config_path) if research_config_path is not None else load_research_config()
     pricing_entries = load_pricing_config()
     cfg = load_config()
+    provider_coverage_policy = (
+        ProviderCoveragePolicy(
+            telemetry_expected=False, configuration_hash=cycle_config.config_hash,
+        )
+        if provider_mode == PROVIDER_MODE_FIXTURE else
+        coverage_policy_from_configuration(load_evidence_provider_config())
+    )
 
     if provider_mode == PROVIDER_MODE_REAL:
         research_provider_name = research_config.provider
@@ -1785,6 +1797,7 @@ def run_due_shadow_cycle_cli(
                 clock=lambda: datetime.now(_tz.utc), research_provider_name=research_provider_name,
                 research_model_name=research_model_name, research_roles=research_config.roles,
                 deployment_source=DEPLOYMENT_SOURCE_MANUAL,
+                provider_coverage_policy=provider_coverage_policy,
             )
     except Exception as exc:  # only a genuine internal error is non-zero-exit-worthy
         return {"error": str(exc), "status": "INTERNAL_ERROR"}
@@ -2263,7 +2276,9 @@ def shadow_health_explain_cli(
     as `{"error": ...}` (mapped to a nonzero exit code by the caller), never
     an unhandled exception or a fabricated empty-but-successful result."""
     from .shadow.health import CHECK_NAMES_IN_ORDER
-    from .storage.shadow_alerts_repositories import list_health_checks, load_run_summary
+    from .storage.shadow_alerts_repositories import (
+        list_health_checks, load_latest_health_hysteresis_evaluation_for_cycle, load_run_summary,
+    )
     from .storage.shadow_operations_repositories import find_scheduler_run_by_cycle_id
 
     if not scheduler_run_id and not cycle_id:
@@ -2282,6 +2297,11 @@ def shadow_health_explain_cli(
             return {"error": f"no shadow_run_summaries row found for scheduler_run_id={resolved_scheduler_run_id!r}"}
 
         checks = list_health_checks(conn, scheduler_run_id=resolved_scheduler_run_id)
+        resolved_cycle_id = checks[0]["cycle_id"] if checks else cycle_id
+        hysteresis_evaluation = (
+            load_latest_health_hysteresis_evaluation_for_cycle(conn, resolved_cycle_id)
+            if resolved_cycle_id else None
+        )
 
     # Deterministic ordering: the same canonical, versioned dimension order
     # `shadow/health.py::evaluate_cycle_health` builds `HealthResult.checks`
@@ -2291,13 +2311,39 @@ def shadow_health_explain_cli(
 
     return {
         "scheduler_run_id": resolved_scheduler_run_id,
-        "cycle_id": checks[0]["cycle_id"] if checks else None,
+        "cycle_id": resolved_cycle_id,
         "health_status": summary["health_status"],
+        "single_cycle_status": summary.get("single_cycle_status"),
+        "hysteresis_status": summary.get("hysteresis_status"),
+        "effective_status": summary.get("effective_status") or summary["health_status"],
         "policy_version": summary["policy_version"],
         "reasons": json.loads(summary["health_reasons_json"]),
         "triggering_flags": [
             c["check_name"] for c in ordered_checks if c["check_status"] == "FAIL" and c["pause_flag_enabled"]
         ],
+        "provider_health": {
+            "mode": summary.get("provider_health_mode"),
+            "sample_size": summary.get("provider_request_count"),
+            "minimum_sample_size": summary.get("provider_minimum_sample_size"),
+            "qualified": bool(summary.get("provider_health_qualified")) if summary.get("provider_health_qualified") is not None else None,
+            "policy_hash": summary.get("provider_policy_hash"),
+            "coverage": json.loads(summary["provider_coverage_json"]) if summary.get("provider_coverage_json") else None,
+            "severe_categories": json.loads(summary["provider_severe_categories_json"]) if summary.get("provider_severe_categories_json") else [],
+        },
+        "hysteresis_evaluation": (
+            {
+                **hysteresis_evaluation,
+                **{
+                    key: json.loads(hysteresis_evaluation[key])
+                    for key in (
+                        "required_categories_json", "required_providers_json", "observed_providers_json",
+                        "missing_required_providers_json", "missing_required_categories_json",
+                        "per_provider_metrics_json", "severe_error_categories_json", "reasons_json",
+                    )
+                },
+            }
+            if hysteresis_evaluation else None
+        ),
         "checks": [
             {
                 "check_name": c["check_name"], "status": c["check_status"], "input_value": c["input_value"],

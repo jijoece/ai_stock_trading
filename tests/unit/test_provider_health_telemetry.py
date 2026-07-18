@@ -55,9 +55,9 @@ def test_malformed_response_is_protocol_or_schema_break():
     assert classify_severe_error(row) == SEVERE_PROTOCOL_OR_SCHEMA_BREAK
 
 
-def test_connection_error_with_no_http_status_is_dns_or_connection_failure():
+def test_unknown_no_response_error_is_not_assumed_severe():
     row = _row(success=False, error_code="ProviderRequestError", http_status=None)
-    assert classify_severe_error(row) == SEVERE_DNS_OR_CONNECTION_FAILURE
+    assert classify_severe_error(row) is None
 
 
 def test_connection_error_with_http_status_is_not_dns_failure():
@@ -67,9 +67,9 @@ def test_connection_error_with_http_status_is_not_dns_failure():
     assert classify_severe_error(row) != SEVERE_DNS_OR_CONNECTION_FAILURE
 
 
-def test_repeated_rate_limit_exhaustion():
+def test_repeated_rate_limit_exhaustion_remains_hysteresis_input():
     row = _row(success=False, rate_limited=1, retry_count=3)
-    assert classify_severe_error(row) == SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION
+    assert classify_severe_error(row) is None
 
 
 def test_single_rate_limit_hit_is_not_severe():
@@ -146,6 +146,7 @@ def test_build_health_inputs_uses_real_provider_request_count_over_symbol_proxy(
             normalized_record_hash=None, cache_status="MISS", rate_limited=False, retry_count=0,
             latency_ms=50, success=(i != 4), error_code=None if i != 4 else "ProviderRequestError",
             retryable=False, licensing_classification="ACCOUNT_LINKED",
+            correlation_mode="RESEARCH_CYCLE", research_cycle_id="cycle-test",
         ))
 
     from trading_research.research.scheduled_cycle import SymbolCycleResult
@@ -164,7 +165,7 @@ def test_build_health_inputs_uses_real_provider_request_count_over_symbol_proxy(
     conn.close()
 
 
-def test_build_health_inputs_falls_back_to_symbol_proxy_when_no_real_requests_in_window():
+def test_build_health_inputs_zero_requests_stays_insufficient_without_symbol_fallback():
     from trading_research.research.scheduled_cycle import ResearchCycleResult, SymbolCycleResult
     from trading_research.shadow.scheduler import _build_health_inputs_from_cycle_result
     from trading_research.storage.database import connect
@@ -180,8 +181,8 @@ def test_build_health_inputs_falls_back_to_symbol_proxy_when_no_real_requests_in
         conn, cycle_result, symbols_attempted=1, cycle_duration_seconds=1.0,
         bounded_symbols=("AAPL",), window_start=as_of, window_end=as_of + timedelta(minutes=5),
     )
-    assert inputs.provider_request_count == 1  # falls back to the symbol-level proxy
-    assert inputs.provider_success_rate == 1.0
+    assert inputs.provider_request_count == 0
+    assert inputs.provider_success_rate is None
     conn.close()
 
 
@@ -198,6 +199,8 @@ def test_build_health_inputs_severe_provider_error_is_wired_through():
         provider_response_timestamp=None, http_status=401, content_hash=None, normalized_record_hash=None,
         cache_status="MISS", rate_limited=False, retry_count=0, latency_ms=50, success=False,
         error_code="ProviderRequestError", retryable=False, licensing_classification="ACCOUNT_LINKED",
+        correlation_mode="RESEARCH_CYCLE", research_cycle_id="cycle-test",
+        transport_failure_category="AUTHENTICATION_FAILURE",
     ))
     cycle_result = ResearchCycleResult(
         cycle_id="cycle-test", universe_id="test-universe", as_of=as_of, status="COMPLETED",

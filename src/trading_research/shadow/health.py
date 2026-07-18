@@ -62,6 +62,7 @@ REASON_RETRY_EXHAUSTION_RATE = "retry_exhaustion_rate"
 REASON_UNSUPPORTED_CLAIM_RATE = "unsupported_claim_rate"
 REASON_RECONCILIATION_MISMATCH = "reconciliation_mismatch"
 REASON_BUDGET_BREACH = "budget_breach"
+REASON_PROVIDER_STRUCTURAL_ERROR = "provider_structural_error"
 # docs/milestone-7.2.md Part 6/9: a duplicate-prevention (lease/idempotency)
 # violation is a structural safety-guarantee break, not a configurable rate —
 # it previously reused REASON_RECONCILIATION_MISMATCH's flag, which meant an
@@ -154,6 +155,16 @@ class CycleHealthInputs:
     # rate looks bad but might just be one flaky call."
     provider_request_count: int | None = None
     provider_severe_error: bool = False
+    provider_health_mode: str = "PRODUCTION"
+    provider_required_categories: tuple[str, ...] = ()
+    provider_required_providers: tuple[str, ...] = ()
+    provider_observed_providers: tuple[str, ...] = ()
+    provider_missing_required_providers: tuple[str, ...] = ()
+    provider_missing_required_categories: tuple[str, ...] = ()
+    provider_per_provider_metrics: dict = field(default_factory=dict)
+    provider_severe_error_categories: tuple[str, ...] = ()
+    provider_policy_version: str = ""
+    provider_policy_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -251,6 +262,76 @@ class HealthResult:
 # name resolves to the identical class ("use existing conventions where
 # possible").
 CycleHealthResult = HealthResult
+
+
+@dataclass(frozen=True)
+class EffectiveHealthDecision:
+    single_cycle_status: str
+    hysteresis_status: str
+    effective_status: str
+    immediate_pause: bool
+    reasons: tuple[str, ...]
+    triggering_flags: tuple[str, ...]
+    policy_version: str
+
+    @property
+    def status(self) -> str:
+        return self.effective_status
+
+
+def provider_health_check(result: HealthResult) -> HealthCheckResult:
+    return next(check for check in result.checks if check.check_name == CHECK_NAME_PROVIDER_FAILURE_RATE)
+
+
+def provider_health_is_qualified(result: HealthResult) -> bool:
+    return provider_health_check(result).status in (
+        CHECK_STATUS_PASS, CHECK_STATUS_WARNING, CHECK_STATUS_FAIL,
+    )
+
+
+def combine_effective_health_decision(
+    single_cycle: HealthResult, hysteresis_status: str, *, provider_severe_categories: tuple[str, ...] = (),
+) -> EffectiveHealthDecision:
+    structural_flags = {
+        REASON_RECONCILIATION_MISMATCH, REASON_DUPLICATE_PREVENTION_VIOLATION, REASON_BUDGET_BREACH,
+    }
+    immediate_pause = bool(structural_flags.intersection(single_cycle.triggering_flags)) or bool(
+        provider_severe_categories
+    )
+    if immediate_pause:
+        effective_status = STATUS_PAUSE_REQUIRED
+    elif single_cycle.status == STATUS_PAUSE_REQUIRED:
+        # Non-structural rate failures are governed by persistent hysteresis.
+        effective_status = hysteresis_status
+    else:
+        # Preserve alert-only single-cycle warnings/recommendations from
+        # non-provider dimensions without allowing them to bypass pausing.
+        effective_status = _worse(single_cycle.status, hysteresis_status)
+    flags = list(single_cycle.triggering_flags)
+    reasons = list(single_cycle.reasons)
+    if provider_severe_categories:
+        flags.append(REASON_PROVIDER_STRUCTURAL_ERROR)
+        reasons.append(
+            "structural provider categories require immediate pause: " + ", ".join(provider_severe_categories)
+        )
+    reasons.append(
+        f"single_cycle={single_cycle.status}; hysteresis={hysteresis_status}; effective={effective_status}"
+    )
+    return EffectiveHealthDecision(
+        single_cycle_status=single_cycle.status, hysteresis_status=hysteresis_status,
+        effective_status=effective_status, immediate_pause=immediate_pause,
+        reasons=tuple(reasons), triggering_flags=tuple(dict.fromkeys(flags)),
+        policy_version=single_cycle.policy_version,
+    )
+
+
+def immediate_pause_required(
+    single_cycle: HealthResult, *, provider_severe_categories: tuple[str, ...] = (),
+) -> bool:
+    structural_flags = {
+        REASON_RECONCILIATION_MISMATCH, REASON_DUPLICATE_PREVENTION_VIOLATION, REASON_BUDGET_BREACH,
+    }
+    return bool(structural_flags.intersection(single_cycle.triggering_flags)) or bool(provider_severe_categories)
 
 
 def _worse(a: str, b: str) -> str:
@@ -365,6 +446,25 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
         sample_size=inputs.provider_request_count, minimum_sample_size=config.minimum_requests_for_failure_rate,
         sample_floor_bypassed=inputs.provider_severe_error,
     )
+    if inputs.provider_health_mode == CHECK_STATUS_NOT_APPLICABLE:
+        check = HealthCheckResult(
+            check_name=CHECK_NAME_PROVIDER_FAILURE_RATE, status=CHECK_STATUS_NOT_APPLICABLE,
+            input_value=None, input_unit="fraction", threshold_value=_fmt(config.pause_on_provider_failure_rate),
+            threshold_unit="fraction", comparison="n/a", applicable=False, pause_flag_enabled=False,
+            reason="provider telemetry is explicitly not applicable for this fixture-only cycle",
+        )
+        fail_reason = degraded_reason = None
+    elif inputs.provider_missing_required_providers or inputs.provider_missing_required_categories:
+        missing = tuple(inputs.provider_missing_required_categories) + tuple(inputs.provider_missing_required_providers)
+        fail_reason = "required provider coverage missing: " + ", ".join(missing)
+        degraded_reason = None
+        check = HealthCheckResult(
+            check_name=CHECK_NAME_PROVIDER_FAILURE_RATE, status=CHECK_STATUS_FAIL,
+            input_value=_fmt(provider_failure_rate), input_unit="fraction",
+            threshold_value=_fmt(config.pause_on_provider_failure_rate), threshold_unit="fraction",
+            comparison="required coverage", applicable=True,
+            pause_flag_enabled=config.pause_on_provider_failure_rate > 0, reason=fail_reason,
+        )
     checks[CHECK_NAME_PROVIDER_FAILURE_RATE] = check
     if fail_reason:
         reasons.append(fail_reason)
@@ -636,6 +736,7 @@ _FLAG_TO_PAUSE_TARGET = {
     REASON_RECONCILIATION_MISMATCH: pause_mod.STATE_PAUSED_RECONCILIATION,
     REASON_DUPLICATE_PREVENTION_VIOLATION: pause_mod.STATE_PAUSED_RECONCILIATION,
     REASON_BUDGET_BREACH: pause_mod.STATE_PAUSED_BUDGET,
+    REASON_PROVIDER_STRUCTURAL_ERROR: pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
 }
 
 _FLAG_TO_CONFIG_ATTR = {
@@ -651,7 +752,7 @@ _FLAG_TO_CONFIG_ATTR = {
 
 
 def apply_health_result(
-    conn, health_result: HealthResult, config: HealthPolicyConfig, clock: Clock,
+    conn, health_result: HealthResult | EffectiveHealthDecision, config: HealthPolicyConfig, clock: Clock,
     source: str = pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE,
 ) -> pause_mod.PauseState | None:
     """The ONLY function in this module that calls
@@ -685,6 +786,7 @@ def apply_health_result(
         # pause_on_reconciliation_mismatch rate flag.
         REASON_DUPLICATE_PREVENTION_VIOLATION: True,
         REASON_BUDGET_BREACH: config.pause_on_budget_breach,
+        REASON_PROVIDER_STRUCTURAL_ERROR: True,
     }
 
     active_flags = [flag for flag in health_result.triggering_flags if boolish_flags.get(flag, False)]

@@ -112,6 +112,36 @@ CREATE TABLE IF NOT EXISTS shadow_health_hysteresis_state (
     reasons_json TEXT NOT NULL,
     per_provider_metrics_json TEXT NOT NULL DEFAULT '{}'
 );
+
+CREATE TABLE IF NOT EXISTS shadow_health_hysteresis_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    cycle_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    policy_hash TEXT NOT NULL,
+    single_cycle_status TEXT NOT NULL,
+    previous_hysteresis_status TEXT NOT NULL,
+    new_hysteresis_status TEXT NOT NULL,
+    effective_status TEXT NOT NULL,
+    qualified INTEGER NOT NULL,
+    sample_size INTEGER NOT NULL,
+    minimum_sample_size INTEGER NOT NULL,
+    aggregate_success_rate REAL,
+    required_categories_json TEXT NOT NULL,
+    required_providers_json TEXT NOT NULL,
+    observed_providers_json TEXT NOT NULL,
+    missing_required_providers_json TEXT NOT NULL,
+    missing_required_categories_json TEXT NOT NULL,
+    per_provider_metrics_json TEXT NOT NULL,
+    severe_error_categories_json TEXT NOT NULL,
+    consecutive_failures_before INTEGER NOT NULL,
+    consecutive_failures_after INTEGER NOT NULL,
+    consecutive_recoveries_before INTEGER NOT NULL,
+    consecutive_recoveries_after INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    UNIQUE(scope, cycle_id, policy_hash)
+);
 """
 
 SHADOW_ALERTS_INDEXES = """
@@ -127,6 +157,10 @@ CREATE INDEX IF NOT EXISTS idx_shadow_run_summaries_created ON shadow_run_summar
 CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_run ON shadow_run_health_checks(scheduler_run_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_cycle ON shadow_run_health_checks(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_shadow_run_health_checks_name ON shadow_run_health_checks(check_name);
+CREATE INDEX IF NOT EXISTS idx_shadow_health_evaluations_scope_time
+    ON shadow_health_hysteresis_evaluations(scope, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_health_evaluations_cycle
+    ON shadow_health_hysteresis_evaluations(cycle_id);
 """
 
 # Milestone 9.1 (docs/milestone9-1-controlled-soak-readiness.md): additive,
@@ -143,6 +177,18 @@ _SHADOW_ALERTS_COLUMN_UPGRADES = {
         "resolved_at": "TEXT",
         "resolved_by": "TEXT",
         "resolved_reason": "TEXT",
+    },
+    "shadow_run_summaries": {
+        "single_cycle_status": "TEXT",
+        "hysteresis_status": "TEXT",
+        "effective_status": "TEXT",
+        "provider_health_mode": "TEXT",
+        "provider_request_count": "INTEGER",
+        "provider_minimum_sample_size": "INTEGER",
+        "provider_health_qualified": "INTEGER",
+        "provider_policy_hash": "TEXT",
+        "provider_coverage_json": "TEXT",
+        "provider_severe_categories_json": "TEXT",
     },
 }
 

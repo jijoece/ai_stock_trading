@@ -18,7 +18,7 @@ explicitly safe to retain in full (see `evidence_providers/persistence.py`).
 """
 from __future__ import annotations
 
-EVIDENCE_PROVIDER_SCHEMA_VERSION = 1
+EVIDENCE_PROVIDER_SCHEMA_VERSION = 2
 
 EVIDENCE_PROVIDER_DDL = """
 CREATE TABLE IF NOT EXISTS evidence_provider_requests (
@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS evidence_provider_requests (
     licensing_classification TEXT NOT NULL,
     raw_payload_stored INTEGER NOT NULL,
     raw_payload_json TEXT,
+    correlation_mode TEXT NOT NULL DEFAULT 'LEGACY_MANUAL',
+    research_cycle_id TEXT,
+    scheduler_run_id TEXT,
+    research_run_id TEXT,
+    symbol_attempt_id TEXT,
+    provider_request_group_id TEXT,
+    transport_failure_category TEXT NOT NULL DEFAULT 'NONE',
     created_at TEXT NOT NULL
 );
 
@@ -67,10 +74,32 @@ EVIDENCE_PROVIDER_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_provider ON evidence_provider_requests(provider, operation);
 CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_symbol ON evidence_provider_requests(symbol);
 CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_created ON evidence_provider_requests(created_at);
+CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_cycle
+    ON evidence_provider_requests(research_cycle_id, created_at, request_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_scheduler_run
+    ON evidence_provider_requests(scheduler_run_id, created_at, request_id);
 """
+
+_REQUEST_COLUMN_UPGRADES = {
+    "correlation_mode": "TEXT NOT NULL DEFAULT 'LEGACY_MANUAL'",
+    "research_cycle_id": "TEXT",
+    "scheduler_run_id": "TEXT",
+    "research_run_id": "TEXT",
+    "symbol_attempt_id": "TEXT",
+    "provider_request_group_id": "TEXT",
+    "transport_failure_category": "TEXT NOT NULL DEFAULT 'NONE'",
+}
+
+
+def _ensure_request_columns(conn) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evidence_provider_requests)").fetchall()}
+    for name, declaration in _REQUEST_COLUMN_UPGRADES.items():
+        if existing and name not in existing:
+            conn.execute(f"ALTER TABLE evidence_provider_requests ADD COLUMN {name} {declaration}")
 
 
 def apply_evidence_provider_schema(conn) -> None:
     conn.executescript(EVIDENCE_PROVIDER_DDL)
+    _ensure_request_columns(conn)
     conn.executescript(EVIDENCE_PROVIDER_INDEXES)
     conn.commit()

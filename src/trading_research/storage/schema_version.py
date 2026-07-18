@@ -120,6 +120,31 @@ def _migration_4_codex_provider_cli_version(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE research_attempts ADD COLUMN provider_cli_version TEXT")
 
 
+def _migration_5_operational_integrity_telemetry(conn: sqlite3.Connection) -> None:
+    """Milestone 11.3.2: exact request ownership and bounded transport taxonomy.
+
+    Existing rows deliberately remain `LEGACY_MANUAL` with nullable ownership;
+    they can be inspected but can never be attributed to a new cycle.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(evidence_provider_requests)").fetchall()}
+    additions = (
+        ("correlation_mode", "TEXT NOT NULL DEFAULT 'LEGACY_MANUAL'"),
+        ("research_cycle_id", "TEXT"),
+        ("scheduler_run_id", "TEXT"),
+        ("research_run_id", "TEXT"),
+        ("symbol_attempt_id", "TEXT"),
+        ("provider_request_group_id", "TEXT"),
+        ("transport_failure_category", "TEXT NOT NULL DEFAULT 'NONE'"),
+    )
+    for column_name, column_type in additions:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE evidence_provider_requests ADD COLUMN {column_name} {column_type}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_provider_requests_cycle "
+        "ON evidence_provider_requests(research_cycle_id, created_at, request_id)"
+    )
+
+
 # Ordered, idempotent migrations. Each callable must be safe to invoke more
 # than once (defense in depth on top of the version gate, which normally
 # prevents re-invocation) and must not raise on a database that already has
@@ -137,6 +162,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     4: (
         "add generic provider_cli_version column for the Codex provider (Milestone 12)",
         _migration_4_codex_provider_cli_version,
+    ),
+    5: (
+        "add provider-request cycle correlation and transport taxonomy (Milestone 11.3.2)",
+        _migration_5_operational_integrity_telemetry,
     ),
 }
 

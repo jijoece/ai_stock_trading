@@ -10,6 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..hashing import hash_config
+from .http_client import (
+    TRANSPORT_AUTHENTICATION_FAILURE,
+    TRANSPORT_CONFIGURATION_ERROR,
+    TRANSPORT_PROTOCOL_ERROR,
+    TRANSPORT_TLS_FAILURE,
+)
+
 STATUS_HEALTHY = "HEALTHY"
 STATUS_DEGRADED = "DEGRADED"
 STATUS_UNAVAILABLE = "UNAVAILABLE"
@@ -87,12 +95,12 @@ def compute_all_provider_health(rows: list[dict]) -> tuple[ProviderHealthSummary
 # -- (`evidence_providers/errors.py`), so this mapping is a lookup over a ---
 # -- bounded, real vocabulary, not a text-pattern guess. ---------------------
 
-SEVERE_AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
-SEVERE_DNS_OR_CONNECTION_FAILURE = "DNS_OR_CONNECTION_FAILURE"
-SEVERE_TLS_FAILURE = "TLS_FAILURE"
-SEVERE_PROVIDER_CONFIGURATION_INVALID = "PROVIDER_CONFIGURATION_INVALID"
+SEVERE_AUTHENTICATION_FAILED = TRANSPORT_AUTHENTICATION_FAILURE
+SEVERE_DNS_OR_CONNECTION_FAILURE = "DNS_OR_CONNECTION_FAILURE"  # legacy display alias; no longer inferred
+SEVERE_TLS_FAILURE = TRANSPORT_TLS_FAILURE
+SEVERE_PROVIDER_CONFIGURATION_INVALID = TRANSPORT_CONFIGURATION_ERROR
 SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION = "REPEATED_RATE_LIMIT_EXHAUSTION"
-SEVERE_PROTOCOL_OR_SCHEMA_BREAK = "PROTOCOL_OR_SCHEMA_BREAK"
+SEVERE_PROTOCOL_OR_SCHEMA_BREAK = TRANSPORT_PROTOCOL_ERROR
 
 SEVERE_ERROR_CATEGORIES = (
     SEVERE_AUTHENTICATION_FAILED, SEVERE_DNS_OR_CONNECTION_FAILURE, SEVERE_TLS_FAILURE,
@@ -115,22 +123,87 @@ def classify_severe_error(row: dict) -> str | None:
         return None
     http_status = row.get("http_status")
     error_code = row.get("error_code")
-    if http_status in (401, 403):
+    transport_category = row.get("transport_failure_category")
+    if transport_category == TRANSPORT_AUTHENTICATION_FAILURE or http_status in (401, 403):
         return SEVERE_AUTHENTICATION_FAILED
-    if error_code == "ProviderConfigurationError":
+    if transport_category == TRANSPORT_CONFIGURATION_ERROR or error_code == "ProviderConfigurationError":
         return SEVERE_PROVIDER_CONFIGURATION_INVALID
-    if error_code == "MalformedProviderResponseError":
+    if transport_category == TRANSPORT_PROTOCOL_ERROR or error_code == "MalformedProviderResponseError":
         return SEVERE_PROTOCOL_OR_SCHEMA_BREAK
-    if row.get("rate_limited") and (row.get("retry_count") or 0) >= _REPEATED_RATE_LIMIT_RETRY_THRESHOLD:
-        return SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION
-    if error_code == "ProviderRequestError" and http_status is None:
-        # No HTTP response at all reached this adapter -- connection-level
-        # failure. TLS failures are not currently distinguishable from a
-        # generic connection failure at this persisted-field granularity,
-        # so both fold into this bucket (a documented limitation, not a
-        # guess from exception text).
-        return SEVERE_DNS_OR_CONNECTION_FAILURE
+    if transport_category == TRANSPORT_TLS_FAILURE:
+        return SEVERE_TLS_FAILURE
+    # Rate limits, timeouts, resets, DNS failures, refusals, and temporary
+    # server failures remain hysteresis inputs. They are not structural
+    # immediate-pause categories merely because no response arrived.
     return None
+
+
+PROVIDER_COVERAGE_POLICY_VERSION = "provider-coverage/v1"
+
+
+def normalize_provider_name(provider: str) -> str:
+    normalized = provider.strip().lower().replace("_", "-")
+    aliases = {
+        "alpaca": "alpaca-data", "alpaca-market-data": "alpaca-data", "alpacadata": "alpaca-data",
+        "sec": "sec-edgar", "edgar": "sec-edgar", "sec-edgar-api": "sec-edgar",
+        "alpaca-news-api": "alpaca-news", "alpacanews": "alpaca-news",
+    }
+    return aliases.get(normalized, normalized)
+
+
+@dataclass(frozen=True)
+class ProviderCoveragePolicy:
+    policy_version: str = PROVIDER_COVERAGE_POLICY_VERSION
+    required_categories: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    optional_providers: tuple[str, ...] = ()
+    unavailable_required_categories: tuple[str, ...] = ()
+    configuration_hash: str = ""
+    telemetry_expected: bool = True
+
+    @property
+    def required_providers(self) -> tuple[str, ...]:
+        return tuple(sorted({normalize_provider_name(p) for _, providers in self.required_categories for p in providers}))
+
+    @property
+    def required_category_names(self) -> tuple[str, ...]:
+        return tuple(category for category, _ in self.required_categories)
+
+    @property
+    def policy_hash(self) -> str:
+        return hash_config({
+            "policy_version": self.policy_version,
+            "required_categories": self.required_categories,
+            "optional_providers": tuple(sorted(normalize_provider_name(p) for p in self.optional_providers)),
+            "unavailable_required_categories": self.unavailable_required_categories,
+            "configuration_hash": self.configuration_hash,
+            "telemetry_expected": self.telemetry_expected,
+        })
+
+
+def coverage_policy_from_configuration(configuration, *, telemetry_expected: bool = True) -> ProviderCoveragePolicy:
+    """Resolve the versioned required-category policy from the frozen provider config."""
+    required: list[tuple[str, tuple[str, ...]]] = []
+    unavailable: list[str] = []
+    if configuration.sec.enabled:
+        required.append(("corporate_filings", ("sec-edgar",)))
+    else:
+        unavailable.append("corporate_filings")
+    if configuration.market_data.enabled:
+        required.append(("market_data", ("alpaca-data",)))
+    else:
+        unavailable.append("market_data")
+    optional: list[str] = []
+    if configuration.news.enabled:
+        optional.append("alpaca-news")
+    if configuration.sentiment.enabled:
+        optional.append("reddit-mcp")
+    if configuration.reddit_free.enabled:
+        optional.append("reddit-free")
+    return ProviderCoveragePolicy(
+        required_categories=tuple(required), optional_providers=tuple(optional),
+        unavailable_required_categories=tuple(sorted(unavailable)),
+        configuration_hash=configuration.config_hash, telemetry_expected=telemetry_expected,
+    )
 
 
 @dataclass(frozen=True)
@@ -151,24 +224,47 @@ class CycleProviderTelemetry:
     required_providers_missing: tuple[str, ...]
     severe_error: bool
     severe_error_categories: tuple[str, ...]
+    required_categories: tuple[str, ...] = ()
+    resolved_required_providers: tuple[str, ...] = ()
+    observed_providers: tuple[str, ...] = ()
+    missing_required_categories: tuple[str, ...] = ()
+    policy_version: str = PROVIDER_COVERAGE_POLICY_VERSION
+    policy_hash: str = ""
+    configuration_hash: str = ""
+    telemetry_expected: bool = True
 
 
 def compute_cycle_provider_telemetry(
     rows: list[dict], *, required_providers: tuple[str, ...] = (),
+    coverage_policy: ProviderCoveragePolicy | None = None,
 ) -> CycleProviderTelemetry:
-    total = len(rows)
-    successes = sum(1 for r in rows if r["success"])
+    normalized_rows = [{**row, "provider": normalize_provider_name(row["provider"])} for row in rows]
+    total = len(normalized_rows)
+    successes = sum(1 for r in normalized_rows if r["success"])
     aggregate_rate = (successes / total) if total > 0 else None
-    providers_seen = sorted({r["provider"] for r in rows})
-    per_provider = {provider: compute_provider_health(rows, provider) for provider in providers_seen}
-    missing = tuple(p for p in required_providers if p not in providers_seen)
+    providers_seen = sorted({r["provider"] for r in normalized_rows})
+    per_provider = {provider: compute_provider_health(normalized_rows, provider) for provider in providers_seen}
+    policy = coverage_policy or ProviderCoveragePolicy(
+        required_categories=(("legacy_required", tuple(required_providers)),) if required_providers else (),
+    )
+    resolved_required = policy.required_providers
+    missing = tuple(p for p in resolved_required if p not in providers_seen)
+    missing_categories = set(policy.unavailable_required_categories)
+    for category, providers in policy.required_categories:
+        if not any(normalize_provider_name(provider) in providers_seen for provider in providers):
+            missing_categories.add(category)
     severe_categories = sorted({
-        category for row in rows for category in (classify_severe_error(row),) if category is not None
+        category for row in normalized_rows for category in (classify_severe_error(row),) if category is not None
     })
     return CycleProviderTelemetry(
         total_requests=total, successful_requests=successes, aggregate_success_rate=aggregate_rate,
         per_provider=per_provider, required_providers_missing=missing,
         severe_error=bool(severe_categories), severe_error_categories=tuple(severe_categories),
+        required_categories=policy.required_category_names,
+        resolved_required_providers=resolved_required, observed_providers=tuple(providers_seen),
+        missing_required_categories=tuple(sorted(missing_categories)), policy_version=policy.policy_version,
+        policy_hash=policy.policy_hash, configuration_hash=policy.configuration_hash,
+        telemetry_expected=policy.telemetry_expected,
     )
 
 

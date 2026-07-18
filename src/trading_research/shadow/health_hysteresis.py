@@ -22,12 +22,14 @@ PAUSED_MANUAL or KILLED system state — see `_effective_decision`.
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable
 
 from ..hashing import hash_config
 from ..storage import shadow_alerts_repositories as repo
+from ..storage.transactions import transaction
 from . import pause as pause_mod
 from .health import STATUS_DEGRADED, STATUS_HEALTHY, STATUS_PAUSE_RECOMMENDED, STATUS_PAUSE_REQUIRED
 
@@ -97,6 +99,24 @@ class PersistentHealthDecision:
     reasons: tuple[str, ...]
     idempotent_replay: bool
     policy_reset: bool
+    previous_decision: str = STATUS_HEALTHY
+    policy_hash: str = ""
+    effective_status: str = STATUS_HEALTHY
+
+
+@dataclass(frozen=True)
+class HysteresisEvaluationEvidence:
+    sample_size: int = 0
+    minimum_sample_size: int = 0
+    aggregate_success_rate: float | None = None
+    required_categories: tuple[str, ...] = ()
+    required_providers: tuple[str, ...] = ()
+    observed_providers: tuple[str, ...] = ()
+    missing_required_providers: tuple[str, ...] = ()
+    missing_required_categories: tuple[str, ...] = ()
+    per_provider_metrics: dict | None = None
+    severe_error_categories: tuple[str, ...] = ()
+    provider_policy_hash: str = ""
 
 
 def _initial_state(scope: str, config: PersistentHealthPolicyConfig, now: datetime) -> dict:
@@ -123,9 +143,19 @@ def _effective_decision(conn, computed_decision: str) -> tuple[str, bool]:
     return computed_decision, False
 
 
+def _operational_effective(single_cycle_status: str, hysteresis_status: str, immediate_pause: bool) -> str:
+    if immediate_pause:
+        return STATUS_PAUSE_REQUIRED
+    if single_cycle_status == STATUS_PAUSE_REQUIRED:
+        return hysteresis_status
+    order = {STATUS_HEALTHY: 0, STATUS_DEGRADED: 1, STATUS_PAUSE_RECOMMENDED: 2, STATUS_PAUSE_REQUIRED: 3}
+    return single_cycle_status if order[single_cycle_status] >= order[hysteresis_status] else hysteresis_status
+
+
 def evaluate_and_persist_hysteresis(
     conn, *, scope: str = DEFAULT_SCOPE, cycle_id: str, cycle_status: str, qualified: bool,
     severe_error: bool = False, config: PersistentHealthPolicyConfig, clock: Clock,
+    evidence: HysteresisEvaluationEvidence | None = None, immediate_pause: bool = False,
 ) -> PersistentHealthDecision:
     """Advance (or replay) the persistent hysteresis state machine by
     exactly one cycle.
@@ -145,8 +175,32 @@ def evaluate_and_persist_hysteresis(
         raise HysteresisPolicyError(f"cycle_status {cycle_status!r} is not a known health status")
 
     now = clock()
+    evidence = evidence or HysteresisEvaluationEvidence()
+    policy_hash = hash_config({
+        "hysteresis_policy_hash": config.config_hash(),
+        "provider_policy_hash": evidence.provider_policy_hash,
+    })
+    prior_evaluation = repo.load_health_hysteresis_evaluation(
+        conn, scope=scope, cycle_id=cycle_id, policy_hash=policy_hash,
+    )
+    if prior_evaluation is not None:
+        return PersistentHealthDecision(
+            # Replay the persisted operational decision as well as the
+            # rolling hysteresis state.  In particular, a manual pause or
+            # kill may have forced `effective_status=PAUSE_REQUIRED` even
+            # when the computed hysteresis status was healthy; returning the
+            # raw status here would let a scheduler replay clear that fence.
+            scope=scope, decision=prior_evaluation["effective_status"],
+            consecutive_failures=prior_evaluation["consecutive_failures_after"],
+            consecutive_recoveries=prior_evaluation["consecutive_recoveries_after"],
+            qualified_cycle_count=(repo.load_health_hysteresis_state(conn, scope) or {}).get("qualified_cycle_count", 0),
+            failing_cycle_count=(repo.load_health_hysteresis_state(conn, scope) or {}).get("failing_cycle_count", 0),
+            reasons=tuple(json.loads(prior_evaluation["reasons_json"])), idempotent_replay=True,
+            policy_reset=False, previous_decision=prior_evaluation["previous_hysteresis_status"],
+            policy_hash=policy_hash, effective_status=prior_evaluation["effective_status"],
+        )
+
     existing = repo.load_health_hysteresis_state(conn, scope)
-    policy_hash = config.config_hash()
     policy_reset = False
 
     if existing is None:
@@ -158,18 +212,12 @@ def evaluate_and_persist_hysteresis(
         # the old policy.
         state = _initial_state(scope, config, now)
         policy_reset = True
-    elif existing.get("last_cycle_id") == cycle_id:
-        # Idempotent replay of the same cycle -- no state change.
-        return PersistentHealthDecision(
-            scope=scope, decision=existing["decision"], consecutive_failures=existing["consecutive_failures"],
-            consecutive_recoveries=existing["consecutive_recoveries"],
-            qualified_cycle_count=existing["qualified_cycle_count"],
-            failing_cycle_count=existing["failing_cycle_count"],
-            reasons=tuple(json.loads(existing["reasons_json"])), idempotent_replay=True, policy_reset=False,
-        )
     else:
         state = dict(existing)
 
+    previous_decision = state["decision"]
+    failures_before = state["consecutive_failures"]
+    recoveries_before = state["consecutive_recoveries"]
     consecutive_failures = state["consecutive_failures"]
     consecutive_recoveries = state["consecutive_recoveries"]
     qualified_cycle_count = state["qualified_cycle_count"]
@@ -213,7 +261,10 @@ def evaluate_and_persist_hysteresis(
         else:
             reasons.append(f"consecutive healthy qualified cycles = {consecutive_recoveries}")
 
-    effective_decision, forced_by_system_state = _effective_decision(conn, decision)
+    if immediate_pause:
+        reasons.append("structural health failure requires an immediate pause")
+    operational_effective = _operational_effective(cycle_status, decision, immediate_pause)
+    effective_decision, forced_by_system_state = _effective_decision(conn, operational_effective)
     if forced_by_system_state:
         reasons.append(
             "system pause state is PAUSED_MANUAL or KILLED — hysteresis decision is never "
@@ -222,17 +273,45 @@ def evaluate_and_persist_hysteresis(
 
     new_state = {
         "scope": scope, "policy_version": config.policy_version, "policy_hash": policy_hash,
-        "decision": effective_decision, "consecutive_failures": consecutive_failures,
+        "decision": decision, "consecutive_failures": consecutive_failures,
         "consecutive_recoveries": consecutive_recoveries, "qualified_cycle_count": qualified_cycle_count,
         "failing_cycle_count": failing_cycle_count, "window_start": state["window_start"],
         "window_end": now.isoformat(), "last_cycle_id": cycle_id, "last_evaluated_at": now.isoformat(),
-        "reasons_json": json.dumps(reasons), "per_provider_metrics_json": state.get("per_provider_metrics_json", "{}"),
+        "reasons_json": json.dumps(reasons),
+        "per_provider_metrics_json": json.dumps(evidence.per_provider_metrics or {}, sort_keys=True),
     }
-    repo.save_health_hysteresis_state(conn, new_state)
+    evaluation = {
+        "evaluation_id": f"health-eval-{uuid.uuid4().hex}", "scope": scope, "cycle_id": cycle_id,
+        "policy_version": config.policy_version, "policy_hash": policy_hash,
+        "single_cycle_status": cycle_status, "previous_hysteresis_status": previous_decision,
+        "new_hysteresis_status": decision, "effective_status": effective_decision,
+        "qualified": int(qualified), "sample_size": evidence.sample_size,
+        "minimum_sample_size": evidence.minimum_sample_size,
+        "aggregate_success_rate": evidence.aggregate_success_rate,
+        "required_categories_json": json.dumps(list(evidence.required_categories)),
+        "required_providers_json": json.dumps(list(evidence.required_providers)),
+        "observed_providers_json": json.dumps(list(evidence.observed_providers)),
+        "missing_required_providers_json": json.dumps(list(evidence.missing_required_providers)),
+        "missing_required_categories_json": json.dumps(list(evidence.missing_required_categories)),
+        "per_provider_metrics_json": json.dumps(evidence.per_provider_metrics or {}, sort_keys=True),
+        "severe_error_categories_json": json.dumps(list(evidence.severe_error_categories)),
+        "consecutive_failures_before": failures_before,
+        "consecutive_failures_after": consecutive_failures,
+        "consecutive_recoveries_before": recoveries_before,
+        "consecutive_recoveries_after": consecutive_recoveries,
+        "reasons_json": json.dumps(reasons), "evaluated_at": now.isoformat(),
+    }
+    with transaction(conn):
+        repo.save_health_hysteresis_state(conn, new_state, commit=False)
+        inserted = repo.insert_health_hysteresis_evaluation(conn, evaluation)
+        if not inserted:
+            raise HysteresisPolicyError("hysteresis evaluation identity raced; retry the idempotent evaluation")
 
     return PersistentHealthDecision(
-        scope=scope, decision=effective_decision, consecutive_failures=consecutive_failures,
+        scope=scope, decision=(effective_decision if forced_by_system_state else decision),
+        consecutive_failures=consecutive_failures,
         consecutive_recoveries=consecutive_recoveries, qualified_cycle_count=qualified_cycle_count,
         failing_cycle_count=failing_cycle_count, reasons=tuple(reasons), idempotent_replay=False,
-        policy_reset=policy_reset,
+        policy_reset=policy_reset, previous_decision=previous_decision, policy_hash=policy_hash,
+        effective_status=effective_decision,
     )

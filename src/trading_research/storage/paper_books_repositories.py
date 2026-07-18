@@ -400,51 +400,55 @@ class SnapshotIdentityConflictError(RuntimeError):
 
 
 def save_snapshot(conn: sqlite3.Connection, snapshot, position_rows: list[dict]) -> bool:
-    existing = conn.execute(
-        "SELECT source_hash FROM paper_book_snapshots WHERE book_id = ? AND snapshot_id = ?",
-        (snapshot.book_id, snapshot.snapshot_id),
-    ).fetchone()
-    if existing is not None:
-        if existing["source_hash"] != snapshot.source_hash:
-            raise SnapshotIdentityConflictError(
-                f"snapshot_id {snapshot.snapshot_id!r} for book {snapshot.book_id!r} already exists with a "
-                f"different source_hash ({existing['source_hash']!r} != {snapshot.source_hash!r}) — refusing "
-                "to silently discard or overwrite a corrected snapshot"
-            )
-        return False
-    conn.execute(
-        "INSERT INTO paper_book_snapshots (book_id, snapshot_id, as_of, cash_available_usd, "
-        "cash_reserved_usd, gross_market_value_usd, net_liquidation_value_usd, total_cost_basis_usd, "
-        "unrealized_pnl_usd, realized_pnl_usd, position_count, unvalued_position_count, "
-        "stale_position_count, valuation_status, source_hash, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            snapshot.book_id, snapshot.snapshot_id, _ts(snapshot.as_of), str(snapshot.cash_available_usd),
-            str(snapshot.cash_reserved_usd), _dec_str(snapshot.gross_market_value_usd),
-            _dec_str(snapshot.net_liquidation_value_usd), str(snapshot.total_cost_basis_usd),
-            _dec_str(snapshot.unrealized_pnl_usd), str(snapshot.realized_pnl_usd),
-            snapshot.position_count, snapshot.unvalued_position_count, snapshot.stale_position_count,
-            snapshot.valuation_status, snapshot.source_hash, _ts(snapshot.as_of),
-        ),
-    )
-    for pos in position_rows:
-        conn.execute(
-            "INSERT INTO paper_book_snapshot_positions (book_id, snapshot_id, symbol, quantity, "
-            "cost_basis_usd, price, price_provider, price_timestamp, price_available_at, "
-            "point_in_time_safe, source_record_id, staleness_seconds, market_value_usd, "
-            "unrealized_pnl_usd, valuation_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    from .transactions import transaction
+
+    with transaction(conn):
+        cursor = conn.execute(
+            "INSERT INTO paper_book_snapshots (book_id, snapshot_id, as_of, cash_available_usd, "
+            "cash_reserved_usd, gross_market_value_usd, net_liquidation_value_usd, total_cost_basis_usd, "
+            "unrealized_pnl_usd, realized_pnl_usd, position_count, unvalued_position_count, "
+            "stale_position_count, valuation_status, source_hash, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(book_id, snapshot_id) DO NOTHING",
             (
-                snapshot.book_id, snapshot.snapshot_id, pos["symbol"], str(pos["quantity"]),
-                str(pos["cost_basis_usd"]), _dec_str(pos.get("price")), pos.get("price_provider"),
-                pos.get("price_timestamp"), pos.get("price_available_at"),
-                int(bool(pos["point_in_time_safe"])) if pos.get("point_in_time_safe") is not None else None,
-                pos.get("source_record_id"), pos.get("staleness_seconds"),
-                _dec_str(pos.get("market_value_usd")), _dec_str(pos.get("unrealized_pnl_usd")),
-                pos["valuation_status"],
+                snapshot.book_id, snapshot.snapshot_id, _ts(snapshot.as_of), str(snapshot.cash_available_usd),
+                str(snapshot.cash_reserved_usd), _dec_str(snapshot.gross_market_value_usd),
+                _dec_str(snapshot.net_liquidation_value_usd), str(snapshot.total_cost_basis_usd),
+                _dec_str(snapshot.unrealized_pnl_usd), str(snapshot.realized_pnl_usd),
+                snapshot.position_count, snapshot.unvalued_position_count, snapshot.stale_position_count,
+                snapshot.valuation_status, snapshot.source_hash, _ts(snapshot.as_of),
             ),
         )
-    conn.commit()
-    return True
+        if cursor.rowcount == 0:
+            existing = conn.execute(
+                "SELECT source_hash FROM paper_book_snapshots WHERE book_id = ? AND snapshot_id = ?",
+                (snapshot.book_id, snapshot.snapshot_id),
+            ).fetchone()
+            if existing is None or existing["source_hash"] != snapshot.source_hash:
+                existing_hash = existing["source_hash"] if existing is not None else None
+                raise SnapshotIdentityConflictError(
+                    f"snapshot_id {snapshot.snapshot_id!r} for book {snapshot.book_id!r} already exists with a "
+                    f"different source_hash ({existing_hash!r} != {snapshot.source_hash!r}) — refusing "
+                    "to silently discard or overwrite a corrected snapshot"
+                )
+            return False
+        for pos in position_rows:
+            conn.execute(
+                "INSERT INTO paper_book_snapshot_positions (book_id, snapshot_id, symbol, quantity, "
+                "cost_basis_usd, price, price_provider, price_timestamp, price_available_at, "
+                "point_in_time_safe, source_record_id, staleness_seconds, market_value_usd, "
+                "unrealized_pnl_usd, valuation_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    snapshot.book_id, snapshot.snapshot_id, pos["symbol"], str(pos["quantity"]),
+                    str(pos["cost_basis_usd"]), _dec_str(pos.get("price")), pos.get("price_provider"),
+                    pos.get("price_timestamp"), pos.get("price_available_at"),
+                    int(bool(pos["point_in_time_safe"])) if pos.get("point_in_time_safe") is not None else None,
+                    pos.get("source_record_id"), pos.get("staleness_seconds"),
+                    _dec_str(pos.get("market_value_usd")), _dec_str(pos.get("unrealized_pnl_usd")),
+                    pos["valuation_status"],
+                ),
+            )
+        return True
 
 
 def load_snapshot(conn: sqlite3.Connection, book_id: str, snapshot_id: str):
@@ -1575,7 +1579,9 @@ def load_latest_external_lookup(conn: sqlite3.Connection, book_id: str, client_o
     return dict(row) if row else None
 
 
-def consume_external_lookup(conn: sqlite3.Connection, lookup_id: str, retry_event_id: str) -> bool:
+def consume_external_lookup(
+    conn: sqlite3.Connection, lookup_id: str, retry_event_id: str, *, commit: bool = True,
+) -> bool:
     """One-time transition of `consumed_by_retry_event_id` from NULL. The
     trigger `trg_paper_external_lookups_no_update` aborts any further update
     once set, so a consumed lookup can never authorize a second retry."""
@@ -1584,7 +1590,7 @@ def consume_external_lookup(conn: sqlite3.Connection, lookup_id: str, retry_even
         "WHERE lookup_id = ? AND consumed_by_retry_event_id IS NULL",
         (retry_event_id, lookup_id),
     )
-    conn.commit()
+    _commit_if(conn, commit)
     return cursor.rowcount > 0
 
 
