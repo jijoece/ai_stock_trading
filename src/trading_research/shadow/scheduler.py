@@ -556,6 +556,7 @@ def run_due_shadow_cycle(
     clock: Clock,
     research_provider_name: str = "deterministic",
     research_model_name: str | None = None,
+    provider_configuration_hash: str | None = None,
     research_roles: tuple[str, ...] | None = None,
     owner: str | None = None,
     deployment_source: str = DEPLOYMENT_SOURCE_MANUAL,
@@ -667,6 +668,11 @@ def run_due_shadow_cycle(
     intended_schedule_id = resolution.intended_schedule_id
     intended_schedule_time = resolution.intended_schedule_time
     assert intended_schedule_id is not None and intended_schedule_time is not None
+    expected_research_cycle_id = derive_cycle_id(
+        cycle_configuration.universe_id, intended_schedule_time, cycle_configuration.config_hash,
+    )
+    expected_model_name = research_model_name or ""
+    effective_provider_configuration_hash = provider_configuration_hash or cycle_configuration.config_hash
 
     # Idempotency: a scheduler run row already exists (and is COMPLETED) for
     # this exact intended slot -> no-op, even if resolve_due_status somehow
@@ -860,47 +866,6 @@ def run_due_shadow_cycle(
             )
         reservation = reservation_result
 
-        # docs/milestone-7.1.md Steps 12-14: build one attempt-controller
-        # factory for this cycle, reusing the EXACT same pricing entry
-        # `estimate_cycle_cost` already selected for the reservation above
-        # (same provider/model/as_of-date inputs to `select_pricing` — never
-        # a second, potentially-inconsistent lookup). Only activated when
-        # the caller supplies `research_roles` (Step 20's CLI wiring does);
-        # `research_roles=None` (every existing caller/test) preserves prior
-        # behavior exactly — no per-attempt enforcement, `attempt_controller_
-        # factory=None` passed to `run_cycle` unchanged from before this task.
-        attempt_controller_factory: Callable[[str], attempt_controller_mod.ShadowResearchAttemptController] | None = None
-        if research_roles is not None:
-            pricing_for_roles = usage_mod.select_pricing(
-                pricing_entries, intent.provider, intent.model_name or "", now.date().isoformat(),
-            )
-
-            def _build_attempt_controller(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
-                per_call_divisor = max(1, managed_budget.calls_per_cycle or 1)
-                return attempt_controller_mod.ShadowResearchAttemptController(
-                    conn=conn, reservation=reservation, provider=intent.provider, allowed_roles=research_roles,
-                    max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
-                    max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
-                    max_output_tokens_per_role=(
-                        managed_budget.output_tokens_per_cycle // per_call_divisor
-                        if managed_budget.is_managed else shadow_config.budgets.max_output_tokens_per_cycle
-                    ),
-                    max_input_tokens_per_role=(
-                        managed_budget.input_tokens_per_cycle // per_call_divisor
-                        if managed_budget.is_managed else shadow_config.budgets.max_input_tokens_per_cycle
-                    ),
-                    max_latency_seconds_per_role=(
-                        managed_budget.latency_seconds_per_role
-                        if managed_budget.is_managed else shadow_config.budgets.max_latency_seconds_per_cycle
-                    ),
-                    pricing=pricing_for_roles, clock=clock, scheduler_run_id=scheduler_run_id, cycle_id=None,
-                    max_calls_per_cycle=managed_budget.calls_per_cycle,
-                    max_calls_per_day=managed_budget.calls_per_day,
-                    max_calls_per_month=managed_budget.calls_per_month,
-                    max_api_equivalent_cost_per_call_usd=managed_budget.api_equivalent_cost_per_call_usd,
-                )
-            attempt_controller_factory = _build_attempt_controller
-
         # --- Step 6: record run start. ---------------------------------------
         start_time = clock()
         save_scheduler_run(
@@ -922,6 +887,7 @@ def run_due_shadow_cycle(
         # --- Step 7: call the existing, unmodified scheduled-cycle service. --
         cycle_result: ResearchCycleResult | None = None
         failure_reason: str | None = None
+        attempt_controller_factory: Callable[[str], attempt_controller_mod.ShadowResearchAttemptController] | None = None
         try:
             if provider_coverage_policy is not None and provider_coverage_policy.unavailable_required_categories:
                 raise SchedulerError(
@@ -930,6 +896,47 @@ def run_due_shadow_cycle(
                 )
             else:
                 cycle_kwargs = cycle_kwargs_builder(bounded_symbols, intended_schedule_time)
+                if provider_configuration_hash is None:
+                    research_configuration = cycle_kwargs.get("research_configuration")
+                    configured_hash = getattr(research_configuration, "config_hash", None)
+                    if isinstance(configured_hash, str) and configured_hash:
+                        effective_provider_configuration_hash = configured_hash
+                configured_roles = getattr(cycle_kwargs.get("research_configuration"), "roles", None)
+                effective_research_roles = research_roles or (
+                    configured_roles if isinstance(configured_roles, tuple) else None
+                )
+                if effective_research_roles is not None:
+                    pricing_for_roles = usage_mod.select_pricing(
+                        pricing_entries, intent.provider, intent.model_name or "", now.date().isoformat(),
+                    )
+
+                    def _build_attempt_controller(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
+                        per_call_divisor = max(1, managed_budget.calls_per_cycle or 1)
+                        return attempt_controller_mod.ShadowResearchAttemptController(
+                            conn=conn, reservation=reservation, provider=intent.provider,
+                            allowed_roles=effective_research_roles,
+                            max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
+                            max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
+                            max_output_tokens_per_role=(
+                                managed_budget.output_tokens_per_cycle // per_call_divisor
+                                if managed_budget.is_managed else shadow_config.budgets.max_output_tokens_per_cycle
+                            ),
+                            max_input_tokens_per_role=(
+                                managed_budget.input_tokens_per_cycle // per_call_divisor
+                                if managed_budget.is_managed else shadow_config.budgets.max_input_tokens_per_cycle
+                            ),
+                            max_latency_seconds_per_role=(
+                                managed_budget.latency_seconds_per_role
+                                if managed_budget.is_managed else shadow_config.budgets.max_latency_seconds_per_cycle
+                            ),
+                            pricing=pricing_for_roles, clock=clock, scheduler_run_id=scheduler_run_id,
+                            cycle_id=expected_research_cycle_id,
+                            max_calls_per_cycle=managed_budget.calls_per_cycle,
+                            max_calls_per_day=managed_budget.calls_per_day,
+                            max_calls_per_month=managed_budget.calls_per_month,
+                            max_api_equivalent_cost_per_call_usd=managed_budget.api_equivalent_cost_per_call_usd,
+                        )
+                    attempt_controller_factory = _build_attempt_controller
                 with provider_persistence_mod.provider_request_context(
                     correlation_mode=provider_persistence_mod.CORRELATION_SCHEDULED,
                     scheduler_run_id=scheduler_run_id,
@@ -1045,17 +1052,21 @@ def run_due_shadow_cycle(
                     configuration_hash=cycle_configuration.config_hash,
                 )
             ),
-            expected_cycle_id=derive_cycle_id(
-                cycle_configuration.universe_id, intended_schedule_time, cycle_configuration.config_hash,
-            ),
+            expected_cycle_id=expected_research_cycle_id,
             scheduler_run_id=scheduler_run_id,
         )
         # Milestone 12.1.1 Item 7: independent model-provider health, from
         # persisted `research_attempts` for THIS scheduler run only (never
         # evidence-provider request rows, never another scheduler run's
-        # attempts — the join is scoped by `scheduler_run_id`).
+        # attempts — direct immutable ownership is scoped by
+        # `scheduler_run_id`, never a reusable-identifier join).
         model_provider_attempt_rows = list_research_attempts_for_scheduler_run(conn, scheduler_run_id)
-        model_provider_evidence = model_provider_health_mod.evaluate_model_provider_health(model_provider_attempt_rows)
+        model_provider_evidence = model_provider_health_mod.evaluate_model_provider_health(
+            model_provider_attempt_rows,
+            expected_provider=research_provider_name,
+            expected_model=expected_model_name,
+            provider_configuration_hash=effective_provider_configuration_hash,
+        )
         health_inputs = dataclasses.replace(
             health_inputs,
             model_provider_success_rate=model_provider_evidence.success_rate,
@@ -1147,14 +1158,27 @@ def run_due_shadow_cycle(
         # immediately for a structural model-provider failure, bypassing the
         # ordinary consecutive-failure streak.
         model_provider_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE)
+        model_provider_scope = model_provider_health_mod.model_provider_health_scope(
+            expected_provider=research_provider_name, expected_model=expected_model_name,
+            provider_configuration_hash=effective_provider_configuration_hash,
+        )
         model_provider_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
-            conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}",
+            conn, scope=model_provider_scope,
             cycle_id=scheduler_run_id, research_cycle_id=cycle_id,
             cycle_status=health_mod.dimension_cycle_status(model_provider_check),
             qualified=health_mod.dimension_is_qualified(model_provider_check),
             severe_error=model_provider_evidence.structural_failure,
             config=_dimension_policy_config(shadow_config.health_hysteresis.model_provider), clock=clock,
             immediate_pause=model_provider_evidence.structural_failure,
+            evidence=health_hysteresis_mod.HysteresisEvaluationEvidence(
+                sample_size=model_provider_evidence.attempt_count,
+                minimum_sample_size=health_config.minimum_requests_for_model_provider_failure_rate,
+                aggregate_success_rate=model_provider_evidence.success_rate,
+                observed_providers=(research_provider_name,) if model_provider_evidence.attempt_count else (),
+                per_provider_metrics={research_provider_name: model_provider_evidence.bounded_metrics()},
+                severe_error_categories=model_provider_evidence.structural_failure_codes,
+                provider_policy_hash=effective_provider_configuration_hash,
+            ),
         )
         # The overall hysteresis status a scheduler-level pause decision acts
         # on is the worst of every independently-evaluated dimension — this

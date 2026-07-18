@@ -8,6 +8,7 @@ failures use ordinary hysteresis, and replay is idempotent.
 from __future__ import annotations
 
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,6 +66,10 @@ def _persist_attempt(conn, *, scheduler_run_id, research_run_id, attempt, cycle_
         research_run_id=research_run_id, snapshot_id=snapshot_id, provider=attempt.provider,
         model_name="m", roles=("fundamental",), run_mode="shadow", config_hash="c" * 64, created_at=NOW,
     )
+    attempt = replace(
+        attempt, scheduler_run_id=scheduler_run_id, research_cycle_id=cycle_id,
+        attempt_control_check_id=f"check-{attempt.attempt_id}", correlation_mode="SCHEDULED",
+    )
     repo.save_attempt(attempt)
     save_role_budget_check(conn, {
         "check_id": f"check-{attempt.attempt_id}", "reservation_id": "res-1", "scheduler_run_id": scheduler_run_id,
@@ -75,6 +80,13 @@ def _persist_attempt(conn, *, scheduler_run_id, research_run_id, attempt, cycle_
         "maximum_attempt_output_tokens": 1000, "maximum_attempt_latency_ms": 60000,
         "maximum_attempt_cost_usd": "1.0", "checked_at": NOW.isoformat(),
     })
+
+
+def _evaluate(rows, *, provider="codex", model="m", config_hash="c" * 64):
+    return mph_mod.evaluate_model_provider_health(
+        rows, expected_provider=provider, expected_model=model,
+        provider_configuration_hash=config_hash,
+    )
 
 
 def test_scheduler_run_sees_only_its_own_model_attempts(conn):
@@ -93,6 +105,63 @@ def test_scheduler_run_sees_only_its_own_model_attempts(conn):
     assert len(rows_b) == 1 and rows_b[0]["attempt_id"] == "b-1"
 
 
+def test_same_research_identifiers_are_isolated_by_direct_scheduler_ownership(conn):
+    """Critical regression: reusable research identifiers cannot cross runs."""
+    shared_run = "cycle-X-AAPL"
+    _persist_attempt(
+        conn, scheduler_run_id="sched-A", research_run_id=shared_run, cycle_id="cycle-X",
+        attempt=_attempt(attempt_id="attempt-A", research_run_id=shared_run, success=True),
+    )
+    _persist_attempt(
+        conn, scheduler_run_id="sched-B", research_run_id=shared_run, cycle_id="cycle-X",
+        attempt=_attempt(
+            attempt_id="attempt-B", research_run_id=shared_run, success=False,
+            failure_code="CODEX_QUOTA_EXHAUSTED", failure_retryable=False,
+        ),
+    )
+    repo = SQLiteResearchRepository(conn)
+    repo.save_attempt(_attempt(attempt_id="attempt-manual", research_run_id=shared_run, success=True))
+    repo.save_attempt(replace(
+        _attempt(attempt_id="attempt-legacy", research_run_id=shared_run, success=True),
+        correlation_mode="LEGACY_UNKNOWN",
+    ))
+
+    rows_a = list_research_attempts_for_scheduler_run(conn, "sched-A")
+    rows_b = list_research_attempts_for_scheduler_run(conn, "sched-B")
+    assert [row["attempt_id"] for row in rows_a] == ["attempt-A"]
+    assert [row["attempt_id"] for row in rows_b] == ["attempt-B"]
+    assert _evaluate(rows_a).success_rate == 1.0
+    assert _evaluate(rows_b).structural_failure is True
+
+
+def test_retry_attempts_keep_ownership_and_order_deterministically(conn):
+    for attempt_id, number in (("z-retry", 2), ("a-first", 1)):
+        _persist_attempt(
+            conn, scheduler_run_id="sched-A", research_run_id="shared-run", cycle_id="cycle-X",
+            attempt=_attempt(
+                attempt_id=attempt_id, research_run_id="shared-run", attempt_number=number,
+                success=False, failure_code="CODEX_PROCESS_TIMEOUT", failure_retryable=True,
+            ),
+        )
+    rows = list_research_attempts_for_scheduler_run(conn, "sched-A")
+    assert [row["attempt_id"] for row in rows] == ["a-first", "z-retry"]
+    assert all(row["scheduler_run_id"] == "sched-A" for row in rows)
+
+
+def test_budget_gated_attempt_is_not_a_provider_invocation(conn):
+    attempt = replace(
+        _attempt(
+            attempt_id="gated", research_run_id="run-gated", success=False,
+            failure_code=None, failure_retryable=False,
+        ),
+        failure_stage="BUDGET_GATED",
+    )
+    _persist_attempt(
+        conn, scheduler_run_id="sched-A", research_run_id="run-gated", attempt=attempt,
+    )
+    assert list_research_attempts_for_scheduler_run(conn, "sched-A") == []
+
+
 def test_authentication_and_unsupported_model_pause_immediately(conn):
     """Required test #1 (integration)."""
     _persist_attempt(
@@ -103,7 +172,7 @@ def test_authentication_and_unsupported_model_pause_immediately(conn):
         ),
     )
     rows = list_research_attempts_for_scheduler_run(conn, "sched-A")
-    evidence = mph_mod.evaluate_model_provider_health(rows)
+    evidence = _evaluate(rows)
     assert evidence.structural_failure is True
 
     check = health_mod.HealthCheckResult(
@@ -112,7 +181,9 @@ def test_authentication_and_unsupported_model_pause_immediately(conn):
         comparison="structural failure", applicable=True, pause_flag_enabled=True, reason="structural",
     )
     decision = hh.evaluate_and_persist_hysteresis(
-        conn, scope=f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}", cycle_id="sched-A",
+        conn, scope=mph_mod.model_provider_health_scope(
+            expected_provider="codex", expected_model="m", provider_configuration_hash="c" * 64,
+        ), cycle_id="sched-A",
         cycle_status=health_mod.dimension_cycle_status(check), qualified=health_mod.dimension_is_qualified(check),
         severe_error=evidence.structural_failure, config=hh.PersistentHealthPolicyConfig(), clock=lambda: NOW,
         immediate_pause=True,
@@ -131,7 +202,9 @@ def test_repeated_transient_failures_reach_configured_pause_threshold(conn):
         input_value="1.0", input_unit="fraction", threshold_value="0.5", threshold_unit="fraction", comparison=">",
         applicable=True, pause_flag_enabled=True, reason="rate",
     )
-    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}"
+    scope = mph_mod.model_provider_health_scope(
+        expected_provider="codex", expected_model="m", provider_configuration_hash="c" * 64,
+    )
     decision = None
     for sched_id in ("sched-1", "sched-2", "sched-3"):
         decision = hh.evaluate_and_persist_hysteresis(
@@ -152,13 +225,15 @@ def test_one_transient_timeout_does_not_immediately_pause(conn):
         ),
     )
     rows = list_research_attempts_for_scheduler_run(conn, "sched-A")
-    evidence = mph_mod.evaluate_model_provider_health(rows)
+    evidence = _evaluate(rows)
     assert evidence.structural_failure is False
 
 
 def test_healthy_attempts_advance_only_model_provider_recovery(conn):
     """Required test #5."""
-    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}"
+    scope = mph_mod.model_provider_health_scope(
+        expected_provider="codex", expected_model="m", provider_configuration_hash="c" * 64,
+    )
     other_scope = hh.DEFAULT_SCOPE
     config = hh.PersistentHealthPolicyConfig(
         warning_after_n_failures=1, pause_recommended_after_n_failures=1, pause_required_after_m_failures=1,
@@ -189,7 +264,9 @@ def test_healthy_attempts_advance_only_model_provider_recovery(conn):
 
 def test_replay_is_idempotent(conn):
     """Required test #8."""
-    scope = f"{hh.DEFAULT_SCOPE}:{health_mod.DIMENSION_MODEL_PROVIDER_FAILURE}"
+    scope = mph_mod.model_provider_health_scope(
+        expected_provider="codex", expected_model="m", provider_configuration_hash="c" * 64,
+    )
     config = hh.PersistentHealthPolicyConfig()
     fail_check = health_mod.HealthCheckResult(
         check_name=health_mod.CHECK_NAME_MODEL_PROVIDER_FAILURE_RATE, status=health_mod.CHECK_STATUS_FAIL,
@@ -206,3 +283,32 @@ def test_replay_is_idempotent(conn):
     )
     assert second.idempotent_replay is True
     assert second.consecutive_failures == first.consecutive_failures
+
+
+def test_provider_switch_success_cannot_recover_codex_failure_scope(conn):
+    config = hh.PersistentHealthPolicyConfig(recovery_streak=1)
+    codex_scope = mph_mod.model_provider_health_scope(
+        expected_provider="codex", expected_model="gpt-test", provider_configuration_hash="a" * 64,
+    )
+    deterministic_scope = mph_mod.model_provider_health_scope(
+        expected_provider="deterministic", expected_model="deterministic-v1",
+        provider_configuration_hash="b" * 64,
+    )
+    anthropic_scope = mph_mod.model_provider_health_scope(
+        expected_provider="anthropic", expected_model="claude-test", provider_configuration_hash="c" * 64,
+    )
+    hh.evaluate_and_persist_hysteresis(
+        conn, scope=codex_scope, cycle_id="run-A", cycle_status=health_mod.STATUS_PAUSE_REQUIRED,
+        qualified=True, config=config, clock=lambda: NOW,
+    )
+    hh.evaluate_and_persist_hysteresis(
+        conn, scope=deterministic_scope, cycle_id="run-B", cycle_status=health_mod.STATUS_HEALTHY,
+        qualified=False, config=config, clock=lambda: NOW,
+    )
+    hh.evaluate_and_persist_hysteresis(
+        conn, scope=anthropic_scope, cycle_id="run-C", cycle_status=health_mod.STATUS_HEALTHY,
+        qualified=True, config=config, clock=lambda: NOW,
+    )
+    codex_state = hh.repo.load_health_hysteresis_state(conn, codex_scope)
+    assert codex_state["consecutive_failures"] == 1
+    assert codex_state["consecutive_recoveries"] == 0

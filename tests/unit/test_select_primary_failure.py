@@ -4,6 +4,7 @@ selection for an attempt that produced several structured failures.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from trading_research.research.failure_taxonomy import (
@@ -62,13 +63,29 @@ def test_budget_gate_outranks_retryable_provider_failure():
     assert primary.code == "BUDGET_EXHAUSTED"
 
 
-def test_unknown_stage_falls_to_lowest_priority_tier_without_crashing():
+def test_known_structural_provider_failure_still_outranks_unknown_non_retryable():
     diagnostic = _failure(stage=STAGE_UNKNOWN, code="UNCLASSIFIED_VALIDATION_FAILURE", retryable=False)
     structural = _failure(stage=STAGE_PROVIDER_RESPONSE, code="PROVIDER_UNAVAILABLE", retryable=False)
     primary = select_primary_failure([diagnostic, structural])
     assert primary.code == "PROVIDER_UNAVAILABLE"
     # And on its own, an unrecognized/diagnostic-tier stage is still selectable.
     assert select_primary_failure([diagnostic]).code == "UNCLASSIFIED_VALIDATION_FAILURE"
+
+
+def test_unknown_non_retryable_outranks_retryable_claim_failure():
+    unknown = _failure(stage=STAGE_UNKNOWN, code="UNCLASSIFIED_VALIDATION_FAILURE", retryable=False)
+    claim = _failure(stage=STAGE_CLAIM_EVIDENCE_VALIDATION, code="UNKNOWN_EVIDENCE_ID", retryable=True)
+    assert select_primary_failure([claim, unknown]).code == "UNCLASSIFIED_VALIDATION_FAILURE"
+    assert select_primary_failure([unknown, claim]).code == "UNCLASSIFIED_VALIDATION_FAILURE"
+
+
+def test_unknown_null_retryability_fails_closed_in_primary_selection():
+    unknown = replace(
+        _failure(stage=STAGE_UNKNOWN, code="UNCLASSIFIED_VALIDATION_FAILURE", retryable=False),
+        retryable=None,
+    )
+    claim = _failure(stage=STAGE_CLAIM_EVIDENCE_VALIDATION, code="UNKNOWN_EVIDENCE_ID", retryable=True)
+    assert select_primary_failure([claim, unknown]) is unknown
 
 
 def test_raw_messages_do_not_affect_selection():

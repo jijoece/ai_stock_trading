@@ -64,6 +64,16 @@ class _RecordingController:
         self.after_calls.append((request, attempt))
 
 
+class _ScheduledRecordingController(_RecordingController):
+    def before_attempt(self, request: AttemptControlRequest) -> AttemptControlDecision:
+        self.before_calls.append(request)
+        return AttemptControlDecision(
+            allowed=True, code="PROCEED", scheduler_run_id="sched-A",
+            research_cycle_id="cycle-X", attempt_control_check_id=f"check-{request.role}-{request.attempt_number}",
+            correlation_mode="SCHEDULED",
+        )
+
+
 def test_default_no_controller_is_a_pure_no_op():
     provider = ScriptedResearchProvider({
         ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
@@ -116,6 +126,29 @@ def test_retries_separately_checked_before_each_attempt():
     # after_attempt called for both the malformed (rejected) attempt and the successful retry.
     fundamental_after = [r for r, _a in controller.after_calls if r.role == "fundamental"]
     assert len(fundamental_after) == 2
+
+
+def test_scheduled_retry_attempts_retain_exact_ownership():
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="malformed", raw_text="not json"),
+        ("fundamental", 2): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
+    })
+    controller = _ScheduledRecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=2),
+        clock=lambda: NOW, run_mode="scripted", attempt_controller=controller,
+        require_decision=False,
+    )
+    assert result.status == "ANALYST_REPORTS_COMPLETE_NO_MANAGER"
+    assert len(result.attempts) == 2
+    assert all(attempt.scheduler_run_id == "sched-A" for attempt in result.attempts)
+    assert all(attempt.research_cycle_id == "cycle-X" for attempt in result.attempts)
+    assert all(attempt.correlation_mode == "SCHEDULED" for attempt in result.attempts)
+    assert len({attempt.attempt_id for attempt in result.attempts}) == 2
 
 
 def test_denied_attempt_never_calls_provider():
@@ -279,3 +312,52 @@ def test_persisted_failure_retryable_matches_actual_behavior():
     assert len(non_retried_attempts) == 1
     assert non_retried_attempts[0].failure_retryable is False
     assert len(provider.calls) == 1
+
+
+def test_mixed_failures_use_all_failures_for_retry_authorization(monkeypatch):
+    from trading_research.research import orchestration as orchestration_mod
+    from trading_research.research.failure_taxonomy import (
+        STAGE_UNKNOWN,
+        new_failure,
+    )
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    bad_payload = {
+        **ANALYST_PAYLOAD,
+        "claims": [{
+            "claim_id": "c1", "claim_type": "downside_estimate", "statement": "unsupported",
+            "evidence_ids": ["missing-evidence"], "numeric_value": None, "unit": None,
+            "importance": "high",
+        }],
+    }
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=bad_payload),
+        ("fundamental", 2): ScriptedStep(kind="response", payload=ANALYST_PAYLOAD),
+    })
+    original = orchestration_mod._claim_validation_failures
+
+    def _mixed_failures(validation, **kwargs):
+        failures = original(validation, **kwargs)
+        failures.append(new_failure(
+            research_run_id=kwargs["research_run_id"], attempt_id=kwargs["attempt_id"],
+            role=kwargs["role"], attempt_number=kwargs["attempt_number"], stage=STAGE_UNKNOWN,
+            code="UNCLASSIFIED_VALIDATION_FAILURE", message="bounded diagnostic",
+            retryable=False, model_name=kwargs["model_name"], prompt_version=kwargs["prompt_version"],
+            schema_version=kwargs["schema_version"], occurred_at=kwargs["occurred_at"],
+        ))
+        return failures
+
+    monkeypatch.setattr(orchestration_mod, "_claim_validation_failures", _mixed_failures)
+    controller = _RecordingController()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=2),
+        clock=lambda: NOW, run_mode="scripted", attempt_controller=controller,
+        require_decision=False,
+    )
+    assert result.status == "ANALYSIS_INCOMPLETE"
+    assert len(provider.calls) == 1
+    attempt = controller.after_calls[0][1]
+    assert attempt.failure_code == "UNCLASSIFIED_VALIDATION_FAILURE"
+    assert attempt.failure_retryable is False

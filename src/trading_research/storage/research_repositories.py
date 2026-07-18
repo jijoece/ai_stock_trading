@@ -192,8 +192,9 @@ class SQLiteResearchRepository:
             "provider_request_id, retry_count, pricing_version, estimated_cost, cost_status, cost_estimate_basis, "
             "configured_model_alias, resolved_model_name, claude_code_version, provider_cli_version, "
             "provider_adapter_version, reasoning_output_tokens, token_accounting_policy, "
-            "failure_code, failure_stage, failure_retryable, failure_metadata_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "failure_code, failure_stage, failure_retryable, failure_metadata_json, scheduler_run_id, "
+            "research_cycle_id, attempt_control_check_id, correlation_mode, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 attempt.attempt_id, attempt.research_run_id, attempt.role, attempt.attempt_number,
                 attempt.prompt_name, attempt.prompt_version, attempt.prompt_hash, attempt.system_prompt_hash,
@@ -210,6 +211,8 @@ class SQLiteResearchRepository:
                 attempt.failure_code, attempt.failure_stage,
                 None if attempt.failure_retryable is None else int(attempt.failure_retryable),
                 json.dumps(dict(attempt.failure_metadata)) if attempt.failure_metadata else None,
+                attempt.scheduler_run_id, attempt.research_cycle_id, attempt.attempt_control_check_id,
+                attempt.correlation_mode,
                 attempt.created_at.isoformat(),
             ),
         )
@@ -502,16 +505,16 @@ def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[st
         priced_usage_cost_usd = None
     elif "PRICING_NOT_CONFIGURED" in cost_statuses:
         pricing_status = "PRICING_NOT_CONFIGURED"
-        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+        priced_usage_cost_usd = sum(priced_costs, Decimal("0")) if priced_costs else None
     elif "USAGE_NOT_RETURNED" in cost_statuses:
         pricing_status = "USAGE_NOT_RETURNED"
-        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+        priced_usage_cost_usd = sum(priced_costs, Decimal("0")) if priced_costs else None
     elif cost_statuses == {"CALCULATED"}:
         pricing_status = "CALCULATED"
-        priced_usage_cost_usd = sum(priced_costs)
+        priced_usage_cost_usd = sum(priced_costs, Decimal("0"))
     else:
         pricing_status = "MIXED"
-        priced_usage_cost_usd = sum(priced_costs) if priced_costs else None
+        priced_usage_cost_usd = sum(priced_costs, Decimal("0")) if priced_costs else None
 
     if required_role_failure_count > 0 or retry_exhaustion_count > 0 or budget_skipped_attempt_count > 0:
         status = STATUS_PARTIAL

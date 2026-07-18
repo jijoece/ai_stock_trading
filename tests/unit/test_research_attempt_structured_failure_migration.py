@@ -133,3 +133,30 @@ def test_legacy_database_gains_provider_adapter_version_column(tmp_path):
     ).fetchone()
     assert row["provider_adapter_version"] is None
     conn.close()
+
+
+def test_attempt_ownership_migration_preserves_rows_without_inference(tmp_path):
+    db_path = tmp_path / "legacy_ownership.sqlite3"
+    _pre_migration_6_db(db_path)
+
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT scheduler_run_id, research_cycle_id, attempt_control_check_id, correlation_mode "
+        "FROM research_attempts WHERE attempt_id = 'run-legacy-fundamental-1'"
+    ).fetchone()
+    assert row is not None
+    assert row["scheduler_run_id"] is None
+    assert row["research_cycle_id"] is None
+    assert row["attempt_control_check_id"] is None
+    assert row["correlation_mode"] == "LEGACY_UNKNOWN"
+    assert conn.execute("SELECT COUNT(*) FROM research_attempts").fetchone()[0] == 1
+    conn.close()
+
+
+def test_fresh_database_has_exact_attempt_ownership_schema_and_index(tmp_path):
+    conn = connect(tmp_path / "fresh_ownership.sqlite3")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)")}
+    assert {"scheduler_run_id", "research_cycle_id", "attempt_control_check_id", "correlation_mode"} <= columns
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(research_attempts)")}
+    assert "idx_research_attempts_scheduled_provider" in indexes
+    conn.close()

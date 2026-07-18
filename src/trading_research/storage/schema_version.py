@@ -179,6 +179,24 @@ def _migration_9_scheduled_run_telemetry_index(conn: sqlite3.Connection) -> None
     )
 
 
+def _migration_10_research_attempt_scheduler_ownership(conn: sqlite3.Connection) -> None:
+    """Persist exact scheduler ownership without inferring legacy rows."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    additions = (
+        ("scheduler_run_id", "TEXT"),
+        ("research_cycle_id", "TEXT"),
+        ("attempt_control_check_id", "TEXT"),
+        ("correlation_mode", "TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN'"),
+    )
+    for column_name, column_type in additions:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE research_attempts ADD COLUMN {column_name} {column_type}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_research_attempts_scheduled_provider "
+        "ON research_attempts(correlation_mode, scheduler_run_id, provider, model_name, created_at, attempt_id)"
+    )
+
+
 def _migration_5_operational_integrity_telemetry(conn: sqlite3.Connection) -> None:
     """Milestone 11.3.2: exact request ownership and bounded transport taxonomy.
 
@@ -241,6 +259,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     9: (
         "add scheduled-run-scoped provider telemetry index (Milestone 12.1 Item 7)",
         _migration_9_scheduled_run_telemetry_index,
+    ),
+    10: (
+        "add exact scheduler ownership to research attempts (Milestone 12.1.2)",
+        _migration_10_research_attempt_scheduler_ownership,
     ),
 }
 

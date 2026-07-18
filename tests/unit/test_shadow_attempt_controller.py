@@ -98,6 +98,10 @@ def test_before_attempt_persists_a_role_budget_check_row(conn):
     controller = _controller(conn, reservation, pricing)
     decision = controller.before_attempt(_request())
     assert decision.allowed is True
+    assert decision.scheduler_run_id == "sched-1"
+    assert decision.research_cycle_id == "cycle-1"
+    assert decision.attempt_control_check_id
+    assert decision.correlation_mode == "SCHEDULED"
     checks = list_role_budget_checks(conn, scheduler_run_id="sched-1")
     assert len(checks) == 1
     assert checks[0]["role"] == "fundamental"
@@ -281,16 +285,48 @@ def test_schema_validation_failure_does_not_masquerade_as_provider_unavailabilit
     assert state.state == pause_mod.STATE_ACTIVE
 
 
-def test_missing_failure_code_does_not_pause(conn):
-    """A legacy/null `failure_code` (e.g. a row from before this migration)
-    must fail closed on the side of *not* pausing from this rule alone —
-    never treated as an implicit match."""
+def test_missing_failure_code_with_unknown_retryability_pauses_fail_closed(conn):
     reservation, pricing = _reservation(conn)
     controller = _controller(conn, reservation, pricing, provider="codex")
     failed = _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex")
     controller.after_attempt(_request(), failed)
     state = pause_mod.current_state(conn)
-    assert state.state == pause_mod.STATE_ACTIVE
+    assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+@pytest.mark.parametrize("provider", ("codex", "claude_code"))
+def test_unknown_non_retryable_cli_failure_pauses(conn, provider):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider=provider)
+    failed = _attempt(
+        success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider=provider,
+        failure_code="FUTURE_PROVIDER_FAILURE", failure_retryable=False,
+    )
+    controller.after_attempt(_request(), failed)
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+def test_anthropic_provider_client_error_pauses(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="anthropic")
+    failed = _attempt(
+        success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="anthropic",
+        failure_code="PROVIDER_CLIENT_ERROR", failure_retryable=False,
+    )
+    controller.after_attempt(_request(), failed)
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+@pytest.mark.parametrize("failure_code", ("PROVIDER_RATE_LIMITED", "PROVIDER_SERVER_ERROR"))
+def test_anthropic_transient_failure_does_not_immediately_pause(conn, failure_code):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="anthropic")
+    failed = _attempt(
+        success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="anthropic",
+        failure_code=failure_code, failure_retryable=True,
+    )
+    controller.after_attempt(_request(), failed)
+    assert pause_mod.current_state(conn).state == pause_mod.STATE_ACTIVE
 
 
 def test_codex_cycle_call_cap_counts_allowed_failed_or_successful_calls(conn):
@@ -385,3 +421,18 @@ def test_automatic_pause_after_attempt_one_blocks_attempt_two(conn):
     decision_2 = controller.before_attempt(_request(attempt_number=2))
     assert decision_2.allowed is False
     assert decision_2.code == "SKIPPED_PAUSED_OR_KILLED"
+
+
+def test_automatic_structural_pause_blocks_a_new_symbol_controller(conn):
+    reservation, pricing = _reservation(conn)
+    first_symbol = _controller(conn, reservation, pricing, provider="anthropic")
+    failed = _attempt(
+        success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="anthropic",
+        failure_code="PROVIDER_CLIENT_ERROR", failure_retryable=False,
+    )
+    first_symbol.after_attempt(_request(), failed)
+
+    next_symbol = _controller(conn, reservation, pricing, provider="anthropic")
+    decision = next_symbol.before_attempt(_request(role="manager"))
+    assert decision.allowed is False
+    assert decision.code == "SKIPPED_PAUSED_OR_KILLED"
