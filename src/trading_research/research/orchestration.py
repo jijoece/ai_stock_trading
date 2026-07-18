@@ -69,6 +69,12 @@ RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER = "ANALYST_REPORTS_COMPLETE_NO_MA
 _RETRYABLE_ERRORS = (ProviderTimeoutError, ProviderRateLimitError, ProviderTransientError, MalformedOutputError, SchemaValidationError)
 _ROLE_OUTPUT_ERRORS = (SchemaValidationError, EvidenceValidationError)
 
+_TERMINATION_RETRIES_EXHAUSTED = "RETRIES_EXHAUSTED"
+_TERMINATION_NON_RETRYABLE_FAILURE = "NON_RETRYABLE_FAILURE"
+_TERMINATION_PAUSED_OR_KILLED = "PAUSED_OR_KILLED"
+_TERMINATION_BUDGET_GATED = "BUDGET_GATED"
+_TERMINATION_ROLE_GATED = "ROLE_GATED"
+
 CORRELATION_LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
 CORRELATION_MANUAL = "MANUAL"
 CORRELATION_RESEARCH_RUN = "RESEARCH_RUN"
@@ -348,6 +354,9 @@ def _run_role_with_retries(
     attempts: list[ResearchAttemptRecord] = []
     all_failures: list[ResearchValidationFailure] = []
     validation_feedback: tuple[str, ...] = ()
+    provider_attempt_count = 0
+    every_provider_failure_retryable = True
+    termination_reason: str | None = None
     schema = _schema_for_role(role, configuration)
     allowed_evidence_ids = tuple(sorted(snapshot.evidence_ids()))
 
@@ -410,8 +419,16 @@ def _run_role_with_retries(
                     failure_metadata=gate_metadata,
                     **_attempt_correlation_fields(control_decision),
                 ))
+                normalized_gate_code = control_decision.code.upper()
+                if "PAUSE" in normalized_gate_code or "KILL" in normalized_gate_code:
+                    termination_reason = _TERMINATION_PAUSED_OR_KILLED
+                elif "ROLE" in normalized_gate_code:
+                    termination_reason = _TERMINATION_ROLE_GATED
+                else:
+                    termination_reason = _TERMINATION_BUDGET_GATED
                 break
 
+        provider_attempt_count += 1
         try:
             response = provider.generate_structured(request)
         except ProviderUnavailableError as exc:
@@ -435,6 +452,8 @@ def _run_role_with_retries(
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
+            every_provider_failure_retryable = False
+            termination_reason = _TERMINATION_NON_RETRYABLE_FAILURE
             break  # not retryable — provider itself is not usable
         except _RETRYABLE_ERRORS as exc:
             if isinstance(exc, SchemaValidationError) and exc.schema_errors:
@@ -479,6 +498,8 @@ def _run_role_with_retries(
                 # CODEX_REASONING_TOKENS_INVALID) are constructed with
                 # `retryable=False` because the failure is a structural provider
                 # contract violation that will recur identically on every attempt.
+                every_provider_failure_retryable = False
+                termination_reason = _TERMINATION_NON_RETRYABLE_FAILURE
                 break
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
@@ -553,6 +574,8 @@ def _run_role_with_retries(
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
             if ro_retryable is not True:
+                every_provider_failure_retryable = False
+                termination_reason = _TERMINATION_NON_RETRYABLE_FAILURE
                 break
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
@@ -582,6 +605,8 @@ def _run_role_with_retries(
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
             if cv_retryable is not True:
+                every_provider_failure_retryable = False
+                termination_reason = _TERMINATION_NON_RETRYABLE_FAILURE
                 break
             validation_feedback = build_retry_feedback(tuple(claim_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
@@ -599,7 +624,19 @@ def _run_role_with_retries(
             attempt_controller.after_attempt(control_request, attempts[-1])
         return built, attempts, all_failures
 
-    if configuration.max_attempts_per_role >= 1:
+    if (
+        termination_reason is None
+        and provider_attempt_count >= configuration.max_attempts_per_role
+        and every_provider_failure_retryable
+    ):
+        termination_reason = _TERMINATION_RETRIES_EXHAUSTED
+
+    if (
+        termination_reason == _TERMINATION_RETRIES_EXHAUSTED
+        and provider_attempt_count > 0
+        and provider_attempt_count >= configuration.max_attempts_per_role
+        and every_provider_failure_retryable
+    ):
         last_attempt_number = attempts[-1].attempt_number if attempts else configuration.max_attempts_per_role
         last_attempt_id = attempts[-1].attempt_id if attempts else _attempt_id(
             research_run_id, role, last_attempt_number,
@@ -608,10 +645,13 @@ def _run_role_with_retries(
         all_failures.append(new_failure(
             research_run_id=research_run_id, attempt_id=last_attempt_id,
             role=role, attempt_number=last_attempt_number, stage=STAGE_RETRY_EXHAUSTED, code=CODE_RETRY_EXHAUSTED,
-            message=f"role {role!r} exhausted {len(attempts)} attempt(s) without a valid structured report",
+            message=(
+                f"role {role!r} exhausted {provider_attempt_count} provider attempt(s) "
+                "without a valid structured report"
+            ),
             retryable=False, model_name=model_name, prompt_version=prompt_def.version,
             schema_version=prompt_def.schema_version, occurred_at=clock(),
-            metadata={"attempts_made": len(attempts)},
+            metadata={"attempts_made": provider_attempt_count},
         ))
     return None, attempts, all_failures
 
@@ -755,7 +795,8 @@ def analyze_with_research_committee(
             failed_required_roles.append(role)
             prompt_def = prompt_registry.get(role)
             required_role_failure = new_failure(
-                research_run_id=research_run_id, attempt_id=f"{research_run_id}-{role}-required-role-failed",
+                research_run_id=research_run_id,
+                attempt_id=(attempts[-1].attempt_id if attempts else f"{research_run_id}-{role}-required-role-failed"),
                 role=role, attempt_number=configuration.max_attempts_per_role, stage=STAGE_REQUIRED_ROLE_FAILED,
                 code=CODE_MISSING_REQUIRED_ROLE,
                 message=f"required analyst role {role!r} produced no valid report after retry exhaustion",
