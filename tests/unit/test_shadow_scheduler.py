@@ -647,6 +647,21 @@ def test_failed_cycle_raises_cycle_failed_alert_and_writes_health_summary(conn):
     assert summaries[0]["policy_version"] == "health/v2"
 
 
+def test_completed_cycle_persists_hysteresis_state(conn):
+    """Milestone 11.3.1 Item 8 Part C: every completed scheduler cycle folds
+    its single-cycle health verdict into the persistent hysteresis row --
+    proves the wiring end to end, not just the standalone module."""
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **_base_kwargs(conn, run_cycle=_stub_run_cycle_success))
+    assert result.status == STATUS_COMPLETED
+    from trading_research.shadow.health_hysteresis import DEFAULT_SCOPE
+    from trading_research.storage.shadow_alerts_repositories import load_health_hysteresis_state
+
+    state = load_health_hysteresis_state(conn, DEFAULT_SCOPE)
+    assert state is not None
+    assert state["decision"] in ("HEALTHY", "DEGRADED", "PAUSE_RECOMMENDED", "PAUSE_REQUIRED")
+    assert state["policy_version"] == "persistent_health/v1"
+
+
 def test_completed_cycle_writes_health_summary_with_real_provider_success_rate(conn):
     calls = []
 

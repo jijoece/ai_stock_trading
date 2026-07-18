@@ -91,3 +91,23 @@ def list_provider_requests(conn: sqlite3.Connection, *, provider: str | None = N
     else:
         rows = conn.execute("SELECT * FROM evidence_provider_requests ORDER BY created_at").fetchall()
     return [dict(r) for r in rows]
+
+
+def list_provider_requests_in_window(
+    conn: sqlite3.Connection, *, symbols: tuple[str, ...], window_start_iso: str, window_end_iso: str,
+) -> list[dict]:
+    """Milestone 11.3.1 Item 8 Part A: the authoritative provider-request
+    telemetry for one research cycle — every persisted request row for the
+    cycle's own symbol set whose `created_at` falls within the cycle's own
+    [start, end) wall-clock window. This is the real per-request count
+    `shadow/scheduler.py` uses in place of `symbols_attempted` (one symbol
+    can produce zero, one, or many provider requests/retries)."""
+    if not symbols:
+        return []
+    placeholders = ",".join("?" for _ in symbols)
+    rows = conn.execute(
+        f"SELECT * FROM evidence_provider_requests WHERE symbol IN ({placeholders}) "
+        "AND created_at >= ? AND created_at < ? ORDER BY created_at",
+        (*symbols, window_start_iso, window_end_iso),
+    ).fetchall()
+    return [dict(r) for r in rows]

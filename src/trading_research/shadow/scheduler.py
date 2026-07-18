@@ -50,6 +50,8 @@ from decimal import Decimal
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from ..evidence_providers import health as provider_health_mod
+from ..evidence_providers import persistence as provider_persistence_mod
 from ..research import usage as usage_mod
 from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration
 from ..storage.research_repositories import compute_cycle_telemetry
@@ -63,6 +65,7 @@ from . import alerts as alerts_mod
 from . import attempt_controller as attempt_controller_mod
 from . import budget as budget_mod
 from . import health as health_mod
+from . import health_hysteresis as health_hysteresis_mod
 from . import lease as lease_mod
 from . import pause as pause_mod
 from . import schedule as schedule_mod
@@ -249,6 +252,8 @@ def _save_no_op_summary(
 def _build_health_inputs_from_cycle_result(
     conn: sqlite3.Connection, cycle_result: ResearchCycleResult | None, *, symbols_attempted: int,
     cycle_duration_seconds: float, budget_breached: bool = False,
+    bounded_symbols: tuple[str, ...] = (), window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> health_mod.CycleHealthInputs:
     """Computes real aggregate rates from `ResearchCycleResult.symbol_results`
     plus, since docs/milestone-7.1.md Step 18, a real `ResearchCycleTelemetry`
@@ -291,7 +296,30 @@ def _build_health_inputs_from_cycle_result(
         )
 
     completed = sum(1 for r in cycle_result.symbol_results if r.status == "COMPLETED")
-    provider_success_rate = completed / symbols_attempted if symbols_attempted > 0 else None
+
+    # Milestone 11.3.1 Item 8 Part A: derive provider health from the real,
+    # persisted `evidence_provider_requests` telemetry for this cycle's own
+    # symbols and wall-clock window -- one symbol can produce zero, one, or
+    # many provider requests/retries, so `symbols_attempted` was never the
+    # right denominator. Falls back to the pre-11.3.1 symbol-level proxy
+    # only when no real request rows exist for this window (e.g. an offline/
+    # deterministic test cycle that never calls a real evidence provider) --
+    # never silently reinterprets a genuine zero-request cycle as healthy.
+    provider_telemetry = None
+    if bounded_symbols and window_start is not None and window_end is not None:
+        provider_rows = provider_persistence_mod.list_provider_requests_in_window(
+            conn, symbols=bounded_symbols, window_start_iso=window_start.isoformat(),
+            window_end_iso=window_end.isoformat(),
+        )
+        provider_telemetry = provider_health_mod.compute_cycle_provider_telemetry(provider_rows)
+    if provider_telemetry is not None and provider_telemetry.total_requests > 0:
+        provider_success_rate = provider_telemetry.aggregate_success_rate
+        provider_request_count = provider_telemetry.total_requests
+        provider_severe_error = provider_telemetry.severe_error
+    else:
+        provider_success_rate = completed / symbols_attempted if symbols_attempted > 0 else None
+        provider_request_count = symbols_attempted
+        provider_severe_error = False
 
     outcomes = [r.evidence_outcome for r in cycle_result.symbol_results if r.evidence_outcome is not None]
     if outcomes:
@@ -341,7 +369,7 @@ def _build_health_inputs_from_cycle_result(
         cost_usd=telemetry.priced_usage_cost_usd, pricing_configured=pricing_configured,
         paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
         cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
-        provider_request_count=symbols_attempted,
+        provider_request_count=provider_request_count, provider_severe_error=provider_severe_error,
     )
 
 
@@ -853,10 +881,26 @@ def run_due_shadow_cycle(
             conn, cycle_result, symbols_attempted=len(bounded_symbols),
             cycle_duration_seconds=(finish_time - start_time).total_seconds(),
             budget_breached=emergency_margin_report.breached,
+            bounded_symbols=tuple(bounded_symbols), window_start=start_time, window_end=finish_time,
         )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)
         health_result = health_mod.evaluate_cycle_health(health_inputs, health_config)
         new_pause_state = health_mod.apply_health_result(conn, health_result, health_config, clock)
+        # Milestone 11.3.1 Item 8 Part C: fold this cycle's single-cycle
+        # verdict into the persistent, multi-cycle hysteresis state. This is
+        # purely observational (never calls request_pause/resume itself —
+        # `apply_health_result` above remains the only actor) but survives a
+        # process restart, so a genuine multi-cycle outage is distinguishable
+        # from one noisy cycle in `shadow_health_hysteresis_state`. A cycle
+        # counts as "qualified" only if real provider-request data existed
+        # this cycle -- never fabricated from a zero-request cycle.
+        hysteresis_decision = health_hysteresis_mod.evaluate_and_persist_hysteresis(
+            conn, cycle_id=cycle_id or scheduler_run_id, cycle_status=health_result.status,
+            qualified=bool(health_inputs.provider_request_count),
+            severe_error=health_inputs.provider_severe_error,
+            config=health_hysteresis_mod.PersistentHealthPolicyConfig(), clock=clock,
+        )
+        del hysteresis_decision  # persisted as a side effect; not otherwise consumed in this cycle's control flow
         # docs/milestone-7.2.md Part 11 fix: previously an automatic
         # health-triggered pause produced NO alert at all — an operator
         # watching `shadow-alerts` would see nothing explaining a sudden
