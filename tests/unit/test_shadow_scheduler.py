@@ -273,6 +273,36 @@ def test_due_path_invokes_run_cycle_and_completes(conn):
     assert result.symbols_completed == 1
     assert result.cycle_id is not None
 
+
+def test_scheduler_infers_roles_and_builds_exact_attempt_ownership_controller(conn):
+    from types import SimpleNamespace
+
+    from trading_research.research.orchestration import AttemptControlRequest
+
+    captured = {}
+
+    def _tracking_stub(*, attempt_controller_factory, **kwargs):
+        assert attempt_controller_factory is not None
+        decision = attempt_controller_factory("AAPL").before_attempt(AttemptControlRequest(
+            research_run_id="shared-research-run", symbol="AAPL", role="fundamental", attempt_number=1,
+            model_name="deterministic-v1", prompt_version="v1", prompt_hash="hash",
+            max_input_tokens=None, max_output_tokens=100, requested_at=DUE_NOW,
+        ))
+        captured["decision"] = decision
+        return _stub_run_cycle_success(**kwargs)
+
+    kwargs = _base_kwargs(conn, run_cycle=_tracking_stub)
+    kwargs["cycle_kwargs_builder"] = lambda symbols, as_of: {
+        "research_configuration": SimpleNamespace(roles=("fundamental",), config_hash="b" * 64),
+    }
+    result = run_due_shadow_cycle(now=DUE_NOW, clock=_clock_at(DUE_NOW), **kwargs)
+    decision = captured["decision"]
+    assert result.status == STATUS_COMPLETED
+    assert decision.scheduler_run_id == result.scheduler_run_id
+    assert decision.research_cycle_id
+    assert decision.attempt_control_check_id
+    assert decision.correlation_mode == "SCHEDULED"
+
     from trading_research.storage.shadow_operations_repositories import list_leases, list_scheduler_runs
     # Lease released after completion.
     leases = list_leases(conn)

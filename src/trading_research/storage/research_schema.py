@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS research_attempts (
     failure_stage TEXT,
     failure_retryable INTEGER,
     failure_metadata_json TEXT,
+    scheduler_run_id TEXT,
+    research_cycle_id TEXT,
+    attempt_control_check_id TEXT,
+    correlation_mode TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN',
     created_at TEXT NOT NULL
 );
 

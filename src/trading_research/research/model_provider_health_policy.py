@@ -29,6 +29,7 @@ from __future__ import annotations
 
 MODEL_PROVIDER_FAILURE_STRUCTURAL = "STRUCTURAL"
 MODEL_PROVIDER_FAILURE_TRANSIENT = "TRANSIENT"
+UNCLASSIFIED_STRUCTURAL_FAILURE = "UNCLASSIFIED_STRUCTURAL_FAILURE"
 
 # Milestone 12.1 Item 1 (Codex/Claude Code) + Milestone 12.1.1 Item 7:
 # explicit, code-reviewed named structural failures — authentication,
@@ -112,6 +113,7 @@ def classify_model_provider_failure(failure_code: str | None, retryable: bool | 
 __all__ = [
     "MODEL_PROVIDER_FAILURE_STRUCTURAL",
     "MODEL_PROVIDER_FAILURE_TRANSIENT",
+    "UNCLASSIFIED_STRUCTURAL_FAILURE",
     "STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES",
     "TRANSIENT_MODEL_PROVIDER_FAILURE_CODES",
     "classify_model_provider_failure",

@@ -17,6 +17,9 @@
     "src/trading_research/shadow/role_budget.py",
     "src/trading_research/storage/shadow_alerts_repositories.py",
     "src/trading_research/storage/shadow_alerts_schema.py",
+    "src/trading_research/storage/research_repositories.py",
+    "src/trading_research/storage/research_schema.py",
+    "src/trading_research/storage/schema_version.py",
     "src/trading_research/storage/shadow_operations_repositories.py",
     "src/trading_research/evidence_providers/health.py",
     "src/trading_research/evidence_providers/persistence.py"

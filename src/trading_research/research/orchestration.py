@@ -13,7 +13,7 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol, TypedDict
 
 from .claim_validation import classify_claim_rejection_reason, validate_decision, validate_role_report
 from .configuration import MANAGER_ROLE, ResearchConfiguration
@@ -69,6 +69,11 @@ RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER = "ANALYST_REPORTS_COMPLETE_NO_MA
 _RETRYABLE_ERRORS = (ProviderTimeoutError, ProviderRateLimitError, ProviderTransientError, MalformedOutputError, SchemaValidationError)
 _ROLE_OUTPUT_ERRORS = (SchemaValidationError, EvidenceValidationError)
 
+CORRELATION_LEGACY_UNKNOWN = "LEGACY_UNKNOWN"
+CORRELATION_MANUAL = "MANUAL"
+CORRELATION_RESEARCH_RUN = "RESEARCH_RUN"
+CORRELATION_SCHEDULED = "SCHEDULED"
+
 
 @dataclass(frozen=True)
 class ResearchAttemptRecord:
@@ -99,6 +104,19 @@ class ResearchAttemptRecord:
     failure_stage: str | None = None
     failure_retryable: bool | None = None
     failure_metadata: Mapping[str, Any] = field(default_factory=dict)
+    scheduler_run_id: str | None = None
+    research_cycle_id: str | None = None
+    attempt_control_check_id: str | None = None
+    correlation_mode: str = CORRELATION_RESEARCH_RUN
+
+    def __post_init__(self) -> None:
+        if self.correlation_mode == CORRELATION_SCHEDULED:
+            if not self.scheduler_run_id:
+                raise ValueError("scheduled research attempts require scheduler_run_id")
+            if not self.research_cycle_id:
+                raise ValueError("scheduled research attempts require research_cycle_id")
+            if not self.attempt_control_check_id:
+                raise ValueError("scheduled research attempts require attempt_control_check_id")
 
 
 @dataclass(frozen=True)
@@ -126,6 +144,10 @@ class AttemptControlDecision:
     allowed: bool
     code: str
     reason: str | None = None
+    scheduler_run_id: str | None = None
+    research_cycle_id: str | None = None
+    attempt_control_check_id: str | None = None
+    correlation_mode: str = CORRELATION_RESEARCH_RUN
 
 
 class ResearchAttemptController(Protocol):
@@ -202,8 +224,37 @@ def _schema_for_role(role: str, configuration: ResearchConfiguration) -> dict:
     return role_report_json_schema(max_claims=configuration.max_claims_per_role)
 
 
-def _attempt_id(research_run_id: str, role: str, attempt_number: int) -> str:
-    return f"{research_run_id}-{role}-{attempt_number}"
+def _attempt_id(
+    research_run_id: str, role: str, attempt_number: int, *, scheduler_run_id: str | None = None,
+) -> str:
+    base = f"{research_run_id}-{role}-{attempt_number}"
+    if scheduler_run_id is None:
+        return base
+    scheduler_digest = hashlib.sha256(scheduler_run_id.encode("utf-8")).hexdigest()[:16]
+    return f"{base}-scheduled-{scheduler_digest}"
+
+
+class _AttemptCorrelationFields(TypedDict):
+    scheduler_run_id: str | None
+    research_cycle_id: str | None
+    attempt_control_check_id: str | None
+    correlation_mode: str
+
+
+def _attempt_correlation_fields(decision: AttemptControlDecision | None) -> _AttemptCorrelationFields:
+    if decision is None:
+        return {
+            "scheduler_run_id": None,
+            "research_cycle_id": None,
+            "attempt_control_check_id": None,
+            "correlation_mode": CORRELATION_RESEARCH_RUN,
+        }
+    return {
+        "scheduler_run_id": decision.scheduler_run_id,
+        "research_cycle_id": decision.research_cycle_id,
+        "attempt_control_check_id": decision.attempt_control_check_id,
+        "correlation_mode": decision.correlation_mode,
+    }
 
 
 def _structured_failure_fields(
@@ -221,7 +272,8 @@ def _structured_failure_fields(
         return None, None, None, {}
     primary = select_primary_failure(failures)
     assert primary is not None
-    return primary.code, primary.stage, primary.retryable, dict(primary.metadata)
+    attempt_retryable = bool(failures) and all(failure.retryable is True for failure in failures)
+    return primary.code, primary.stage, attempt_retryable, dict(primary.metadata)
 
 
 def _failure_from_exc(
@@ -319,6 +371,7 @@ def _run_role_with_retries(
         attempt_failures: list[ResearchValidationFailure] = []
 
         control_request: "AttemptControlRequest | None" = None
+        control_decision: "AttemptControlDecision | None" = None
         if attempt_controller is not None:
             control_request = AttemptControlRequest(
                 research_run_id=research_run_id, symbol=snapshot.symbol, role=role, attempt_number=attempt_number,
@@ -326,6 +379,10 @@ def _run_role_with_retries(
                 max_input_tokens=None, max_output_tokens=configuration.max_output_tokens, requested_at=created_at,
             )
             control_decision = attempt_controller.before_attempt(control_request)
+            if control_decision.correlation_mode == CORRELATION_SCHEDULED:
+                attempt_id = _attempt_id(
+                    research_run_id, role, attempt_number, scheduler_run_id=control_decision.scheduler_run_id,
+                )
             if not control_decision.allowed:
                 # No provider call — a budget/role-eligibility denial is
                 # structurally distinct from a provider failure (Step 12/13:
@@ -351,6 +408,7 @@ def _run_role_with_retries(
                     usage=_unavailable_usage(provider_name, model_name, role, attempt_number), created_at=created_at,
                     failure_code=gate_code, failure_stage=gate_stage, failure_retryable=gate_retryable,
                     failure_metadata=gate_metadata,
+                    **_attempt_correlation_fields(control_decision),
                 ))
                 break
 
@@ -373,6 +431,7 @@ def _run_role_with_retries(
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
                 failure_code=pf_code, failure_stage=pf_stage, failure_retryable=pf_retryable,
                 failure_metadata=pf_metadata,
+                **_attempt_correlation_fields(control_decision),
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
@@ -406,10 +465,11 @@ def _run_role_with_retries(
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
                 failure_code=rt_code, failure_stage=rt_stage, failure_retryable=rt_retryable,
                 failure_metadata=rt_metadata,
+                **_attempt_correlation_fields(control_decision),
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
-            if rt_retryable is False:
+            if rt_retryable is not True:
                 # Milestone 12.1.1 Item 1: retry eligibility must be driven by the
                 # structured `retryable` value on the failure itself, not by which
                 # exception class was caught. `_RETRYABLE_ERRORS` groups exception
@@ -488,9 +548,12 @@ def _run_role_with_retries(
                 usage=response.usage, created_at=created_at,
                 failure_code=ro_code, failure_stage=ro_stage, failure_retryable=ro_retryable,
                 failure_metadata=ro_metadata,
+                **_attempt_correlation_fields(control_decision),
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
+            if ro_retryable is not True:
+                break
             validation_feedback = build_retry_feedback(tuple(attempt_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 
@@ -514,9 +577,12 @@ def _run_role_with_retries(
                 usage=response.usage, created_at=created_at,
                 failure_code=cv_code, failure_stage=cv_stage, failure_retryable=cv_retryable,
                 failure_metadata=cv_metadata,
+                **_attempt_correlation_fields(control_decision),
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
+            if cv_retryable is not True:
+                break
             validation_feedback = build_retry_feedback(tuple(claim_failures), allowed_evidence_ids=allowed_evidence_ids)
             continue
 
@@ -527,6 +593,7 @@ def _run_role_with_retries(
             provider=provider_name, model_name=model_name, success=True, failure_reason=None,
             raw_response_json=dict(response.parsed_json), validated_payload_json=dict(response.parsed_json),
             usage=response.usage, created_at=created_at,
+            **_attempt_correlation_fields(control_decision),
         ))
         if attempt_controller is not None and control_request is not None:
             attempt_controller.after_attempt(control_request, attempts[-1])
@@ -534,9 +601,12 @@ def _run_role_with_retries(
 
     if configuration.max_attempts_per_role >= 1:
         last_attempt_number = attempts[-1].attempt_number if attempts else configuration.max_attempts_per_role
+        last_attempt_id = attempts[-1].attempt_id if attempts else _attempt_id(
+            research_run_id, role, last_attempt_number,
+        )
         prompt_def = prompt_registry.get(role)
         all_failures.append(new_failure(
-            research_run_id=research_run_id, attempt_id=_attempt_id(research_run_id, role, last_attempt_number),
+            research_run_id=research_run_id, attempt_id=last_attempt_id,
             role=role, attempt_number=last_attempt_number, stage=STAGE_RETRY_EXHAUSTED, code=CODE_RETRY_EXHAUSTED,
             message=f"role {role!r} exhausted {len(attempts)} attempt(s) without a valid structured report",
             retryable=False, model_name=model_name, prompt_version=prompt_def.version,

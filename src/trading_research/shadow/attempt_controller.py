@@ -18,12 +18,28 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Callable
 
-from ..research.model_provider_health_policy import STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES
-from ..research.orchestration import AttemptControlDecision, AttemptControlRequest, ResearchAttemptRecord
+from ..research.model_provider_health_policy import (
+    MODEL_PROVIDER_FAILURE_STRUCTURAL,
+    STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES,
+    classify_model_provider_failure,
+)
+from ..research.orchestration import (
+    CORRELATION_RESEARCH_RUN,
+    CORRELATION_SCHEDULED,
+    AttemptControlDecision,
+    AttemptControlRequest,
+    ResearchAttemptRecord,
+)
 from ..research.usage import PricingEntry
 from ..storage.shadow_operations_repositories import save_role_budget_check
 from . import role_budget as role_budget_mod
-from .budget import PRICING_EXEMPT_PROVIDERS, ReservationHandle, record_actual_usage_for_attempt, remaining_reservation_budget
+from .budget import (
+    PRICING_EXEMPT_PROVIDERS,
+    REAL_CLAUDE_PROVIDERS,
+    ReservationHandle,
+    record_actual_usage_for_attempt,
+    remaining_reservation_budget,
+)
 
 Clock = Callable[[], datetime]
 
@@ -47,13 +63,15 @@ _MANAGED_CLI_PROVIDERS = ("claude_code", "codex")
 IMMEDIATE_PROVIDER_PAUSE_CODES = STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES
 
 
-def _compute_check_id(*, reservation_id: str, research_run_id: str, role: str, attempt_number: int) -> str:
+def _compute_check_id(
+    *, reservation_id: str, scheduler_run_id: str | None, research_run_id: str, role: str, attempt_number: int,
+) -> str:
     """Deterministic identity (docs/milestone-7.1.md Step 14: "deterministic/
     idempotent check identity") — the same (reservation, run, role, attempt)
     tuple always produces the same `check_id`, so a resumed cycle's repeated
     pre-attempt check never inserts a duplicate audit row (`save_role_budget_check`
     uses `INSERT OR IGNORE`)."""
-    payload = f"{reservation_id}|{research_run_id}|{role}|{attempt_number}"
+    payload = f"{reservation_id}|{scheduler_run_id or ''}|{research_run_id}|{role}|{attempt_number}"
     digest = hashlib.sha256(payload.encode()).hexdigest()
     return f"rbcheck-{digest[:32]}"
 
@@ -114,7 +132,8 @@ class ShadowResearchAttemptController:
             remaining = remaining_reservation_budget(self.conn, self.reservation.reservation_id)
             checked_at = self.clock()
             check_id = _compute_check_id(
-                reservation_id=self.reservation.reservation_id, research_run_id=request.research_run_id,
+                reservation_id=self.reservation.reservation_id, scheduler_run_id=self.scheduler_run_id,
+                research_run_id=request.research_run_id,
                 role=request.role, attempt_number=request.attempt_number,
             )
             save_role_budget_check(
@@ -136,7 +155,12 @@ class ShadowResearchAttemptController:
                     "checked_at": checked_at.isoformat(),
                 },
             )
-            return AttemptControlDecision(allowed=False, code=decision.decision, reason=decision.reason)
+            return AttemptControlDecision(
+                allowed=False, code=decision.decision, reason=decision.reason,
+                scheduler_run_id=self.scheduler_run_id, research_cycle_id=self.cycle_id,
+                attempt_control_check_id=check_id,
+                correlation_mode=CORRELATION_SCHEDULED if self.scheduler_run_id else CORRELATION_RESEARCH_RUN,
+            )
         cost_per_output_token = (
             (self.pricing.output_price_per_million / Decimal(1_000_000)) if self.pricing is not None else Decimal("0")
         )
@@ -198,7 +222,8 @@ class ShadowResearchAttemptController:
         remaining = remaining_reservation_budget(self.conn, self.reservation.reservation_id)
         checked_at = self.clock()
         check_id = _compute_check_id(
-            reservation_id=self.reservation.reservation_id, research_run_id=request.research_run_id,
+            reservation_id=self.reservation.reservation_id, scheduler_run_id=self.scheduler_run_id,
+            research_run_id=request.research_run_id,
             role=request.role, attempt_number=request.attempt_number,
         )
         save_role_budget_check(
@@ -221,20 +246,28 @@ class ShadowResearchAttemptController:
             },
         )
 
-        return AttemptControlDecision(allowed=decision.proceed, code=decision.decision, reason=decision.reason)
+        return AttemptControlDecision(
+            allowed=decision.proceed, code=decision.decision, reason=decision.reason,
+            scheduler_run_id=self.scheduler_run_id, research_cycle_id=self.cycle_id,
+            attempt_control_check_id=check_id,
+            correlation_mode=CORRELATION_SCHEDULED if self.scheduler_run_id else CORRELATION_RESEARCH_RUN,
+        )
 
     def after_attempt(self, request: AttemptControlRequest, attempt: ResearchAttemptRecord) -> None:
         usage = attempt.usage
-        if self.provider in _MANAGED_CLI_PROVIDERS and not attempt.success:
-            # Milestone 12.1 Item 1: act only on the stable typed
-            # `failure_code` taxonomy, never on `failure_reason` free text —
-            # a retryable transient failure (e.g. CODEX_TRANSIENT_FAILURE,
-            # CODEX_PROCESS_TIMEOUT) must never trip this pause just because
-            # its message happens to contain a word like "retry".
-            if attempt.failure_code in IMMEDIATE_PROVIDER_PAUSE_CODES:
+        if self.provider in REAL_CLAUDE_PROVIDERS and not attempt.success:
+            # Every real model provider uses the same typed classifier as
+            # end-of-cycle health. Human-readable messages never influence
+            # this immediate fail-closed boundary.
+            classification = classify_model_provider_failure(
+                attempt.failure_code, attempt.failure_retryable,
+            )
+            if classification == MODEL_PROVIDER_FAILURE_STRUCTURAL:
                 from . import pause as pause_mod
 
-                provider_label = "Claude Code" if self.provider == "claude_code" else "Codex"
+                provider_label = {
+                    "claude_code": "Claude Code", "codex": "Codex", "anthropic": "Anthropic",
+                }.get(self.provider, "Model")
                 current = pause_mod.current_state(self.conn)
                 if current.state == pause_mod.STATE_ACTIVE:
                     pause_mod.request_pause(

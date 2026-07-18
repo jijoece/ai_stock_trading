@@ -417,7 +417,7 @@ def new_failure(
 # the order the failures happened to be appended in. Never uses `message`
 # (free text) to rank or break ties — only the already-validated, allowlisted
 # `stage`/`code`/`retryable` fields.
-PRIMARY_FAILURE_POLICY_VERSION = "primary-failure-selection/v1"
+PRIMARY_FAILURE_POLICY_VERSION = "primary-failure-selection/v2"
 
 _PROVIDER_STAGES = (STAGE_PROVIDER_REQUEST, STAGE_PROVIDER_RESPONSE)
 _CONTRACT_STAGES = (STAGE_TOOL_USE_EXTRACTION, STAGE_JSON_DECODING, STAGE_STRUCTURED_SCHEMA, STAGE_ROLE_REPORT_VALIDATION)
@@ -428,24 +428,30 @@ def _failure_tier(failure: ResearchValidationFailure) -> int:
     """Lower number = higher priority. Every branch is derived only from the
     already-typed/validated `stage` and `retryable` fields — never from
     `code` free-form matching or `message` text. A stage this policy does not
-    otherwise recognize (including any future taxonomy addition) falls
-    through to the lowest-priority "diagnostic failure" tier rather than
-    raising or silently outranking a real provider/contract failure — fails
-    closed toward "least operationally alarming", never toward "most".
+    otherwise recognize is conservative when non-retryable (or has unknown
+    retryability): it ranks immediately after a known structural provider
+    failure and ahead of retryable claim/schema failures. Unknown retryable
+    diagnostics remain in the lowest-priority tier.
     """
-    if failure.stage in _PROVIDER_STAGES and not failure.retryable:
+    if failure.stage in _PROVIDER_STAGES and failure.retryable is not True:
         return 0  # structural provider failure
-    if failure.stage in _CONTRACT_STAGES and not failure.retryable:
-        return 1  # non-retryable provider contract failure
+    if (
+        failure.retryable is not True
+        and failure.stage not in _CONTRACT_STAGES
+        and failure.stage != STAGE_BUDGET_GATED
+    ):
+        return 1  # unknown non-retryable failure
+    if failure.stage in _CONTRACT_STAGES and failure.retryable is not True:
+        return 2  # non-retryable provider contract failure
     if failure.stage == STAGE_BUDGET_GATED:
-        return 2  # budget or kill failure
-    if failure.stage in _PROVIDER_STAGES and failure.retryable:
-        return 3  # retryable provider failure
-    if failure.stage in _CONTRACT_STAGES and failure.retryable:
-        return 4  # schema validation
+        return 3  # budget or kill failure
+    if failure.stage in _PROVIDER_STAGES and failure.retryable is True:
+        return 4  # retryable provider failure
+    if failure.stage in _CONTRACT_STAGES and failure.retryable is True:
+        return 5  # schema validation
     if failure.stage in _CLAIM_STAGES:
-        return 5  # claim validation
-    return 6  # diagnostic failure (RETRY_EXHAUSTED, REQUIRED_ROLE_FAILED, MANAGER_SKIPPED, PERSISTENCE, UNKNOWN, ...)
+        return 6  # claim validation
+    return 7  # diagnostic failure (RETRY_EXHAUSTED, REQUIRED_ROLE_FAILED, MANAGER_SKIPPED, PERSISTENCE, UNKNOWN, ...)
 
 
 def select_primary_failure(
