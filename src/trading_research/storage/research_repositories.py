@@ -474,6 +474,65 @@ def compute_cycle_telemetry(conn: sqlite3.Connection, research_run_ids: tuple[st
         for f in list_run_failures(conn, run_id)
     )
 
+    return _compute_telemetry_from_rows(
+        research_run_ids=research_run_ids, attempt_rows=attempt_rows, failures=failures,
+    )
+
+
+def compute_scheduled_run_telemetry(
+    conn: sqlite3.Connection,
+    *,
+    scheduler_run_id: str,
+    research_run_ids: tuple[str, ...] = (),
+) -> ResearchCycleTelemetry:
+    """Derive telemetry from attempts owned by one exact scheduler run.
+
+    Scheduled ownership is always established by the immutable correlation
+    fields on ``research_attempts``. Reusable ``research_run_id`` values are
+    only an optional narrowing filter and never the ownership boundary.
+    Failures are reached through their owning attempts for the same reason.
+    """
+    query = (
+        "SELECT * FROM research_attempts "
+        "WHERE correlation_mode = 'SCHEDULED' AND scheduler_run_id = ?"
+    )
+    failure_query = (
+        "SELECT f.* FROM research_attempt_failures f "
+        "JOIN research_attempts a ON a.attempt_id = f.attempt_id "
+        "WHERE a.correlation_mode = 'SCHEDULED' AND a.scheduler_run_id = ?"
+    )
+    params: list[str] = [scheduler_run_id]
+    if research_run_ids:
+        placeholders = ",".join("?" for _ in research_run_ids)
+        query += f" AND research_run_id IN ({placeholders})"
+        failure_query += f" AND a.research_run_id IN ({placeholders})"
+        params.extend(research_run_ids)
+
+    attempt_rows = conn.execute(query, params).fetchall()
+    failure_rows = conn.execute(failure_query, params).fetchall()
+    failures = tuple(_failure_from_row(row) for row in failure_rows)
+    owned_research_run_ids = research_run_ids or tuple(
+        dict.fromkeys(row["research_run_id"] for row in attempt_rows)
+    )
+    if not owned_research_run_ids:
+        return ResearchCycleTelemetry(
+            status=STATUS_UNAVAILABLE, research_run_ids=(), attempt_count=0, successful_attempt_count=0,
+            failed_attempt_count=0, retry_count=0, retry_exhaustion_count=0, distinct_roles_invoked_count=0,
+            required_role_failure_count=0, provider_failure_count=0, unsupported_claim_count=0,
+            output_truncation_count=0, budget_skipped_attempt_count=0, input_tokens=None, output_tokens=None,
+            latency_ms=None, priced_usage_cost_usd=None, pricing_status="NO_DATA", missing_usage_record_count=0,
+        )
+    return _compute_telemetry_from_rows(
+        research_run_ids=owned_research_run_ids, attempt_rows=attempt_rows, failures=failures,
+    )
+
+
+def _compute_telemetry_from_rows(
+    *,
+    research_run_ids: tuple[str, ...],
+    attempt_rows: list[sqlite3.Row],
+    failures: tuple[ResearchValidationFailure, ...],
+) -> ResearchCycleTelemetry:
     attempt_count = len(attempt_rows)
     successful_attempt_count = sum(1 for r in attempt_rows if r["success"])
     failed_attempt_count = attempt_count - successful_attempt_count

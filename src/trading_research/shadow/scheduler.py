@@ -55,7 +55,7 @@ from ..evidence_providers import health as provider_health_mod
 from ..evidence_providers import persistence as provider_persistence_mod
 from ..research import usage as usage_mod
 from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration, derive_cycle_id
-from ..storage.research_repositories import compute_cycle_telemetry
+from ..storage.research_repositories import compute_cycle_telemetry, compute_scheduled_run_telemetry
 from ..storage.shadow_alerts_repositories import save_health_check, save_run_summary
 from ..storage.shadow_operations_repositories import (
     find_scheduler_run_by_intended_schedule,
@@ -365,7 +365,12 @@ def _build_health_inputs_from_cycle_result(
     research_run_ids = tuple(
         r.research_run_id for r in cycle_result.symbol_results if r.research_run_id is not None
     )
-    telemetry = compute_cycle_telemetry(conn, research_run_ids)
+    if scheduler_run_id is not None:
+        telemetry = compute_scheduled_run_telemetry(
+            conn, scheduler_run_id=scheduler_run_id, research_run_ids=research_run_ids,
+        )
+    else:
+        telemetry = compute_cycle_telemetry(conn, research_run_ids)
 
     if telemetry.attempt_count > 0:
         claude_role_success_rate = telemetry.successful_attempt_count / telemetry.attempt_count
