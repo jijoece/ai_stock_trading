@@ -20,6 +20,25 @@ from .trading_schema import apply_trading_schema
 SQLITE_BUSY_TIMEOUT_MS = 5_000
 
 
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Start a `BEGIN IMMEDIATE` transaction, first clearing any pending
+    implicit transaction left open on this connection by a prior unguarded
+    write (Milestone 11.2 Part 4/5). Python's default (legacy) sqlite3
+    isolation mode auto-starts an implicit transaction before any DML
+    statement; if one is left open when a manual `BEGIN IMMEDIATE` helper is
+    entered, `BEGIN IMMEDIATE` itself raises `OperationalError: cannot start
+    a transaction within a transaction`, and — because that failure happens
+    before any `try` block guarding the helper's own transaction — the
+    connection is left in an ambiguous, still-open transaction state for the
+    *caller* to clean up (or not). Rolling back any pre-existing implicit
+    transaction here first guarantees `BEGIN IMMEDIATE` always starts clean
+    and the connection is always left usable, even when the caller reuses a
+    connection object that was left mid-transaction by unrelated code."""
+    if conn.in_transaction:
+        conn.rollback()
+    conn.execute("BEGIN IMMEDIATE")
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))

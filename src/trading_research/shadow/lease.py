@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
 
+from ..storage.database import begin_immediate
 from ..storage.shadow_operations_repositories import insert_operator_action, load_lease
 
 LEASE_STATUS_HELD = "HELD"
@@ -72,8 +73,8 @@ def acquire(
     transaction's committed result) rather than racing it in memory."""
     now = clock()
     expires_at = now + timedelta(seconds=ttl_seconds)
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         existing = conn.execute(
             "SELECT * FROM shadow_run_leases WHERE lease_key = ?", (lease_key,)
         ).fetchone()
@@ -152,8 +153,8 @@ def _record_stale_recovery(
 def renew(conn: sqlite3.Connection, lease_key: str, owner: str, ttl_seconds: int, clock: Clock) -> LeaseHandle:
     now = clock()
     new_expires_at = now + timedelta(seconds=ttl_seconds)
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         row = conn.execute("SELECT * FROM shadow_run_leases WHERE lease_key = ?", (lease_key,)).fetchone()
         if row is None or row["status"] != LEASE_STATUS_HELD or row["owner"] != owner:
             conn.rollback()
@@ -171,8 +172,8 @@ def renew(conn: sqlite3.Connection, lease_key: str, owner: str, ttl_seconds: int
 
 def release(conn: sqlite3.Connection, lease_key: str, owner: str, clock: Clock) -> None:
     now = clock()
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         row = conn.execute("SELECT * FROM shadow_run_leases WHERE lease_key = ?", (lease_key,)).fetchone()
         if row is None or row["status"] != LEASE_STATUS_HELD or row["owner"] != owner:
             conn.rollback()
@@ -197,8 +198,8 @@ def force_release(conn: sqlite3.Connection, lease_key: str, reason: str, operato
     if not operator or not operator.strip():
         raise LeaseError("force_release requires a non-empty operator identity")
     now = clock()
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         row = conn.execute("SELECT * FROM shadow_run_leases WHERE lease_key = ?", (lease_key,)).fetchone()
         if row is None:
             conn.rollback()

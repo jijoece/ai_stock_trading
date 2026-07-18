@@ -8,6 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..storage import paper_books_repositories as repo
+from ..storage.database import begin_immediate
 
 COST_BASIS_METHOD = "FIFO"
 
@@ -189,12 +190,40 @@ def reserve_shares_for_sell(
     conn, book_id: str, symbol: str, paper_order_intent_id: str, client_order_id: str, quantity: Decimal, now,
     *, commit: bool = True,
 ) -> bool:
-    """Atomically reserve `quantity` shares for an external closing SELL before submission.
+    """Reserve `quantity` shares for an external closing SELL before submission.
 
     Fails closed (`InsufficientPositionError`) if fewer shares are
     confirmed-and-unreserved than requested — this is what prevents a second
-    SELL from reserving or submitting the same shares."""
+    SELL from reserving or submitting the same shares. Milestone 11.2 Part 8:
+    the load-position/verify-no-conflicting-reservation/append-reservation/
+    update-aggregate sequence must be serialized at (book_id, symbol) scope,
+    otherwise two SELL intents can both observe the same available quantity
+    before either commits. When `commit=True` (the only mode any caller
+    currently uses) this function owns its own `BEGIN IMMEDIATE` symbol-
+    scoped lock end-to-end; `commit=False` is reserved for a caller that has
+    already acquired its own lock and wants this reservation to participate
+    in that outer transaction."""
     idem = f"reserve:{paper_order_intent_id}"
+    if not commit:
+        return _reserve_shares_for_sell_locked(
+            conn, book_id, symbol, paper_order_intent_id, client_order_id, quantity, now, idem, commit=False,
+        )
+    try:
+        begin_immediate(conn)
+        result = _reserve_shares_for_sell_locked(
+            conn, book_id, symbol, paper_order_intent_id, client_order_id, quantity, now, idem, commit=False,
+        )
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _reserve_shares_for_sell_locked(
+    conn, book_id: str, symbol: str, paper_order_intent_id: str, client_order_id: str, quantity: Decimal, now,
+    idem: str, *, commit: bool,
+) -> bool:
     if repo.list_external_position_reservation_events(
         conn, book_id=book_id, paper_order_intent_id=paper_order_intent_id
     ):

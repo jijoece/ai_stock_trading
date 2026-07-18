@@ -50,6 +50,18 @@ class RuntimeConfiguration:
         return self.broker_provider == "alpaca" and self.alpaca_base_url == ALPACA_PAPER_BASE_URL
 
 
+
+# Milestone 11.2 Part 21: the only keys a dedicated `PAPER_RUNTIME_ENV_FILE`
+# may contain. Any other key present anywhere in the file causes the whole
+# file to be rejected (fail closed — none of its values are loaded), which
+# is also what makes pointing this at the main repository's own `.env`
+# (Anthropic/Reddit/Robinhood/database secrets, none allowlisted here) fail
+# closed without needing to hard-code a path to that file.
+_ALLOWED_ENV_FILE_KEYS = frozenset({
+    "ALPACA_API_KEY", "ALPACA_API_SECRET", "ALPACA_IS_PAPER", "ALPACA_BASE_URL", "PAPER_BROKER_PROVIDER",
+})
+
+
 def _load_dotenv_if_present() -> None:
     """Loads credentials only from a dotenv file the operator explicitly
     named via `PAPER_RUNTIME_ENV_FILE` — never by scanning the filesystem.
@@ -65,17 +77,60 @@ def _load_dotenv_if_present() -> None:
     must name one dedicated, Alpaca-only file outside the repository (or be
     left unset, in which case credentials come only from the subprocess
     environment / a deployment secret manager). Never overrides a variable
-    already set in the real environment (`override=False`); never raises if
-    `python-dotenv` or the named file is unavailable.
+    already set in the real environment (`override=False`); never raises —
+    an invalid, unreadable, or unsafe env file simply means none of its
+    values are loaded, which leaves credentials absent and the environment
+    correctly disabled rather than crashing the process (`health`/
+    `capabilities` must always be answerable).
+
+    Validation performed before anything from the file is applied to
+    `os.environ`:
+    * the path must be absolute (a relative path is ambiguous about which
+      directory it's relative to once this process's cwd is fixed by the
+      main process — rejected rather than silently resolved against an
+      assumption that could be wrong);
+    * symlinks are resolved (`Path.resolve()`) before every other check, so
+      a symlink cannot be used to point at a file that would otherwise be
+      rejected;
+    * on POSIX, a file writable by group or other is rejected (a dedicated
+      credential file should be operator-readable only);
+    * every key in the file must be in `_ALLOWED_ENV_FILE_KEYS` — a single
+      unknown key rejects the *entire* file (fail closed), not just that
+      key. Duplicate keys within the file are resolved deterministically by
+      `dotenv_values` (last occurrence wins), matching `python-dotenv`'s own
+      documented behavior.
     """
     explicit_path = os.environ.get("PAPER_RUNTIME_ENV_FILE")
     if not explicit_path:
         return
     try:
-        from dotenv import load_dotenv
+        from dotenv import dotenv_values
     except ImportError:
         return
-    load_dotenv(explicit_path, override=False)
+    from pathlib import Path
+
+    raw_path = Path(explicit_path)
+    if not raw_path.is_absolute():
+        return  # ambiguous relative path — fail closed, load nothing
+    resolved = raw_path.resolve()
+    if not resolved.is_file():
+        return
+    try:
+        mode = resolved.stat().st_mode
+        if mode & 0o022:  # group- or other-writable
+            return
+    except OSError:
+        return
+    try:
+        values = dotenv_values(resolved)
+    except Exception:
+        return
+    unknown_keys = set(values) - _ALLOWED_ENV_FILE_KEYS
+    if unknown_keys:
+        return  # entire file rejected — fail closed
+    for key, value in values.items():
+        if value is not None and key not in os.environ:
+            os.environ[key] = value
 
 
 def load_runtime_configuration() -> RuntimeConfiguration:

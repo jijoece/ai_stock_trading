@@ -77,7 +77,7 @@ class Dispatcher:
         intent = OrderIntentPayload.from_dict(payload)
         intent.validate(now=datetime.now(timezone.utc))
         if intent.side == "SELL":
-            self._validate_confirmed_long(intent.symbol, intent.quantity)
+            self._validate_confirmed_long(intent.symbol, intent.quantity, exclude_client_order_id=intent.idempotency_key)
         snapshot = self._gateway.submit_order(intent)
         return snapshot.to_dict()
 
@@ -135,7 +135,7 @@ class Dispatcher:
         if expected != fingerprint:
             raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "account fingerprint mismatch")
         if intent.side == "SELL":
-            self._validate_confirmed_long(intent.symbol, intent.quantity)
+            self._validate_confirmed_long(intent.symbol, intent.quantity, exclude_client_order_id=intent.idempotency_key)
         return {
             "provider": "alpaca_paper", "environment": "paper", "book_id": intent.book_id,
             "client_order_id": intent.idempotency_key, "account_fingerprint": fingerprint,
@@ -150,7 +150,7 @@ class Dispatcher:
         if payload["account_fingerprint"] != fingerprint:
             raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "account fingerprint mismatch")
         if intent.side == "SELL":
-            self._validate_confirmed_long(intent.symbol, intent.quantity)
+            self._validate_confirmed_long(intent.symbol, intent.quantity, exclude_client_order_id=intent.idempotency_key)
         return _external_order_dict(self._gateway.submit_order(intent))
 
     def _op_GET_ORDER_BY_CLIENT_ID(self, payload: dict) -> dict:
@@ -220,13 +220,41 @@ class Dispatcher:
             raise RuntimeOperationError(ErrorCode.MALFORMED_PAYLOAD, "limit must be a positive int <= 200")
         return {"orders": [_external_order_dict(o) for o in self._gateway.list_recent_orders(limit)]}
 
-    def _validate_confirmed_long(self, symbol: str, quantity: int) -> None:
+    # Milestone 11.2 Part 14: broker order states considered "active" (still
+    # committing shares) for open-SELL exposure accounting. Excludes every
+    # terminal state (FILLED/CANCELLED/REJECTED/ERROR) and BUY orders.
+    _ACTIVE_SELL_STATES = frozenset({
+        "PENDING_SUBMISSION", "SUBMISSION_UNKNOWN", "SUBMITTED", "ACCEPTED",
+        "PARTIALLY_FILLED", "CANCEL_REQUESTED",
+    })
+
+    def _validate_confirmed_long(self, symbol: str, quantity: int, *, exclude_client_order_id: str | None = None) -> None:
         position = next((p for p in self._gateway.list_positions() if p.symbol == symbol), None)
         if position is None:
             raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "SELL exceeds confirmed broker long position")
         confirmed = _parse_exact_int(position.quantity, "broker position quantity")
-        if confirmed < quantity:
-            raise RuntimeOperationError(ErrorCode.VALIDATION_FAILED, "SELL exceeds confirmed broker long position")
+        committed = 0
+        for order in self._gateway.list_open_orders():
+            if order.symbol != symbol or order.side != "SELL":
+                continue
+            if order.status not in self._ACTIVE_SELL_STATES:
+                continue
+            if exclude_client_order_id is not None and order.client_order_id == exclude_client_order_id:
+                # The current deterministic client order ID during a
+                # retry/idempotent lookup must not double-count itself.
+                continue
+            order_quantity = _parse_exact_int(order.quantity, "open SELL order quantity")
+            filled_quantity = _parse_exact_int(order.filled_quantity, "open SELL order filled quantity")
+            remaining = order_quantity - filled_quantity
+            if remaining > 0:
+                committed += remaining
+        available = confirmed - committed
+        if available < quantity:
+            raise RuntimeOperationError(
+                ErrorCode.VALIDATION_FAILED,
+                f"SELL exceeds confirmed broker long position net of {committed} shares already committed "
+                f"to other active open SELL orders (confirmed={confirmed}, available={available})",
+            )
 
 
 def _require_str(payload: dict, name: str) -> str:

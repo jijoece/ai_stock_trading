@@ -190,12 +190,14 @@ def save_order_intent(conn: sqlite3.Connection, intent) -> bool:
     return True
 
 
-def update_order_status(conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str, status: str) -> None:
+def update_order_status(
+    conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str, status: str, *, commit: bool = True,
+) -> None:
     conn.execute(
         "UPDATE paper_book_orders SET status = ? WHERE book_id = ? AND paper_order_intent_id = ?",
         (status, book_id, paper_order_intent_id),
     )
-    conn.commit()
+    _commit_if(conn, commit)
 
 
 def load_order_intent(conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str) -> dict | None:
@@ -1472,14 +1474,23 @@ def list_external_order_events(
     query = "SELECT * FROM paper_external_order_events"
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
-    query += " ORDER BY created_at, rowid"
+    # Part 11: scope_sequence is the chain-ordering authority; legacy rows
+    # with a NULL sequence sort first (SQLite's default NULL-lowest-in-ASC),
+    # which is correct since they necessarily predate the upgrade.
+    query += " ORDER BY scope_sequence, created_at, rowid"
     return [dict(row) for row in conn.execute(query, params).fetchall()]
 
 
 def load_latest_external_order_event(conn: sqlite3.Connection, book_id: str, client_order_id: str) -> dict | None:
+    # Milestone 11.2 Part 11: scope_sequence is the chain-ordering
+    # authority, not created_at (a clock regression must never select an
+    # earlier event as current). SQLite sorts NULL lowest, so legacy
+    # pre-upgrade rows with scope_sequence IS NULL naturally rank behind
+    # every sequenced row; created_at/rowid remain tiebreakers only among
+    # rows that share a NULL sequence.
     row = conn.execute(
         "SELECT * FROM paper_external_order_events WHERE book_id = ? AND client_order_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, client_order_id),
+        "ORDER BY scope_sequence DESC, created_at DESC, rowid DESC LIMIT 1", (book_id, client_order_id),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1491,7 +1502,7 @@ def load_latest_external_order_event_for_intent(
     one intent maps to exactly one external order-event chain."""
     row = conn.execute(
         "SELECT * FROM paper_external_order_events WHERE book_id = ? AND paper_order_intent_id = ? "
-        "ORDER BY created_at DESC, rowid DESC LIMIT 1", (book_id, paper_order_intent_id),
+        "ORDER BY scope_sequence DESC, created_at DESC, rowid DESC LIMIT 1", (book_id, paper_order_intent_id),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1660,21 +1671,62 @@ def list_external_position_reservation_events(
 def acquire_external_order_lease(
     conn: sqlite3.Connection, *, lease_key: str, book_id: str, client_order_id: str, owner_id: str,
     operation: str, now: str, expires_at: str,
-) -> bool:
+) -> int | None:
+    """Milestone 11.2 Part 10: returns the newly-acquired fencing
+    generation on success (1 for a brand-new lease row, or the prior
+    generation + 1 on a fresh/reclaimed-stale acquisition), or `None` if
+    another owner currently holds an unexpired lease."""
     cursor = conn.execute(
         "INSERT INTO paper_external_order_leases "
         "(lease_key, book_id, client_order_id, owner_id, operation, acquired_at, heartbeat_at, "
-        "expires_at, released_at, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE') "
+        "expires_at, released_at, status, generation) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'ACTIVE', 1) "
         "ON CONFLICT(lease_key) DO UPDATE SET "
         "owner_id = excluded.owner_id, operation = excluded.operation, acquired_at = excluded.acquired_at, "
         "heartbeat_at = excluded.heartbeat_at, expires_at = excluded.expires_at, released_at = NULL, "
-        "status = 'ACTIVE' "
+        "status = 'ACTIVE', generation = paper_external_order_leases.generation + 1 "
         "WHERE paper_external_order_leases.status <> 'ACTIVE' OR paper_external_order_leases.expires_at <= ?",
         (lease_key, book_id, client_order_id, owner_id, operation, now, now, expires_at, now),
     )
     _commit_if(conn, True)
+    if cursor.rowcount == 0:
+        return None
+    row = conn.execute(
+        "SELECT generation FROM paper_external_order_leases WHERE lease_key = ? AND owner_id = ?",
+        (lease_key, owner_id),
+    ).fetchone()
+    return row["generation"] if row is not None else None
+
+
+def heartbeat_external_order_lease(
+    conn: sqlite3.Connection, *, lease_key: str, owner_id: str, generation: int, now: str, expires_at: str,
+) -> bool:
+    """Renews `expires_at`/`heartbeat_at` for the current owner+generation
+    without releasing the lease. Fails (returns False, no write) if the
+    lease was reclaimed by another owner (generation advanced) or already
+    released/expired — a stale owner can never extend its own dead lease."""
+    cursor = conn.execute(
+        "UPDATE paper_external_order_leases SET heartbeat_at = ?, expires_at = ? "
+        "WHERE lease_key = ? AND owner_id = ? AND generation = ? AND status = 'ACTIVE' AND expires_at > ?",
+        (now, expires_at, lease_key, owner_id, generation, now),
+    )
+    conn.commit()
     return cursor.rowcount > 0
+
+
+def verify_external_order_lease(
+    conn: sqlite3.Connection, *, lease_key: str, owner_id: str, generation: int, now: str,
+) -> bool:
+    """Read-only fencing check: does this owner+generation still hold an
+    unexpired ACTIVE lease right now? Used to gate a write immediately
+    before it happens, so a stale owner whose lease was reclaimed mid-
+    operation cannot proceed to write after all."""
+    row = conn.execute(
+        "SELECT 1 FROM paper_external_order_leases "
+        "WHERE lease_key = ? AND owner_id = ? AND generation = ? AND status = 'ACTIVE' AND expires_at > ?",
+        (lease_key, owner_id, generation, now),
+    ).fetchone()
+    return row is not None
 
 
 def load_external_order_lease(conn: sqlite3.Connection, lease_key: str) -> dict | None:
@@ -1684,11 +1736,23 @@ def load_external_order_lease(conn: sqlite3.Connection, lease_key: str) -> dict 
     return dict(row) if row is not None else None
 
 
-def release_external_order_lease(conn: sqlite3.Connection, *, lease_key: str, owner_id: str, now: str) -> bool:
-    cursor = conn.execute(
-        "UPDATE paper_external_order_leases SET status = 'RELEASED', released_at = ? "
-        "WHERE lease_key = ? AND owner_id = ? AND status = 'ACTIVE'",
-        (now, lease_key, owner_id),
-    )
+def release_external_order_lease(
+    conn: sqlite3.Connection, *, lease_key: str, owner_id: str, now: str, generation: int | None = None,
+) -> bool:
+    """`generation`, when supplied, fences the release the same way as
+    `heartbeat_external_order_lease` — a stale owner whose lease was
+    reclaimed cannot release the *new* owner's lease out from under it."""
+    if generation is None:
+        cursor = conn.execute(
+            "UPDATE paper_external_order_leases SET status = 'RELEASED', released_at = ? "
+            "WHERE lease_key = ? AND owner_id = ? AND status = 'ACTIVE'",
+            (now, lease_key, owner_id),
+        )
+    else:
+        cursor = conn.execute(
+            "UPDATE paper_external_order_leases SET status = 'RELEASED', released_at = ? "
+            "WHERE lease_key = ? AND owner_id = ? AND generation = ? AND status = 'ACTIVE'",
+            (now, lease_key, owner_id, generation),
+        )
     conn.commit()
     return cursor.rowcount > 0

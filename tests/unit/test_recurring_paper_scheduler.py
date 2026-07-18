@@ -87,7 +87,7 @@ def _save_attempt(
 def ready_review(
     conn, config, *, campaign_id="ready-campaign", attempt_id="ready-attempt", review_id="ready-review",
     attempt_status=None, supersedes=None, attempt_campaign_id=None, config_hash="attempt-config",
-    create_attempt=True, attempt_number=1, previous_attempt_id=None,
+    create_attempt=True, attempt_number=1, previous_attempt_id=None, provider_success_counts=None,
 ):
     for book in (config.baseline, config.enhanced):
         cash_ledger.open_book(
@@ -109,7 +109,10 @@ def ready_review(
         "campaign_attempt_id": attempt_id, "config_hash": config_hash,
         "supersedes_activation_review_id": supersedes,
         "campaign_manifest_hash": "manifest", "completed_market_days": 1, "completed_cycles": 1,
-        "provider_provenance_counts": {}, "provider_success_counts": {"real_provider_success_cycles": 1},
+        "provider_provenance_counts": {},
+        "provider_success_counts": provider_success_counts if provider_success_counts is not None else {
+            "real_provider_success_cycles": 1, "qualifying_real_provider_cycles": 1,
+        },
         "cross_book_verification_history": [{
             "as_of": REVIEW_TIME.isoformat(), "verification_id": verification.verification_id,
             "status": "PASSED", "stale_at_final_review": False,
@@ -224,6 +227,40 @@ def test_activation_rejects_superseded_review(conn):
         paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
     )
     assert request["activation_review_id"] == "newer-review"
+
+
+def test_activation_uses_qualifying_not_naive_success_count(conn):
+    """Milestone 11.2 Part 16: a review whose naive `real_provider_success_cycles`
+    meets the threshold but whose strict `qualifying_real_provider_cycles`
+    does not must still fail activation."""
+    config = cfg()
+    ready_review(
+        conn, config, campaign_id="naive-campaign", attempt_id="naive-attempt", review_id="naive-review",
+        provider_success_counts={
+            "real_provider_success_cycles": 5,  # meets minimum_successful_real_provider_cycles
+            "qualifying_real_provider_cycles": 0,  # every real-provider cycle had a partial failure
+        },
+    )
+    with pytest.raises(rs.RecurringPaperError, match="qualifying real-provider cycles"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="naive-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+        )
+
+
+def test_activation_rejects_legacy_review_missing_qualifying_field(conn):
+    """Milestone 11.2 Part 16: a review persisted before the qualifying-cycle
+    field existed must fail closed, not silently pass on an absent key."""
+    config = cfg()
+    ready_review(
+        conn, config, campaign_id="legacy-campaign", attempt_id="legacy-attempt", review_id="legacy-review",
+        provider_success_counts={"real_provider_success_cycles": 5},  # no qualifying key at all
+    )
+    with pytest.raises(rs.RecurringPaperError, match="predates qualifying-provider-cycle evidence"):
+        rs.request_recurring_activation(
+            conn, activation_review_id="legacy-review", operator="a", reason="r",
+            paper_books_config=config, now=REVIEW_TIME + timedelta(minutes=1),
+        )
 
 
 def test_activation_rejects_cross_campaign_attempt(conn):

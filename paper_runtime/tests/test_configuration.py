@@ -39,8 +39,9 @@ def test_runtime_loads_only_an_explicitly_named_env_file(clean_env, tmp_path):
     dedicated = tmp_path / "alpaca-only.env"
     dedicated.write_text(
         "ALPACA_API_KEY=explicit-key\nALPACA_API_SECRET=explicit-secret\n"
-        "ALPACA_IS_PAPER=true\nANTHROPIC_API_KEY=unrelated-secret-should-not-matter\n"
+        "ALPACA_IS_PAPER=true\n"
     )
+    dedicated.chmod(0o600)
     os.environ["PAPER_RUNTIME_ENV_FILE"] = str(dedicated)
     try:
         config = load_runtime_configuration()
@@ -50,6 +51,58 @@ def test_runtime_loads_only_an_explicitly_named_env_file(clean_env, tmp_path):
             os.environ.pop(key, None)
     assert config.has_credentials is True
     assert config.alpaca_is_paper_flag is True
+
+
+def test_runtime_rejects_the_whole_file_when_an_unknown_key_is_present(clean_env, tmp_path):
+    """Milestone 11.2 Part 21: a single unknown key anywhere in the
+    dedicated env file causes the entire file to be rejected — even the
+    allowlisted keys alongside it are never loaded — so accidentally
+    pointing PAPER_RUNTIME_ENV_FILE at the main repository's own `.env`
+    (which carries ANTHROPIC_API_KEY, REDDIT_*, etc.) fails closed."""
+    dedicated = tmp_path / "mixed.env"
+    dedicated.write_text(
+        "ALPACA_API_KEY=explicit-key\nALPACA_API_SECRET=explicit-secret\n"
+        "ALPACA_IS_PAPER=true\nANTHROPIC_API_KEY=unrelated-secret-should-not-matter\n"
+    )
+    dedicated.chmod(0o600)
+    os.environ["PAPER_RUNTIME_ENV_FILE"] = str(dedicated)
+    try:
+        config = load_runtime_configuration()
+    finally:
+        del os.environ["PAPER_RUNTIME_ENV_FILE"]
+        for key in ("ALPACA_API_KEY", "ALPACA_API_SECRET", "ALPACA_IS_PAPER", "ANTHROPIC_API_KEY"):
+            os.environ.pop(key, None)
+    assert config.has_credentials is False
+    assert config.alpaca_api_key is None
+
+
+def test_runtime_rejects_a_relative_env_file_path(clean_env, tmp_path, monkeypatch):
+    dedicated = tmp_path / "alpaca-only.env"
+    dedicated.write_text("ALPACA_API_KEY=explicit-key\nALPACA_API_SECRET=explicit-secret\n")
+    dedicated.chmod(0o600)
+    monkeypatch.chdir(tmp_path)
+    os.environ["PAPER_RUNTIME_ENV_FILE"] = "alpaca-only.env"  # relative, not absolute
+    try:
+        config = load_runtime_configuration()
+    finally:
+        del os.environ["PAPER_RUNTIME_ENV_FILE"]
+        for key in ("ALPACA_API_KEY", "ALPACA_API_SECRET"):
+            os.environ.pop(key, None)
+    assert config.has_credentials is False
+
+
+def test_runtime_rejects_a_group_writable_env_file(clean_env, tmp_path):
+    dedicated = tmp_path / "alpaca-only.env"
+    dedicated.write_text("ALPACA_API_KEY=explicit-key\nALPACA_API_SECRET=explicit-secret\n")
+    dedicated.chmod(0o660)  # group-writable
+    os.environ["PAPER_RUNTIME_ENV_FILE"] = str(dedicated)
+    try:
+        config = load_runtime_configuration()
+    finally:
+        del os.environ["PAPER_RUNTIME_ENV_FILE"]
+        for key in ("ALPACA_API_KEY", "ALPACA_API_SECRET"):
+            os.environ.pop(key, None)
+    assert config.has_credentials is False
 
 
 def test_real_environment_takes_precedence_over_the_named_dotenv_file(clean_env, tmp_path):

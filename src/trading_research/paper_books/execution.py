@@ -26,6 +26,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..storage import paper_books_repositories as repo
+from ..storage.database import begin_immediate
 from . import cash_ledger, positions
 from .models import (
     INTENT_STATUS_FILLED,
@@ -120,18 +121,54 @@ def submit_and_simulate(conn, intent: PaperBookOrderIntent, market: MarketSimula
     if repo.fill_exists(conn, intent.book_id, fill["fill_id"]):
         return {"status": INTENT_STATUS_FILLED, "fill": None}  # already applied — idempotent no-op
 
-    repo.save_fill(conn, fill)
     cost_or_proceeds = fill["fill_price"] * fill["fill_quantity"]
 
-    if intent.side == ORDER_SIDE_BUY:
-        positions.apply_buy_fill(conn, intent.book_id, intent.symbol, fill["fill_id"], fill["fill_quantity"], fill["fill_price"], now)
-        cash_ledger.settle_buy(conn, intent.book_id, fill["fill_id"], cost_or_proceeds, fill["fees_usd"], fill["slippage_usd"], now)
-        cash_ledger.release_reservation(conn, intent.book_id, intent.paper_order_intent_id, intent.notional_usd, now, reason="filled")
-    else:
-        positions.apply_sell_fill(conn, intent.book_id, intent.symbol, fill["fill_id"], fill["fill_quantity"], fill["fill_price"], now)
-        cash_ledger.settle_sell(conn, intent.book_id, fill["fill_id"], cost_or_proceeds, fill["fees_usd"], fill["slippage_usd"], now)
+    # Milestone 11.2 Part 6: fill + lot/position + cash settlement + fee/
+    # slippage + reservation release + order status must commit atomically
+    # (all-or-nothing), mirroring the external fill path's `begin_immediate`
+    # pattern in external_broker.py. Previously each repo call defaulted to
+    # commit=True and committed independently, so a crash between any two
+    # steps left a partially-applied fill (e.g. persisted fill row with no
+    # position/cash effect) that a later idempotency check (`fill_exists`)
+    # would treat as already complete.
+    try:
+        begin_immediate(conn)
+        if repo.fill_exists(conn, intent.book_id, fill["fill_id"]):
+            conn.rollback()
+            return {"status": INTENT_STATUS_FILLED, "fill": None}
+        saved = repo.save_fill(conn, fill, commit=False)
+        if not saved:
+            conn.rollback()
+            return {"status": INTENT_STATUS_FILLED, "fill": None}
 
-    repo.update_order_status(conn, intent.book_id, intent.paper_order_intent_id, INTENT_STATUS_FILLED)
+        if intent.side == ORDER_SIDE_BUY:
+            positions.apply_buy_fill(
+                conn, intent.book_id, intent.symbol, fill["fill_id"], fill["fill_quantity"], fill["fill_price"],
+                now, commit=False,
+            )
+            cash_ledger.settle_buy(
+                conn, intent.book_id, fill["fill_id"], cost_or_proceeds, fill["fees_usd"], fill["slippage_usd"],
+                now, commit=False,
+            )
+            cash_ledger.release_reservation(
+                conn, intent.book_id, intent.paper_order_intent_id, intent.notional_usd, now,
+                reason="filled", commit=False,
+            )
+        else:
+            positions.apply_sell_fill(
+                conn, intent.book_id, intent.symbol, fill["fill_id"], fill["fill_quantity"], fill["fill_price"],
+                now, commit=False,
+            )
+            cash_ledger.settle_sell(
+                conn, intent.book_id, fill["fill_id"], cost_or_proceeds, fill["fees_usd"], fill["slippage_usd"],
+                now, commit=False,
+            )
+
+        repo.update_order_status(conn, intent.book_id, intent.paper_order_intent_id, INTENT_STATUS_FILLED, commit=False)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return {"status": INTENT_STATUS_FILLED, "fill": fill}
 
 
