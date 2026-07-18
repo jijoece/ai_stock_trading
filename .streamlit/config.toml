@@ -1,0 +1,14 @@
+[server]
+address = "127.0.0.1"
+port = 8501
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+fileWatcherType = "none"
+
+[client]
+showErrorDetails = "none"
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false
