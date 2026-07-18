@@ -27,50 +27,100 @@
 | 5 | Runtime transport reused after timeout | CONFIRMED | `_request()` only marked the transport unhealthy on a *detected* response mismatch (`ProtocolViolationError`), not on the timeout itself; a bare `queue.Empty` timeout left the transport "healthy" so a later request (including the documented recovery lookup) could read a stale late response | `_mark_unhealthy_after_timeout()` now called on every timeout; `_request` raises `RuntimeUnavailableError` for any op on an unhealthy transport unless the op is in `_RETRYABLE_ON_TIMEOUT`, in which case it transparently calls `start()` (fresh child, re-verified health/capabilities) before proceeding — mutating ops (`submit_order` etc.) are never auto-retried | `tests/unit/test_runtime_client.py` (rewrote 2 stale-contract tests + added 6: unhealthy-on-timeout, no-auto-retry-for-mutating, transparent-restart-for-read-only, stale-response-never-reused-after-restart, kill-escalation, repeated-real-timeout-cycles-no-leak); `tests/unit/test_submit_credentialed_paper_order.py` updated to a two-transport fixture (`sequential_fake_transport_factory`, new in `tests/support/runtime_client_fixtures.py`) | FIXED |
 | 6A | Local BUY intent persisted before reservation | CONFIRMED | `execution.py::submit_and_simulate` called `repo.save_order_intent` (auto-commit) then separately `cash_ledger.reserve_for_order` (own commit) — two independent transactions | New intent path: claim+intent+reservation atomic under `transaction()`; existing-intent path: fail-closed consistency check (`remaining_buy_reservation == notional_usd`), no fabricated release | `tests/unit/test_execution_namespace_claims.py` (crash-after-claim, crash-after-intent, replay-fails-closed) | FIXED |
 | 6B | No durable execution namespace claim (local vs external) | CONFIRMED | Exclusivity was emergent from two asymmetric checks (`has_external_execution_evidence` scan of 4 tables; external `_intent()`'s terminal-status check) — a claimed-but-not-yet-evidenced or non-terminal race was not caught | New `paper_order_execution_claims` table (book_id+intent_id PK, immutable once claimed — simpler fail-closed policy, no release path); `claim_execution_namespace`/`load_execution_namespace_claim`/`ExecutionNamespaceConflictError` in repo; wired into `execution.py` (local) and `external_broker.py::_intent`/`preview_external_paper_order` (external, claims at first preview); schema-version migration 2 backfills legacy rows | `tests/unit/test_execution_namespace_claims.py` (13 tests: local-wins, external-wins, exactly-one-claim, no-double-reserve, no-double-fill, crash reproductions, replay integrity, cancel-release, restart-survival, legacy-migration-and-idempotency, conflict/idempotent-claim) | FIXED |
-| 7 | shadow/config.py permissive boolean coercion | TBD | TBD | TBD | TBD | TBD |
+| 7 | shadow/config.py permissive boolean coercion | CONFIRMED | All 9 boolean fields (`shadow_operations.*`, `schedule.enabled`, `budgets.require_pricing_for_real_claude`, `safety.pause_on_*`) parsed via plain `bool(...)` — `bool("false")`/`bool("no")` are both `True` | Added local `_strict_bool` (mirrors `paper_books/config.py`/`research/scheduled_research_config.py`'s existing pattern: `type(value) is not bool` fails closed) and applied it to all 9 fields | `tests/unit/test_shadow_config.py` (+70 parametrized cases: real booleans accepted, quoted/int/None/list/mapping rejected, default repo config still loads, config hash still deterministic) | FIXED |
 | 8 | Provider health sample floor uses symbols_attempted; no hysteresis | CONFIRMED | `scheduler.py::_build_health_inputs_from_cycle_result` set `provider_request_count=symbols_attempted` and `provider_success_rate=completed/symbols_attempted` — a symbol-count proxy, not real provider-call telemetry; `evaluate_cycle_health` was purely per-cycle with no persisted multi-cycle state; `provider_severe_error` was never set from real data | Part A: new `evidence_providers/health.py::compute_cycle_provider_telemetry`/`classify_severe_error` + `persistence.py::list_provider_requests_in_window` wired into `_build_health_inputs_from_cycle_result` (real per-request count/rate/per-provider breakdown/required-provider-missing when real telemetry exists this cycle's window, falls back to the symbol proxy only when zero real rows exist — e.g. offline/deterministic test cycles). Part B: bounded `SEVERE_ERROR_CATEGORIES` enum classified from persisted `error_code`/`http_status`/`rate_limited`/`retry_count` (never raw exception text). Part C: new `shadow/health_hysteresis.py` + `shadow_health_hysteresis_state` table — versioned `PersistentHealthPolicyConfig`, consecutive-failure/recovery counters, INSUFFICIENT_DATA cycles never counted, idempotent per cycle_id, policy-hash-boundary reset, never overrides PAUSED_MANUAL/KILLED; wired into `scheduler.py`'s per-cycle flow (observational only — no resume() call) | `tests/unit/test_provider_health_telemetry.py` (18 tests: classification + telemetry aggregation + per-provider/required-provider coverage + real-vs-proxy wiring), `tests/unit/test_health_hysteresis.py` (13 tests covering all 14 required scenarios), `test_shadow_scheduler.py::test_completed_cycle_persists_hysteresis_state` (end-to-end wiring) | FIXED |
 
 ## Architecture and transaction decisions
 
-(TBD — populated during implementation)
+See `docs/milestone11-3-1-safety-closure.md`'s "Architecture decisions"
+section for the full writeup. Key decisions: `isolation_level=None` +
+`TransactionAlreadyActiveError` (reject-nested, not savepoint) for Item 2;
+simpler fail-closed (no release path) execution-namespace claims for Item 6;
+transparent in-client restart-on-retry (bounded allowlist) for Item 5;
+single global `"default"` hysteresis scope for Item 8 Part C.
 
 ## Schema changes
 
-(TBD)
+- `paper_order_execution_claims` (new, Item 6) — migration 2 backfills
+  legacy rows.
+- `shadow_health_hysteresis_state` (new, Item 8 Part C) — no backfill
+  needed (absent row = fresh HEALTHY state).
+- (Unrelated to this milestone: migration 3 `claude_code_usage_provenance`
+  columns appeared on this branch from a separate concurrent workstream —
+  not authored/reviewed here.)
 
 ## Crash and concurrency reproductions
 
-(TBD)
+All covered by dedicated regression tests rather than ad hoc manual runs:
+
+- external checkpoint -> crash -> restart -> broker FOUND/NOT_FOUND/timeout/malformed
+  -> `test_stranded_submission_recovery.py`
+- local namespace claim -> crash before intent/reservation -> `test_execution_namespace_claims.py`
+- local intent/reservation transaction interrupted -> same file
+- runtime request timeout with late response -> `test_runtime_client.py`
+- two concurrent local BUYs / lease takeover while old owner writes -> `test_external_order_lease_handle_fencing.py`,
+  `test_transaction_discipline.py` (two-connection BEGIN IMMEDIATE serialization)
+- two snapshot writers for the same natural scope -> `test_snapshot_identity.py`
+- repeated recovery / lookup / fill application / reservation release / namespace claim / migration / snapshot
+  persistence / health evaluation -> idempotency assertions embedded in each item's own test file
+- Concurrency-focused test files repeated 10x via shell loop: stable (440/440 passed).
 
 ## Files changed
 
-(TBD)
+See `docs/milestone11-3-1-safety-closure.md` "Fixes implemented" for the
+full list (19 source files + 12 test files).
 
 ## Tests added
 
-(TBD)
+See `docs/milestone11-3-1-safety-closure.md` "Tests added" table — 190+ new/
+updated test cases across 12 test modules.
 
 ## Commands run
 
 - git rev-parse HEAD / git branch --show-current / git status --short / git log --oneline -20
-- pytest tests/ -q --tb=short
+- pytest tests/ -q --tb=short (baseline + after every item + final)
 - cd paper_runtime && pytest tests/ -q --tb=short
-- env -u ... pytest tests/ -q --tb=short
+- env -u ANTHROPIC_API_KEY -u ANTHROPIC_MODEL -u ANTHROPIC_BATCH_POLL_INTERVAL_SECONDS -u ALPACA_API_KEY
+  -u ALPACA_API_SECRET -u ALPACA_IS_PAPER -u ALPACA_BASE_URL -u REDDIT_MCP_MODE -u REDDIT_MCP_COMMAND
+  -u REDDIT_AUTH_MODE pytest tests/ -q --tb=short
 - pyright ; cd paper_runtime && pyright
 - git diff --check
+- per-new-test-module `pytest <file> -q` runs
+- 10x repeated concurrency-test-file runs via shell loop
 
 ## Open issues
 
-(TBD)
+None blocking. See "Remaining limitations" below for documented,
+non-blocking follow-ups.
 
 ## Remaining limitations
 
-(TBD)
+- Item 8: `compute_cycle_provider_telemetry`'s `required_providers` param
+  is not yet populated from a concrete per-category config at the
+  `scheduler.py` call site (no single canonical "required providers"
+  constant exists in the codebase yet) — the missing-required-provider
+  detection is implemented and tested at the function level; wiring a
+  concrete list through the scheduler is a follow-up.
+- Item 8: TLS failures are not distinguishable from generic connection
+  failures at the currently-persisted field granularity (both fold into
+  `DNS_OR_CONNECTION_FAILURE`, documented in `classify_severe_error`'s
+  docstring).
+- Item 8 Part C: hysteresis is a single global `"default"` scope (correct
+  for this system's current one-pipeline shape).
+- pyright is non-blocking per project convention; post-milestone error
+  count (1951 root, up from 1888 baseline) follows the codebase's existing
+  Optional-narrowing test-fixture pattern in ~15 new test modules — no new
+  category of error.
 
 ## Resume instructions
 
-If resuming: check this file's finding tracker for TBD rows, re-run baseline commands above to confirm no drift, then continue from the last item without a FIXED final status.
+Not applicable — milestone complete on this branch
+(`agent/milestone-11-3-1-safety-closure`). If further work is needed, start
+from the "Remaining limitations" list above.
 
 ## Final status
 
-IN PROGRESS — baseline recorded, findings not yet validated.
+COMPLETE — all 8 items CONFIRMED and FIXED with passing regression tests.
+Full suite: 2079 passed, 16 skipped (clean and credential-free-env
+identical). `docs/milestone11-3-1-safety-closure.md` has the full
+implementation report.

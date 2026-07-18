@@ -27,7 +27,9 @@ read multiple milestone variants unless the task requires comparing them.
 | System boundaries and target architecture | [`AI-Driven-Stock-Trading-Architecture.md`](AI-Driven-Stock-Trading-Architecture.md) |
 | Original roadmap and acceptance criteria | [`AI-Stock-Trading-Implementation-Plan.md`](AI-Stock-Trading-Implementation-Plan.md) |
 | External research-source policy | [`AI-Stock-Trading-Research-Sources.md`](AI-Stock-Trading-Research-Sources.md) |
-| Latest completed integrity implementation | [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md) |
+| Latest completed integrity implementation | [`milestone11-3-1-safety-closure.md`](milestone11-3-1-safety-closure.md) |
+| Milestone 11.3.1 specification | [`milestones/milestone-11.3.1.md`](milestones/milestone-11.3.1.md) |
+| Prior completed integrity implementation | [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md) |
 | Milestone 11.3 specification | [`milestones/milestone11-3-remaining-integrity-closure.md`](milestones/milestone11-3-remaining-integrity-closure.md) |
 | Latest full integrity-closure specification | [`milestones/milestone11-2-full-integrity-closure.md`](milestones/milestone11-2-full-integrity-closure.md) |
 | Latest repository audit | [`full-codebase-audit.md`](full-codebase-audit.md) |
