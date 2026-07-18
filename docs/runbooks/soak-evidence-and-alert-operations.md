@@ -1,7 +1,7 @@
 # Runbook: Soak evidence-integrity and alert operations (Milestone 9.2)
 
 Operator-facing procedure for the new Milestone 9.2 commands: cross-book verification,
-alert listing, and audited alert resolution. See `docs/milestone9-2-soak-evidence-integrity.md`
+alert listing, and audited alert resolution. See `docs/milestones/milestone9-2-soak-evidence-integrity.md`
 for the full architecture record, `docs/runbooks/controlled-paper-soak.md` for the daily
 `paper-soak-run` workflow this extends (unchanged in shape), and `docs/runbooks/shadow-incident-response.md`
 for the broader alert-response process.

@@ -32,7 +32,7 @@ Readiness evaluates all safe checks and returns every failed or missing check wh
 primary-status priority. Cross-book verification IDs now incorporate deterministic source state and
 check results; repaired state creates a later immutable event, and stale verification cannot satisfy
 recurring-review readiness. Settlement references, unexpected book namespaces, and position/lot
-quantities receive explicit checks. See `docs/milestone9-3-evidence-integrity-and-soak-campaign.md`.
+quantities receive explicit checks. See `docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md`.
 
 ## 1. Authoritative provider-provenance classification
 

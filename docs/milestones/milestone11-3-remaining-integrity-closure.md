@@ -6,8 +6,8 @@ commit `c5232ad`).
 
 ## Context
 
-Milestone 11.2 (`docs/milestone11-2-full-integrity-closure.md`, spec;
-`docs/milestone11-2-integrity-closure.md`, closure report) closed 21 of the
+Milestone 11.2 (`docs/milestones/milestone11-2-full-integrity-closure.md`, spec;
+`docs/milestones/milestone11-2-integrity-closure.md`, closure report) closed 21 of the
 original 37 parts: CI hermeticity, migration/trigger versioning, SQLite
 transaction discipline, atomic local fills, BUY/SELL reservation
 atomicity, local/external execution exclusivity, renewable fenced order
@@ -167,10 +167,10 @@ large logs.
 Create:
 
 ```text
-docs/milestone11-3-integrity-closure.md
+docs/milestones/milestone11-3-integrity-closure.md
 ```
 
-Follow the same structure as `docs/milestone11-2-integrity-closure.md`:
+Follow the same structure as `docs/milestones/milestone11-2-integrity-closure.md`:
 starting commit, baseline, findings classified, fixes implemented,
 findings already fixed, design tradeoffs, schema changes, migration
 strategy, transaction boundaries, tests added, final results, remaining

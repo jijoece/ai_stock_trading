@@ -1862,7 +1862,7 @@ Do not install or enable the schedule unless explicitly instructed.
 Create:
 
 ```text
-docs/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-production-shadow-operations.md
 docs/runbooks/shadow-operations.md
 docs/runbooks/shadow-incident-response.md
 ```

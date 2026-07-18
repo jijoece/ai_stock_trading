@@ -10,7 +10,7 @@ Milestone 2 delivered a complete offline research/decision pipeline
 persistence) and an already-existing internal paper ledger
 (`paper/ledger.py`, present since Milestone 1). Nothing in the codebase
 could yet turn a frozen `buy_candidate` recommendation into a simulated
-order/fill. `docs/milestone-3.md` requires closing that gap using LumiBot as
+order/fill. `docs/milestones/milestone-3.md` requires closing that gap using LumiBot as
 "the runtime and simulated-broker component," while the existing trading
 desk remains "the domain, policy, audit, persistence, and evaluation
 authority."
@@ -22,12 +22,12 @@ Three architectural questions had to be answered before writing code:
 2. Does the existing paper ledger get replaced, rewritten, or extended?
 3. Do the new paper-execution contracts follow this repository's existing
    modeling convention, or the `pydantic.BaseModel` shown illustratively in
-   `docs/milestone-3.md`?
+   `docs/milestones/milestone-3.md`?
 
 ## Decision 1: LumiBot is the sole external trading runtime, isolated to `runtime/lumibot/`
 
 LumiBot is the only new major framework introduced (per
-`docs/milestone-3.md`'s explicit constraint — no NautilusTrader, LEAN,
+`docs/milestones/milestone-3.md`'s explicit constraint — no NautilusTrader, LEAN,
 FinRL-X, FinRobot, or TradingAgents). It is imported in exactly one
 package, `src/trading_research/runtime/lumibot/`, behind the
 framework-neutral `execution.adapter_protocol.PaperExecutionAdapter`
@@ -40,7 +40,7 @@ the AST of every other file under `src/trading_research/`.
 application (a `Strategy` subclass with lifecycle callbacks, run by a
 `Trader` event loop). Adopting that shape would have meant migrating
 recommendation/risk/ledger logic into LumiBot-owned lifecycle hooks —
-exactly what `docs/milestone-3.md` forbids ("Do not create a new
+exactly what `docs/milestones/milestone-3.md` forbids ("Do not create a new
 LumiBot-first repository," "Do not replace the existing recommendation
 model"). Instead, LumiBot is consumed as a library for two narrow,
 genuinely LumiBot-shaped pieces of work: constructing a well-formed order
@@ -71,7 +71,7 @@ milestone, and remain separate after it.
 
 ## Decision 3: contracts as `@dataclass(frozen=True)`, not `pydantic.BaseModel`
 
-`docs/milestone-3.md` Step 3 illustrates `PaperOrderIntent` etc. as
+`docs/milestones/milestone-3.md` Step 3 illustrates `PaperOrderIntent` etc. as
 `pydantic.BaseModel` subclasses. This repository has never used pydantic —
 every existing typed contract (`models/trading_models.py`,
 `analysis/screener.py::ScreeningConfig`, `analysis/scorer.py::
@@ -83,9 +83,9 @@ not in `pyproject.toml`'s dependencies today.
 introduce a second validation paradigm alongside the existing one for a
 single milestone's contracts, with no behavioral benefit — dataclasses with
 `__post_init__` already provide the fail-closed validation
-`docs/milestone-3.md` Step 3 requires (long-only, positive quantity,
+`docs/milestones/milestone-3.md` Step 3 requires (long-only, positive quantity,
 limit/market price rules, exact notional reconstruction, expiry ordering).
-`docs/milestone-3.md`'s own instruction ("Add framework-neutral models
+`docs/milestones/milestone-3.md`'s own instruction ("Add framework-neutral models
 *similar to* the following") permits this substitution; matching the
 existing convention was judged more valuable than matching the illustrative
 snippet verbatim.
@@ -109,7 +109,7 @@ live trading:
    (unchanged from Milestone 1/2) — even a hypothetical bug elsewhere could
    not write a live order row.
 
-This mirrors `docs/milestone-3.md`'s explicit non-goals (live Robinhood
+This mirrors `docs/milestones/milestone-3.md`'s explicit non-goals (live Robinhood
 trading, order review/preview/placement/cancellation/modification,
 autonomous live execution, direct LLM-to-order execution) and Milestone
 1/2's existing fail-closed posture.

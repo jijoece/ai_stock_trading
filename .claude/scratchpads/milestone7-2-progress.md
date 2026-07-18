@@ -7,7 +7,7 @@ Status: IN_PROGRESS
 ## Baseline
 - Git state at start of this session: working tree CLEAN, HEAD = `f070bdf "milestone 7.2"` (this
   commit actually contains the *Milestone 7.1* runtime-integration-closure work — the commit
-  message is just the renamed session title; `docs/milestone-7.2.md` itself, the spec this
+  message is just the renamed session title; `docs/milestones/milestone-7.2.md` itself, the spec this
   session implements, was also added by that commit but nothing in `shadow/health.py`,
   `shadow/readiness.py`, `shadow/pause.py`, `shadow/alerts.py`, or a `shadow_run_health_checks`
   table exists yet — none of *this* milestone's work has started).
@@ -566,7 +566,7 @@ twice, honestly reported as an operator error), ~$0.136 total real spend, zero p
 submissions, zero enhanced executions, budget settled, lease released.
 
 ## Security review
-See `docs/milestone7-2-shadow-health-diagnostics.md` Section 14 for the full checklist (no
+See `docs/milestones/milestone7-2-shadow-health-diagnostics.md` Section 14 for the full checklist (no
 secrets, no `.env` printed, no raw Claude content, no model influence over health/pause, no
 automatic resume/kill-clear, no threshold weakened, no missing-metric-as-zero, no
 unknown-cost-as-zero, no duplicate health-check rows, no duplicate pause actions, no paper/
@@ -574,13 +574,13 @@ enhanced/live execution, `real_orders` untouched, recommendation immutability in
 recurring deployment activated).
 
 ## Documentation
-Created `docs/milestone7-2-shadow-health-diagnostics.md`. Updated (pointer notes only,
-historical content preserved): `docs/milestone7-1-shadow-integration-closure.md`,
-`docs/milestone7-production-shadow-operations.md`, `docs/adr/0005-production-shadow-operations-boundary.md`,
+Created `docs/milestones/milestone7-2-shadow-health-diagnostics.md`. Updated (pointer notes only,
+historical content preserved): `docs/milestones/milestone7-1-shadow-integration-closure.md`,
+`docs/milestones/milestone7-production-shadow-operations.md`, `docs/adr/0005-production-shadow-operations-boundary.md`,
 `docs/runbooks/shadow-operations.md`, `docs/runbooks/shadow-incident-response.md`.
 
 ## Known limitations
-See `docs/milestone7-2-shadow-health-diagnostics.md` Section 13 (unsupported_claim_rate
+See `docs/milestones/milestone7-2-shadow-health-diagnostics.md` Section 13 (unsupported_claim_rate
 denominator undemonstrated-so-unfixed; retry_exhaustion_rate's "exhaustion" label is
 misleading for max_attempts_per_role=1; paper_reconciliation_mismatch/
 duplicate_prevention_violation still hardcoded False; cycle_duration_seconds harness-clock

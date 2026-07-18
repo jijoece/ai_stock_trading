@@ -3,7 +3,7 @@
 ## Baseline
 `pytest tests/ -q --tb=short` -> 1486 passed, 14 skipped (matches expected).
 `cd paper_runtime && pytest tests/ -q --tb=short` -> 33 passed (matches expected).
-Git status at start: clean except untracked `docs/milestone-9.2.md` (spec) and pre-existing
+Git status at start: clean except untracked `docs/milestones/milestone-9.2.md` (spec) and pre-existing
 unrelated untracked files (`batch/prompts/milestone-10*`, `milestone-11*`, `milestone-9-3*`,
 `docs/batch_creation.md`) — left untouched.
 
@@ -80,9 +80,9 @@ from the existing `ControlledSoakReadinessResult.checks` list — no change to e
 - Net new: 63 tests. All targeted suites green throughout development.
 
 ## Documentation
-Created `docs/milestone9-2-soak-evidence-integrity.md` and
+Created `docs/milestones/milestone9-2-soak-evidence-integrity.md` and
 `docs/runbooks/soak-evidence-and-alert-operations.md`. Added a short pointer to
-`docs/milestone9-1-controlled-soak-readiness.md`. No prior milestone doc rewritten.
+`docs/milestones/milestone9-1-controlled-soak-readiness.md`. No prior milestone doc rewritten.
 
 ## Safety review
 - No forbidden imports (lumibot/alpaca_trade_api/robinhood order mutation/anthropic) in any new

@@ -2,7 +2,7 @@
 
 Investigation playbook for `paper_books/reconciliation.py`'s per-book reconciliation status.
 Pair with `docs/runbooks/paper-book-operations.md` for routine commands and
-`docs/milestone8-isolated-paper-portfolios.md` for architecture detail.
+`docs/milestones/milestone8-isolated-paper-portfolios.md` for architecture detail.
 
 ## Run a reconciliation
 

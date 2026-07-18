@@ -29,9 +29,9 @@ Before doing anything else, read:
 
 ```text
 .claude/scratchpads/milestone6-progress.md
-docs/milestone6-real-evidence-continuous-evaluation.md
+docs/milestones/milestone6-real-evidence-continuous-evaluation.md
 docs/adr/0004-real-evidence-provider-boundary.md
-docs/milestone5-evidence-backed-claude-research.md
+docs/milestones/milestone5-evidence-backed-claude-research.md
 docs/adr/0003-claude-research-boundary.md
 ```
 
@@ -1431,7 +1431,7 @@ If it still fails for a correct validator reason, preserve the rejection and rep
 Update:
 
 ```text
-docs/milestone6-real-evidence-continuous-evaluation.md
+docs/milestones/milestone6-real-evidence-continuous-evaluation.md
 ```
 
 Add a section:

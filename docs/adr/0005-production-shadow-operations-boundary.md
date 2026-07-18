@@ -14,7 +14,7 @@ Milestones 1-6.1 built a deterministic, evidence-backed research pipeline with a
 * alerts an operator when something goes wrong;
 * reports whether the system is stable enough to keep running unattended.
 
-`docs/milestone-7.md` asks for all of this while explicitly forbidding an always-running daemon, silent scheduler activation, and any weakening of the Milestone 1-6.1 safety invariants (paper-only execution, no enhanced-arm submission, no live trading, Claude as research-provider-only).
+`docs/milestones/milestone-7.md` asks for all of this while explicitly forbidding an always-running daemon, silent scheduler activation, and any weakening of the Milestone 1-6.1 safety invariants (paper-only execution, no enhanced-arm submission, no live trading, Claude as research-provider-only).
 
 ## Decision 1: The scheduler is an external-invocation-compatible single-run entry point, not a daemon
 
@@ -54,7 +54,7 @@ Before each role invocation inside a shadow cycle, `shadow/role_budget.py::check
 
 ## Decision 10: Evidence-completeness policy is a new, versioned classification layer sitting beside `evidence_providers/normalization.py::classify_snapshot_outcome`, not a replacement for it
 
-`classify_snapshot_outcome` (Milestone 6, unchanged) already classifies a single `EvidenceSnapshot`'s outcome (e.g. `COMPLETE`, `INCOMPLETE_REQUIRED_DATA`, `PROVIDER_UNAVAILABLE`, `POINT_IN_TIME_UNSAFE`) from evidence-item-level data. `research/evidence_completeness.py::evaluate_completeness` (new) consumes that outcome *plus* the new `CorporateStatusEvidence` result and produces a distinct, explicitly screening-vs-research pair of statuses per `docs/milestone-7.md` Step 11's status vocabulary. It does not duplicate snapshot-level classification logic — it composes the existing snapshot outcome with the new corporate-status result under a versioned policy (`policy_version` field, persisted), and its result is what the scheduler checks before allowing enhanced-arm Claude calls to run (extending, not replacing, the existing `evidence_blocks_enhanced` check in `research/scheduled_cycle.py::_run_symbol`).
+`classify_snapshot_outcome` (Milestone 6, unchanged) already classifies a single `EvidenceSnapshot`'s outcome (e.g. `COMPLETE`, `INCOMPLETE_REQUIRED_DATA`, `PROVIDER_UNAVAILABLE`, `POINT_IN_TIME_UNSAFE`) from evidence-item-level data. `research/evidence_completeness.py::evaluate_completeness` (new) consumes that outcome *plus* the new `CorporateStatusEvidence` result and produces a distinct, explicitly screening-vs-research pair of statuses per `docs/milestones/milestone-7.md` Step 11's status vocabulary. It does not duplicate snapshot-level classification logic — it composes the existing snapshot outcome with the new corporate-status result under a versioned policy (`policy_version` field, persisted), and its result is what the scheduler checks before allowing enhanced-arm Claude calls to run (extending, not replacing, the existing `evidence_blocks_enhanced` check in `research/scheduled_cycle.py::_run_symbol`).
 
 ## Decision 11: Retention is dry-run-first and never deletes audit-relevant rows in this milestone
 
@@ -79,8 +79,8 @@ Before each role invocation inside a shadow cycle, `shadow/role_budget.py::check
 When this ADR was accepted, Decision 6 ("role/token/attempt/latency/cost enforcement
 happens once per role call") and Decision 10's completeness-gates-Claude claim described
 **target** behavior only — Milestone 7's own scratchpad honestly recorded both as not yet
-wired into the running scheduler. Milestone 7.1 (`docs/milestone-7.1.md`,
-`docs/milestone7-1-shadow-integration-closure.md`) closed this gap:
+wired into the running scheduler. Milestone 7.1 (`docs/milestones/milestone-7.1.md`,
+`docs/milestones/milestone7-1-shadow-integration-closure.md`) closed this gap:
 
 * Decision 6 is now RUNTIME-INTEGRATED: `shadow/attempt_controller.py::
   ShadowResearchAttemptController` (a shadow-specific adapter to a new, framework-neutral
@@ -128,7 +128,7 @@ intentional (a required role's only attempt genuinely failed to produce a valid 
 Decision 8's alerting boundary gained one addition: an automatic health-triggered pause (or a
 `PAUSE_RECOMMENDED` verdict) now raises an alert where previously it raised none — the
 underlying "persist before any sink is attempted, delivery failure never erases the alert"
-guarantee is unchanged. See `docs/milestone7-2-shadow-health-diagnostics.md` for full detail,
+guarantee is unchanged. See `docs/milestones/milestone7-2-shadow-health-diagnostics.md` for full detail,
 including a demonstrated (but session-undemonstrated-by-real-evidence, hence unfixed)
 `unsupported_claim_rate` denominator concern, and an honest activation-readiness decision
 (`shadow/readiness.py::evaluate_activation_readiness`) that still reports

@@ -21,7 +21,7 @@ dependency bump in either project from reintroducing a real, blocking conflict, 
 explicitly requires proving a **credentialed** paper-broker round trip is possible without ever
 requiring the main trading-desk process to accept LumiBot's dependency tree as its own.
 
-`docs/milestone-4.md` requires closing that gap: "Because LumiBot 4.5.74 introduces a large
+`docs/milestones/milestone-4.md` requires closing that gap: "Because LumiBot 4.5.74 introduces a large
 dependency tree and conflicts with dependency floors in the main project, Milestone 4 must move the
 real LumiBot runtime behind a process boundary."
 
@@ -42,7 +42,7 @@ exactly the dependency-conflict outcome this milestone must eliminate. A process
 only way to keep "LumiBot's dependency tree" and "the main trading desk's dependency tree" truly
 independent while still allowing a real credentialed connection to exist somewhere.
 
-**Rejected alternative: a local-only HTTP service instead of stdio JSON Lines.** `docs/milestone-
+**Rejected alternative: a local-only HTTP service instead of stdio JSON Lines.** `docs/milestones/milestone-
 4.md` Step 2 permits either but recommends stdio unless the repository already has an established
 HTTP-service pattern — it does not (no web framework dependency exists anywhere in this repository
 today). stdio avoids introducing one, is trivial to spawn/tear down as a child process, and every
@@ -60,14 +60,14 @@ format, but neither is installed as a shared dependency of the other, and neithe
 constructed Python object (no `pickle`, no `pydantic` model shared across the boundary — matching
 this repository's Decision 3 from ADR 0001, dataclasses stay `@dataclass(frozen=True)` everywhere).
 
-**Rejected alternative: a shared `trading-runtime-protocol` package.** `docs/milestone-4.md` Step 4
+**Rejected alternative: a shared `trading-runtime-protocol` package.** `docs/milestones/milestone-4.md` Step 4
 explicitly permits this ("If sharing protocol models is necessary, create a very small
 framework-neutral package... with no LumiBot dependencies") but also warns against "circular
 installation requirements." Given the JSON contract is genuinely small (9 operations, ~5 envelope
 fields), duplicating ~150 lines of dataclass/validation code twice was judged simpler and safer
 than introducing a third installable package that both other packages would need to depend on —
 and it forces both sides to independently validate the wire format rather than trusting a shared
-type system, which is the actual safety property this boundary needs (docs/milestone-4.md: "reject
+type system, which is the actual safety property this boundary needs (docs/milestones/milestone-4.md: "reject
 unknown protocol versions... malformed payloads... responses with mismatched request IDs").
 
 ## Decision 3: submission is asynchronous — a new, additive orchestration path, not a rewrite of Milestone 3's synchronous adapter
@@ -85,7 +85,7 @@ the top-level orchestration function itself:
   `execution.eligibility.PaperExecutionEligibilityPolicy`, `execution.intent_builder.
   build_paper_order_intent`, and `storage.execution_repositories.save_intent` verbatim; adds a new
   `paper_broker_submissions` table and a `PENDING_SUBMISSION` → `ACCEPTED`/`SUBMISSION_UNKNOWN`/...
-  state machine (docs/milestone-4.md Step 8) that did not exist in Milestone 3's contracts.
+  state machine (docs/milestones/milestone-4.md Step 8) that did not exist in Milestone 3's contracts.
 * `services/sync_paper_orders.py` — polls the runtime for state changes and reuses `execution.
   ledger_events.apply_all_new_events` (the exact Milestone 3 ledger-application code path)
   unchanged, converting cumulative broker-reported fill quantities into the incremental
@@ -132,7 +132,7 @@ against a real, verified point-in-time data source without changing `evaluation_
   LumiBot 4.5.74 and reported it back over the protocol (`lumibot_version: "4.5.74"`), correctly
   detected the absence of Alpaca credentials in this environment, and was correctly refused by the
   main process's `RuntimeClient` (`RuntimeCapabilityError`, since `paper_endpoint_verified` was
-  `False`). See `docs/milestone4-isolated-paper-broker.md` "Known limitations" for why no
+  `False`). See `docs/milestones/milestone4-isolated-paper-broker.md` "Known limitations" for why no
   credentialed acknowledgement or fill was exercised.
 * That same smoke test caught a real bug this ADR's design did not anticipate: LumiBot prints an
   unguarded startup banner directly to its process's stdout at import time, which would have

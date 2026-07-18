@@ -1,7 +1,7 @@
 # Runbook: Paper-book operations
 
 Operator-facing procedures for the Milestone 8 isolated paper-book subsystem. See
-`docs/milestone8-isolated-paper-portfolios.md` for the full architecture and
+`docs/milestones/milestone8-isolated-paper-portfolios.md` for the full architecture and
 `docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md` for why each boundary
 exists.
 

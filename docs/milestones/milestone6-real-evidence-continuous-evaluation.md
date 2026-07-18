@@ -358,7 +358,7 @@ recorded in the Milestone 6 scratchpad's "Environmental validation" section.
    calls, not cache hits~~ — **fixed in Milestone 6.1**: `ProviderCache.get()` now notifies
    the same `on_response` callback `HttpJsonClient` uses on a genuine cache `HIT` (and on
    `CACHE_CORRUPT`), so cache activity is now visible in `evidence_provider_requests` and in
-   `provider-health`'s `cache_hit_rate`. See `docs/milestone-6.1.md`'s documentation section
+   `provider-health`'s `cache_hit_rate`. See `docs/milestones/milestone-6.1.md`'s documentation section
    below.
 8. **Only one primary market-data provider (Alpaca) and one primary filing/fundamentals
    source (SEC EDGAR) are implemented**, per the milestone's explicit "avoid adding several

@@ -95,7 +95,7 @@ tests/unit/test_provider_provenance.py
 Read:
 
 ```text
-docs/milestone9-3-evidence-integrity-and-soak-campaign.md
+docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md
 docs/runbooks/paper-soak-campaign.md
 ```
 
@@ -728,13 +728,13 @@ attempt starts
 Create:
 
 ```text
-docs/milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md
+docs/milestones/milestone9-3-1-campaign-resumability-and-point-in-time-integrity.md
 ```
 
 Update:
 
 ```text
-docs/milestone9-3-evidence-integrity-and-soak-campaign.md
+docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md
 docs/runbooks/paper-soak-campaign.md
 ```
 

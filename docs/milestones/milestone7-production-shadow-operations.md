@@ -1,6 +1,6 @@
 # Milestone 7 — Production shadow operations and evidence-completeness expansion
 
-**Status:** Code-complete for the vertical slice defined in `docs/milestone-7.md`. Real
+**Status:** Code-complete for the vertical slice defined in `docs/milestones/milestone-7.md`. Real
 validation was performed where credentials/entitlements allow (SEC EDGAR corporate-status
 data, a real end-to-end SEC-backed shadow cycle, and two real Claude API shadow-cycle runs).
 Real news and real Reddit sentiment remain `ENVIRONMENTALLY_PENDING` — the required
@@ -13,7 +13,7 @@ unambiguous distinction.
 > primary evidence snapshot, evidence-completeness not called from the scheduled-cycle
 > path, per-role budget enforcement not wired end-to-end, `CycleIntent.model_name` always
 > `None`, actual Claude usage never charged to the reservation — are now closed. See
-> `docs/milestone7-1-shadow-integration-closure.md` for the full detail and
+> `docs/milestones/milestone7-1-shadow-integration-closure.md` for the full detail and
 > `docs/adr/0005-production-shadow-operations-boundary.md`'s "Milestone 7.1 closure"
 > section for the architecture-decision update. The content below is preserved as
 > Milestone 7's own historical record and is not rewritten to imply these integrations
@@ -25,12 +25,12 @@ unambiguous distinction.
 > (`shadow-readiness`'s `activation_readiness` block) were added. The
 > `health_status=PAUSE_REQUIRED` this document's own Section "Real Claude validation"
 > reported without explanation is now root-caused and fixed — see
-> `docs/milestone7-2-shadow-health-diagnostics.md`.
+> `docs/milestones/milestone7-2-shadow-health-diagnostics.md`.
 
 This document describes the shadow-operations control layer and evidence-completeness
 expansion added on top of Milestones 1-6.1. See `docs/adr/0005-production-shadow-operations-boundary.md`
 for the design decisions and why each boundary exists, and
-`docs/milestone6-real-evidence-continuous-evaluation.md` for the real-evidence architecture
+`docs/milestones/milestone6-real-evidence-continuous-evaluation.md` for the real-evidence architecture
 this milestone builds on top of, unmodified.
 
 ## Why the existing pipeline remains authoritative
@@ -277,7 +277,7 @@ been validated against a real server response.
 EvidenceCompletenessResult` composes `classify_snapshot_outcome`'s existing Milestone 6
 outcome with an optional `CorporateStatusEvidence` result under a versioned policy
 (`POLICY_VERSION = "evidence-completeness-v1"`, persisted on every result). Full 11-value
-status vocabulary from `docs/milestone-7.md` Step 11:
+status vocabulary from `docs/milestones/milestone-7.md` Step 11:
 
 ```text
 COMPLETE_FOR_SCREENING          COMPLETE_FOR_RESEARCH
@@ -524,7 +524,7 @@ this document.
 ## Retention
 
 `src/trading_research/shadow/retention.py` classifies 17 table rules (`TableRetentionRule`)
-covering the categories named in `docs/milestone-7.md` Step 26: immutable evidence, raw SEC
+covering the categories named in `docs/milestones/milestone-7.md` Step 26: immutable evidence, raw SEC
 filing documents, provider request metadata, account-linked normalized market data, research
 attempts, structured failures, scheduler runs, alerts, budget reservations, delivery logs.
 Tier vocabulary: `PERMANENT_AUDIT`, `RETAIN_N_DAYS`, `RETAIN_N_DAYS_THEN_HASH_ONLY`,
@@ -562,7 +562,7 @@ retention-apply [--dry-run]    Dry-run diff; without --dry-run, raises NotImplem
 ```
 
 `shadow-resume`/`shadow-kill`/`shadow-force-clear-kill` all require `--operator` (argparse
-`required=True`) — a deliberate, documented deviation from `docs/milestone-7.md`'s own
+`required=True`) — a deliberate, documented deviation from `docs/milestones/milestone-7.md`'s own
 shorthand CLI example, because `pause.py`'s `resume`/`kill`/`force_clear_kill` structurally
 require a non-empty operator string, and defaulting it to a hardcoded value would weaken the
 audit trail's "who" field for the highest-stakes commands. `shadow-pause` alone does not
@@ -886,7 +886,7 @@ stateDiagram-v2
     KILLED --> ACTIVE: force_clear_kill(reason, operator)\n— the ONLY exit from KILLED
 ```
 
-### 6. Shadow-cycle flow (core architecture, from `docs/milestone-7.md`)
+### 6. Shadow-cycle flow (core architecture, from `docs/milestones/milestone-7.md`)
 
 ```mermaid
 flowchart TD

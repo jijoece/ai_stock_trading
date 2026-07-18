@@ -64,7 +64,7 @@ src/trading_research/storage/execution_schema.py
 src/trading_research/storage/execution_repositories.py
 src/trading_research/paper/ledger.py
 config/execution.yaml
-docs/milestone3-lumibot-paper-integration.md
+docs/milestones/milestone3-lumibot-paper-integration.md
 docs/adr/0001-lumibot-paper-runtime.md
 ```
 
@@ -182,7 +182,7 @@ Before changing code:
 1. Check Git status and current branch.
 2. Read:
 
-   * `docs/milestone3-lumibot-paper-integration.md`;
+   * `docs/milestones/milestone3-lumibot-paper-integration.md`;
    * `docs/adr/0001-lumibot-paper-runtime.md`;
    * execution contracts;
    * runtime adapter protocol;
@@ -1131,7 +1131,7 @@ If no credentials are available, complete all implementation and offline tests, 
 Create:
 
 ```text
-docs/milestone4-isolated-paper-broker.md
+docs/milestones/milestone4-isolated-paper-broker.md
 docs/adr/0002-isolated-lumibot-runtime.md
 ```
 

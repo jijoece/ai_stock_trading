@@ -56,9 +56,9 @@ Read only:
 
 ```text
 .claude/scratchpads/milestone9-1-progress.md
-docs/milestone9-1-controlled-soak-readiness.md
-docs/milestone9-manual-paper-soak-and-lifecycle.md
-docs/milestone8-1-scheduled-paper-book-integration.md
+docs/milestones/milestone9-1-controlled-soak-readiness.md
+docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md
+docs/milestones/milestone8-1-scheduled-paper-book-integration.md
 ```
 
 Inspect only relevant symbols in:
@@ -758,11 +758,11 @@ Do not make a real provider call.
 Create:
 
 ```text
-docs/milestone9-2-soak-evidence-integrity.md
+docs/milestones/milestone9-2-soak-evidence-integrity.md
 docs/runbooks/soak-evidence-and-alert-operations.md
 ```
 
-Update `docs/milestone9-1-controlled-soak-readiness.md` with a short pointer only.
+Update `docs/milestones/milestone9-1-controlled-soak-readiness.md` with a short pointer only.
 
 Document:
 

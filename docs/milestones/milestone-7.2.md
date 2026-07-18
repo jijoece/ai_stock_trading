@@ -42,8 +42,8 @@ Before editing, read:
 .claude/scratchpads/milestone7-progress.md
 .claude/scratchpads/milestone7-1-progress.md
 
-docs/milestone7-production-shadow-operations.md
-docs/milestone7-1-shadow-integration-closure.md
+docs/milestones/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-1-shadow-integration-closure.md
 docs/adr/0005-production-shadow-operations-boundary.md
 docs/runbooks/shadow-operations.md
 docs/runbooks/shadow-incident-response.md
@@ -870,14 +870,14 @@ Do not weaken, delete, or newly skip existing tests to obtain a pass.
 Create:
 
 ```text
-docs/milestone7-2-shadow-health-diagnostics.md
+docs/milestones/milestone7-2-shadow-health-diagnostics.md
 ```
 
 Update:
 
 ```text
-docs/milestone7-1-shadow-integration-closure.md
-docs/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-1-shadow-integration-closure.md
+docs/milestones/milestone7-production-shadow-operations.md
 docs/adr/0005-production-shadow-operations-boundary.md
 docs/runbooks/shadow-operations.md
 docs/runbooks/shadow-incident-response.md

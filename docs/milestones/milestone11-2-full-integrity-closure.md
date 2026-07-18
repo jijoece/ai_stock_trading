@@ -260,7 +260,7 @@ Do not store credentials, raw broker responses, private reasoning, or large logs
 Create:
 
 ```text
-docs/milestone11-2-integrity-closure.md
+docs/milestones/milestone11-2-integrity-closure.md
 ```
 
 This file must explain:

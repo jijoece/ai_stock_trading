@@ -124,10 +124,10 @@ Before editing, read:
 .claude/scratchpads/milestone7-1-progress.md
 .claude/scratchpads/milestone7-2-progress.md
 
-docs/milestone7-production-shadow-operations.md
-docs/milestone7-1-shadow-integration-closure.md
-docs/milestone7-2-shadow-health-diagnostics.md
-docs/milestone7-pending-work.md
+docs/milestones/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-1-shadow-integration-closure.md
+docs/milestones/milestone7-2-shadow-health-diagnostics.md
+docs/milestones/milestone7-pending-work.md
 
 docs/adr/0004-real-evidence-provider-boundary.md
 docs/adr/0005-production-shadow-operations-boundary.md
@@ -1419,7 +1419,7 @@ Do not perform this automatically.
 Create:
 
 ```text
-docs/milestone8-isolated-paper-portfolios.md
+docs/milestones/milestone8-isolated-paper-portfolios.md
 docs/runbooks/paper-book-operations.md
 docs/runbooks/paper-book-reconciliation.md
 ```
@@ -1428,7 +1428,7 @@ Update as needed:
 
 ```text
 docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md
-docs/milestone7-pending-work.md
+docs/milestones/milestone7-pending-work.md
 docs/runbooks/shadow-operations.md
 ```
 

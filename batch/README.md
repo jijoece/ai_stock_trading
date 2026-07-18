@@ -81,7 +81,7 @@ See `batch/manifest.example.json`. Key rules:
 ```bash
 cp batch/manifest.example.json batch/manifest.json
 mkdir -p batch/prompts
-cp docs/milestone9-2-prompt.md batch/prompts/milestone-9-2.md
+cp docs/milestones/milestone9-2-prompt.md batch/prompts/milestone-9-2.md
 
 export ANTHROPIC_API_KEY="..."
 export ANTHROPIC_MODEL="..."

@@ -251,11 +251,11 @@ Before changing code:
 2. Read:
 
    * Milestone 1 documentation;
-   * `docs/milestone2-analysis-layer.md`;
-   * `docs/milestone3-lumibot-paper-integration.md`;
-   * `docs/milestone4-isolated-paper-broker.md`;
+   * `docs/milestones/milestone2-analysis-layer.md`;
+   * `docs/milestones/milestone3-lumibot-paper-integration.md`;
+   * `docs/milestones/milestone4-isolated-paper-broker.md`;
    * both existing ADRs;
-   * `docs/milestone-5.md` if it already exists;
+   * `docs/milestones/milestone-5.md` if it already exists;
    * screening and scoring code;
    * sentiment code;
    * recommendation models and builder;
@@ -1505,7 +1505,7 @@ Was the decision reproducible?
 Create:
 
 ```text
-docs/milestone5-evidence-backed-claude-research.md
+docs/milestones/milestone5-evidence-backed-claude-research.md
 docs/adr/0003-claude-research-boundary.md
 ```
 

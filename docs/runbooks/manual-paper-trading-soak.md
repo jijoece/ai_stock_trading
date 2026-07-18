@@ -1,7 +1,7 @@
 # Runbook: Manual paper-trading soak
 
 Operator-facing procedures for the Milestone 9 manual daily lifecycle. See
-`docs/milestone9-manual-paper-soak-and-lifecycle.md` for the full architecture record and
+`docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md` for the full architecture record and
 `docs/runbooks/paper-book-operations.md` for the Milestone 8 book-level runbook this one builds
 on (enable/open books, cash, positions, reconciliation).
 
@@ -124,4 +124,4 @@ A lifecycle run never partially corrupts one book because of the other: check
 Unattended recurring activation, launchd installation, an external paper broker, a per-book
 `paper_runtime` subprocess pool, partial fills, trailing stops, non-FIFO tax-lot selection,
 live trading, and automated promotion all remain out of scope — see
-`docs/milestone9-manual-paper-soak-and-lifecycle.md` Section 13 for the full list.
+`docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md` Section 13 for the full list.

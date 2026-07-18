@@ -84,8 +84,8 @@
 - Final counts: 51 tests in test_external_paper_broker.py, 20 in test_recurring_paper_scheduler.py, 20 in test_paper_books_lifecycle.py, 57 in test_paper_books_config.py, plus new files (test_configuration.py, test_cli_runtime_env_isolation.py, test_cli_error_sanitization.py) and paper_runtime additions. Full suite: 1714 passed / 15 skipped (main), 47 passed (paper_runtime).
 
 ## Documentation
-- Wrote `docs/milestone11-1-external-paper-safety-closure.md` (this file) as the primary closure report — one section per part with Problem/Fix/Tests, plus recovery procedures, known limitations, and a safety confirmation checklist.
-- Updated `docs/milestone11-isolated-alpaca-paper-broker.md` with a "Milestone 11.1 corrections" summary section linking to the closure doc.
+- Wrote `docs/milestones/milestone11-1-external-paper-safety-closure.md` (this file) as the primary closure report — one section per part with Problem/Fix/Tests, plus recovery procedures, known limitations, and a safety confirmation checklist.
+- Updated `docs/milestones/milestone11-isolated-alpaca-paper-broker.md` with a "Milestone 11.1 corrections" summary section linking to the closure doc.
 - Updated `.env.example` with `PAPER_RUNTIME_ENV_FILE` and corrected pass-through-vs-dedicated-file documentation (done earlier alongside Part 11).
 - Updated `docs/runbooks/alpaca-paper-operations.md`: credential-injection mechanisms, retry-evidence consumption note, `external-paper-queue-show` command.
 - Updated `docs/runbooks/recurring-local-paper-trading.md`: precise attempt-vs-definition activation validation description.

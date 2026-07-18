@@ -1,7 +1,7 @@
 # Milestone 4 — Isolated credentialed paper broker and evaluation loop (developer guide)
 
-Covers `docs/milestone-4.md`. Extends Milestone 3
-(`docs/milestone3-lumibot-paper-integration.md`) with a process-isolated, credentialed Alpaca
+Covers `docs/milestones/milestone-4.md`. Extends Milestone 3
+(`docs/milestones/milestone3-lumibot-paper-integration.md`) with a process-isolated, credentialed Alpaca
 paper-broker connection and a forward-performance evaluation/metrics layer. Read
 `docs/adr/0002-isolated-lumibot-runtime.md` first for *why* each of these design choices was made;
 this document is the *how it works* / *how to run it* guide.
@@ -319,7 +319,7 @@ a real broker is exercised through a fake:
 
 `tests/integration/test_paper_broker_smoke.py`, marked `@pytest.mark.paper_broker`, is excluded from
 the default suite by a `pytest.mark.skipif` gated on `RUN_PAPER_BROKER_TESTS=true` — never on
-credential presence alone. It performs the exact 11-step sequence from `docs/milestone-4.md` Step
+credential presence alone. It performs the exact 11-step sequence from `docs/milestones/milestone-4.md` Step
 17: health → paper-endpoint/real-money verification → account snapshot → submit a $1.00 non-
 marketable AAPL limit order (1 share) → confirm acknowledgement and broker order id → `get_order` →
 cancel → confirm cancellation → reconcile no fill/no position change → persist the outcome (via the

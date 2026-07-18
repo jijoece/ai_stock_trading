@@ -1,7 +1,7 @@
 # Runbook: Shadow operations
 
 Operator-facing procedures for the Milestone 7 shadow-operations control layer. See
-`docs/milestone7-production-shadow-operations.md` for the full architecture and design
+`docs/milestones/milestone7-production-shadow-operations.md` for the full architecture and design
 rationale, and `docs/adr/0005-production-shadow-operations-boundary.md` for why each
 boundary exists.
 
@@ -13,7 +13,7 @@ recurring schedule has ever been activated on any machine this code has run on �
 **Milestone 7.1 update:** `run-due-shadow-cycle` now accepts `--provider-mode {fixture,real}`
 (default `fixture`) and repeatable `--symbol`. Corporate-status evidence, evidence-completeness
 gating, and per-role budget enforcement are now active in the real scheduled-cycle path — see
-`docs/milestone7-1-shadow-integration-closure.md` for what changed and
+`docs/milestones/milestone7-1-shadow-integration-closure.md` for what changed and
 `docs/adr/0005-production-shadow-operations-boundary.md`'s "Milestone 7.1 closure" section.
 A real-mode invocation still requires `research.yaml`'s `provider`/`model` to be set and,
 for `provider: anthropic`, a matching `config/research_pricing.yaml` entry and
@@ -25,7 +25,7 @@ through the legacy global `paper/ledger.py` path (unchanged) — isolated baseli
 paper books are a separate, additive subsystem (`config/paper_books.yaml`,
 `docs/runbooks/paper-book-operations.md`) not yet wired into the shadow scheduler. Wiring
 `paper_books/` into `run_due_shadow_cycle` is recommended future work (see
-`docs/milestone8-isolated-paper-portfolios.md` Section 21).
+`docs/milestones/milestone8-isolated-paper-portfolios.md` Section 21).
 
 **Milestone 7.2 update:** every `run-due-shadow-cycle` invocation that reaches health
 evaluation now persists one field-level diagnostic row per health dimension. Explain any
@@ -38,7 +38,7 @@ python -m trading_research.cli shadow-health-explain --cycle-id <id>
 
 `shadow-readiness` also now reports an `activation_readiness` block (`READY_FOR_MANUAL_SHADOW_RUNS`
 / `READY_FOR_LIMITED_RECURRING_SHADOW` / `NOT_READY_*` / `ENVIRONMENTALLY_BLOCKED`) — see
-`docs/milestone7-2-shadow-health-diagnostics.md` for the full vocabulary and evaluation order.
+`docs/milestones/milestone7-2-shadow-health-diagnostics.md` for the full vocabulary and evaluation order.
 An automatic health-triggered pause (or `PAUSE_RECOMMENDED` verdict) now also raises a
 `shadow-alerts` entry, which it previously did not.
 

@@ -7,12 +7,12 @@ Status: IN_PROGRESS
 ## Baseline
 - `pytest tests/ -q` -> **1266 passed, 14 skipped** (matches expected baseline exactly).
 - `cd paper_runtime && pytest tests/ -q` -> **33 passed** (matches expected baseline exactly).
-- Git status at start: clean except untracked `docs/milestone-8.md` (this spec),
-  `docs/milestone-7 pending.md` / `docs/milestone-7 pending copy.md` (pre-existing untracked
+- Git status at start: clean except untracked `docs/milestones/milestone-8.md` (this spec),
+  `docs/milestones/milestone-7 pending.md` / `docs/milestones/milestone-7 pending copy.md` (pre-existing untracked
   backlog docs from a prior session, left untouched by this session), and this new scratchpad.
-- `docs/milestone7-pending-work.md` (the exact path the milestone-8 doc's mandatory-review
+- `docs/milestones/milestone7-pending-work.md` (the exact path the milestone-8 doc's mandatory-review
   list names) does not exist under that filename — the closest match is the untracked
-  `docs/milestone-7 pending.md`, read in full instead. Confirms Section 7.2 of that doc
+  `docs/milestones/milestone-7 pending.md`, read in full instead. Confirms Section 7.2 of that doc
   ("Separate baseline and enhanced paper books... A future design must address: isolated
   balances; isolated positions; independent order IDs; experiment attribution;
   reconciliation; fair comparison; corporate-action handling; portfolio constraints") is
@@ -530,16 +530,16 @@ All checks performed directly against the actual working-tree diff (not delegate
   regressions, zero skips added).
 
 ## Documentation
-Created: `docs/milestone8-isolated-paper-portfolios.md`, `docs/runbooks/paper-book-operations.md`,
+Created: `docs/milestones/milestone8-isolated-paper-portfolios.md`, `docs/runbooks/paper-book-operations.md`,
 `docs/runbooks/paper-book-reconciliation.md`. Updated (pointer notes only, historical content
 preserved per the established Milestone 7.1/7.2 convention): `docs/adr/0006-...md` (marked
-Accepted with the exact final test count), `docs/milestone-7 pending.md` Section 7.2 (marked
+Accepted with the exact final test count), `docs/milestones/milestone-7 pending.md` Section 7.2 (marked
 addressed by Milestone 8, original text preserved below the pointer),
 `docs/runbooks/shadow-operations.md` (one paragraph noting paper_books is not yet wired into
 the shadow scheduler).
 
 ## Known limitations
-See `docs/milestone8-isolated-paper-portfolios.md` Section 19 for the full, authoritative
+See `docs/milestones/milestone8-isolated-paper-portfolios.md` Section 19 for the full, authoritative
 list: local-simulated fill engine is self-contained rather than routed through the isolated
 `paper_runtime` subprocess (documented rationale, not an oversight); no PARTIALLY_FILLED
 support (all-or-nothing, matches legacy convention); SELL-side intents supported at the
@@ -549,7 +549,7 @@ REJECTED_INSUFFICIENT_CASH); corporate actions limited to the 3 types Milestone 
 implemented.
 
 ## Deferred work
-Explicit non-goals from docs/milestone-8.md, none attempted: fixing unsupported_claim_rate,
+Explicit non-goals from docs/milestones/milestone-8.md, none attempted: fixing unsupported_claim_rate,
 real paper-reconciliation health wiring into shadow (from the Milestone 7 backlog),
 duplicate-prevention health wiring, Reddit registration, new news providers, destructive
 retention, real recurring shadow activation, remaining deferred corporate-action provider

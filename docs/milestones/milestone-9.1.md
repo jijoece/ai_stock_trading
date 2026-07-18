@@ -64,9 +64,9 @@ Read only:
 
 ```text
 .claude/scratchpads/milestone9-progress.md
-docs/milestone9-manual-paper-soak-and-lifecycle.md
-docs/milestone8-1-scheduled-paper-book-integration.md
-docs/milestone7-2-shadow-health-diagnostics.md
+docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md
+docs/milestones/milestone8-1-scheduled-paper-book-integration.md
+docs/milestones/milestone7-2-shadow-health-diagnostics.md
 ```
 
 Inspect only relevant symbols in:
@@ -609,11 +609,11 @@ Keep test data small.
 Create:
 
 ```text
-docs/milestone9-1-controlled-soak-readiness.md
+docs/milestones/milestone9-1-controlled-soak-readiness.md
 docs/runbooks/controlled-paper-soak.md
 ```
 
-Update `docs/milestone9-manual-paper-soak-and-lifecycle.md` with a short pointer only.
+Update `docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md` with a short pointer only.
 
 Document:
 

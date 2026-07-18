@@ -2,7 +2,7 @@
 
 ## Metadata
 
-- Spec: `docs/milestone11-3-remaining-integrity-closure.md`
+- Spec: `docs/milestones/milestone11-3-remaining-integrity-closure.md`
 - Starting commit: `c5232adf89b84b7e32dc716e243d3a8426d95eb2` (branch `agent/milestone-11-2-full-integrity-closure`)
 - No commits made this session — all changes in the working tree, per instructions.
 
@@ -56,7 +56,7 @@ All 16 tasks (see TaskCreate #1-#16) completed.
 
 ## Files changed
 
-See final report `docs/milestone11-3-integrity-closure.md` for the full table.
+See final report `docs/milestones/milestone11-3-integrity-closure.md` for the full table.
 
 ## Open issues
 

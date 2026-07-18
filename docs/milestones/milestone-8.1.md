@@ -55,7 +55,7 @@ Read only these documents first:
 
 ```text
 .claude/scratchpads/milestone8-progress.md
-docs/milestone8-isolated-paper-portfolios.md
+docs/milestones/milestone8-isolated-paper-portfolios.md
 docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md
 ```
 
@@ -618,7 +618,7 @@ Also correct any table-count wording that says “ten” while listing 14 tables
 Create:
 
 ```text
-docs/milestone8-1-scheduled-paper-book-integration.md
+docs/milestones/milestone8-1-scheduled-paper-book-integration.md
 ```
 
 Update the Milestone 8 document with a concise pointer.

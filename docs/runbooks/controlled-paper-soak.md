@@ -1,7 +1,7 @@
 # Runbook: Controlled manual paper soak (Milestone 9.1)
 
 Operator-facing procedure for the single, manual, end-to-end `paper-soak-run` command. See
-`docs/milestone9-1-controlled-soak-readiness.md` for the full architecture record,
+`docs/milestones/milestone9-1-controlled-soak-readiness.md` for the full architecture record,
 `docs/runbooks/manual-paper-trading-soak.md` for the Milestone 9 per-step commands this builds
 on, and `docs/runbooks/paper-book-operations.md` for book-level basics.
 
@@ -81,7 +81,7 @@ the two underlying sub-verdicts this combines.
 * `READY_FOR_RECURRING_ACTIVATION_REVIEW` — a human may now review recurring activation. This
   status never activates anything by itself, and is not reachable until a future milestone adds
   the cross-book violation signal this milestone deliberately leaves `MISSING` (see
-  `docs/milestone9-1-controlled-soak-readiness.md` Section 4).
+  `docs/milestones/milestone9-1-controlled-soak-readiness.md` Section 4).
 
 ## 5. Recovering from a partial failure
 

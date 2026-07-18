@@ -790,7 +790,7 @@ Each must be independently verified against official response models before impl
 ## 7.2 Separate baseline and enhanced paper books
 
 **Update (2026-07-14):** This item is now addressed by Milestone 8 — see
-`docs/milestone8-isolated-paper-portfolios.md` and
+`docs/milestones/milestone8-isolated-paper-portfolios.md` and
 `docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md`. `ENHANCED_ONLY`/
 `BOTH_SEPARATE_PAPER_BOOKS` are now selectable, gated on explicit per-book enablement in the
 new, disabled-by-default `config/paper_books.yaml`. This section's original text is preserved

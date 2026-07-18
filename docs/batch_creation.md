@@ -131,7 +131,7 @@ Example:
       "custom_id": "milestone-10",
       "prompt_file": "batch/prompts/milestone-10.md",
       "context_files": [
-        "docs/milestone9-2-soak-evidence-integrity.md"
+        "docs/milestones/milestone9-2-soak-evidence-integrity.md"
       ],
       "max_tokens": 32000
     }
@@ -600,7 +600,7 @@ Include a minimal example in `batch/README.md`:
 ```bash
 cp batch/manifest.example.json batch/manifest.json
 mkdir -p batch/prompts
-cp docs/milestone9-2-prompt.md batch/prompts/milestone-9-2.md
+cp docs/milestones/milestone9-2-prompt.md batch/prompts/milestone-9-2.md
 
 export ANTHROPIC_API_KEY="..."
 export ANTHROPIC_MODEL="..."

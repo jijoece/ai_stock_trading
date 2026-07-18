@@ -1,6 +1,6 @@
 # Milestone 3 — LumiBot paper-trading integration (developer guide)
 
-Covers `docs/milestone-3.md`: integrating LumiBot behind a clean adapter so
+Covers `docs/milestones/milestone-3.md`: integrating LumiBot behind a clean adapter so
 the existing trading desk can send eligible, frozen recommendations through
 a deterministic paper-execution workflow. Everything described here runs
 fully offline in the default test suite — no LumiBot import, no network, no
@@ -232,7 +232,7 @@ for that symbol:
 
 Reconciliation compares against the ledger's *symbol-level* aggregate
 position (the only granularity `PaperLedger` tracks — it was not rewritten
-to add per-order sub-ledgers, per docs/milestone-3.md Step 6's
+to add per-order sub-ledgers, per docs/milestones/milestone-3.md Step 6's
 "do not replace or rewrite it merely to resemble LumiBot"). For this
 milestone's smallest safe slice (1–5 fixture symbols, one live intent per
 symbol at a time), this is the correct level of ledger truth to reconcile
@@ -347,7 +347,7 @@ assuming "LumiBot integration" means a real broker round trip happened:
 5. **Reconciliation compares symbol-level ledger state**, not a
    per-intent sub-ledger — see "Reconciliation" above.
 6. **The illustrative `PaperExecutionAdapter`/`LiveExecutionGateway`
-   snippets in `docs/milestone-3.md` use `pydantic.BaseModel`.** This
+   snippets in `docs/milestones/milestone-3.md` use `pydantic.BaseModel`.** This
    codebase implements every contract as `@dataclass(frozen=True)` with
    `__post_init__` validation instead, matching 100% of the existing domain
    code (`models/trading_models.py`, `analysis/screener.py::

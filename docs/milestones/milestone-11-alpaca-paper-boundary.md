@@ -181,8 +181,8 @@ config/paper_runtime.yaml
 Read relevant documentation only:
 
 ```text
-docs/milestone4-isolated-paper-broker.md
-docs/milestone10-controlled-recurring-local-paper.md
+docs/milestones/milestone4-isolated-paper-broker.md
+docs/milestones/milestone10-controlled-recurring-local-paper.md
 docs/runbooks/recurring-local-paper-trading.md
 ```
 
@@ -1204,7 +1204,7 @@ The smoke test must:
 Create:
 
 ```text
-docs/milestone11-isolated-alpaca-paper-broker.md
+docs/milestones/milestone11-isolated-alpaca-paper-broker.md
 docs/adr/0007-external-paper-account-isolation.md
 docs/runbooks/alpaca-paper-operations.md
 ```
@@ -1214,7 +1214,7 @@ Update:
 ```text
 README.md
 .env.example
-docs/milestone10-controlled-recurring-local-paper.md
+docs/milestones/milestone10-controlled-recurring-local-paper.md
 ```
 
 Document:

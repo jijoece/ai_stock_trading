@@ -7,7 +7,7 @@ Status: STARTING
 ## Baseline
 - `pytest tests/ -q` -> 1174 passed, 12 skipped (matches expected baseline exactly)
 - `cd paper_runtime && pytest tests/ -q` -> 33 passed (matches expected baseline exactly)
-- Git status: clean except untracked `.claude/scratchpads/milestone7-progress.md` and `docs/milestone-7.md` (both pre-existing, added before this session)
+- Git status: clean except untracked `.claude/scratchpads/milestone7-progress.md` and `docs/milestones/milestone-7.md` (both pre-existing, added before this session)
 - Credentials, boolean presence only:
   - ANTHROPIC_API_KEY: present
   - ALPACA_API_KEY: present
@@ -20,7 +20,7 @@ Status: STARTING
 - Real validation this session will therefore be possible for: real SEC EDGAR corporate-status, real Claude (bear+manager). NOT possible for: real Alpaca news/market-data, real Reddit (credentials absent) — consistent with Milestone 7's own session.
 
 ## Current integration gaps confirmed
-(from docs/milestone-7.1.md's own list, cross-checked against .claude/scratchpads/milestone7-progress.md "Known limitations"/"Deferred work" sections — all 13 confirmed accurate as of baseline, will re-verify against actual code before editing each)
+(from docs/milestones/milestone-7.1.md's own list, cross-checked against .claude/scratchpads/milestone7-progress.md "Known limitations"/"Deferred work" sections — all 13 confirmed accurate as of baseline, will re-verify against actual code before editing each)
 
 1. Corporate-status evidence not in primary EvidenceSnapshot — CONFIRMED (milestone7-progress.md line 409, 458)
 2. No corporate-status provider connected to build_evidence_snapshot — CONFIRMED (same)
@@ -44,7 +44,7 @@ corporate_status*.py, filing_documents.py, disclosure_extraction.py, evidence_ad
 fixture_clients.py, sec_provider.py, normalization.py, shadow/scheduler.py, budget.py,
 role_budget.py, health.py, config.py, storage/*_repositories.py, *_schema.py, database.py,
 cli.py (evidence registry builder, run_due_shadow_cycle_cli, run_research_cycle_cli),
-config/*.yaml, ADR 0005, failure_taxonomy.py. Confirms all 13 gaps from docs/milestone-7.1.md
+config/*.yaml, ADR 0005, failure_taxonomy.py. Confirms all 13 gaps from docs/milestones/milestone-7.1.md
 plus the milestone7-progress.md "Deferred work" list.
 
 Key finding: `research_attempts` table (research_repositories.py) already stores
@@ -477,13 +477,13 @@ All checks below performed directly against the actual working-tree diff (not de
   `test_shadow_end_to_end.py` edit is a docstring-only correction (zero assertion changes).
 
 ## Documentation consistency review
-- `docs/milestone7-1-shadow-integration-closure.md` created — every concrete claim
+- `docs/milestones/milestone7-1-shadow-integration-closure.md` created — every concrete claim
   (file path, table name, test count, real-validation figure) cross-checked against the
   actual code/test output before writing (not transcribed from memory).
 - `docs/adr/0005-production-shadow-operations-boundary.md` — appended a "Milestone 7.1
   closure" section; Decisions 1-11's original text left completely unmodified (does not
   rewrite Milestone 7's own historical honesty about what was/wasn't wired at that time).
-- `docs/milestone7-production-shadow-operations.md` — added a pointer note at the top;
+- `docs/milestones/milestone7-production-shadow-operations.md` — added a pointer note at the top;
   body text left unmodified (preserves Milestone 7's own historical record).
 - `docs/runbooks/shadow-operations.md` / `shadow-incident-response.md` — added short
   "Milestone 7.1 update" notes pointing to the closure doc; existing procedures unchanged
@@ -494,7 +494,7 @@ All checks below performed directly against the actual working-tree diff (not de
   step never executed this session, or explicitly stating it was NOT run.
 
 ## Known limitations
-See `docs/milestone7-1-shadow-integration-closure.md` Section 26 for the authoritative,
+See `docs/milestones/milestone7-1-shadow-integration-closure.md` Section 26 for the authoritative,
 detailed list (health_status=PAUSE_REQUIRED root-cause not investigated to avoid further
 real spend; retention destructive-delete still NotImplementedError; real news/Reddit still
 environmentally pending; cover-page-checkbox exclusion window is a tested-but-not-formally-
@@ -502,11 +502,11 @@ proven heuristic; retention table classification still partial; corporate-action
 still unwired into the registry).
 
 ## Deferred work
-See `docs/milestone7-1-shadow-integration-closure.md` Section 27 (additional news vendors,
+See `docs/milestones/milestone7-1-shadow-integration-closure.md` Section 27 (additional news vendors,
 real Reddit registration, remaining corporate-action types, destructive retention, separate
 paper books, MFE/MAE, live promotion, actual recurring scheduler activation, new
 broker/model/DB, LLM-based disclosure extraction) — all explicitly named as non-goals in
-docs/milestone-7.1.md and not attempted.
+docs/milestones/milestone-7.1.md and not attempted.
 
 ## Final status
 **COMPLETE for this session's scope.**

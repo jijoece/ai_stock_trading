@@ -6,7 +6,7 @@
 - Branch: agent/milestone-11-1-external-paper-safety
 - Started: 2026-07-17T15:59:18Z
 - Last updated: 2026-07-17T15:59:18Z
-- Working-tree status: clean except this scratchpad + docs/milestone11-2-full-integrity-closure.md (spec, untracked) at start
+- Working-tree status: clean except this scratchpad + docs/milestones/milestone11-2-full-integrity-closure.md (spec, untracked) at start
 - Main test baseline: 1714 passed, 15 skipped (pytest tests/ -q), REPRODUCED FAILING under clean env before fix (see CI finding)
 - Paper-runtime test baseline: 47 passed (paper_runtime/pytest tests/ -q)
 - Type-check baseline: pyright run continue-on-error in CI; not yet captured locally
@@ -86,7 +86,7 @@
 - [x] Full tests pass — 1755 passed, 15 skipped (main); 59 passed (paper_runtime); verified under both ambient and clean-CI-simulated env
 - [ ] Migration smoke passes — only the lookup-trigger fixture exists; full Part 2 fixture matrix not built
 - [x] Concurrency tests pass — tests/unit/test_paper_books_reservation_concurrency.py (real 2-thread/2-connection races)
-- [x] Documentation complete for parts done — docs/milestone11-2-integrity-closure.md written; README banners corrected
+- [x] Documentation complete for parts done — docs/milestones/milestone11-2-integrity-closure.md written; README banners corrected
 - [x] No live-trading path added
 
-See docs/milestone11-2-integrity-closure.md for the full report and honest list of what remains open (Part 2 full fixture matrix, Parts 23-34, 36-37).
+See docs/milestones/milestone11-2-integrity-closure.md for the full report and honest list of what remains open (Part 2 full fixture matrix, Parts 23-34, 36-37).

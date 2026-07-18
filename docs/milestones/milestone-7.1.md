@@ -82,13 +82,13 @@ Before editing, read:
 
 ```text
 .claude/scratchpads/milestone7-progress.md
-docs/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-production-shadow-operations.md
 docs/adr/0005-production-shadow-operations-boundary.md
 docs/runbooks/shadow-operations.md
 docs/runbooks/shadow-incident-response.md
-docs/milestone6-real-evidence-continuous-evaluation.md
+docs/milestones/milestone6-real-evidence-continuous-evaluation.md
 docs/adr/0004-real-evidence-provider-boundary.md
-docs/milestone5-evidence-backed-claude-research.md
+docs/milestones/milestone5-evidence-backed-claude-research.md
 docs/adr/0003-claude-research-boundary.md
 ```
 
@@ -1373,13 +1373,13 @@ Do not add guessed pricing merely to make the test run.
 Create:
 
 ```text
-docs/milestone7-1-shadow-integration-closure.md
+docs/milestones/milestone7-1-shadow-integration-closure.md
 ```
 
 Update:
 
 ```text
-docs/milestone7-production-shadow-operations.md
+docs/milestones/milestone7-production-shadow-operations.md
 docs/adr/0005-production-shadow-operations-boundary.md
 docs/runbooks/shadow-operations.md
 docs/runbooks/shadow-incident-response.md

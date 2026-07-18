@@ -198,8 +198,8 @@ Before changing code:
 1. Inspect the repository structure.
 2. Read:
 
-   * `docs/milestone-2.md`;
-   * `docs/milestone2-analysis-layer.md`;
+   * `docs/milestones/milestone-2.md`;
+   * `docs/milestones/milestone2-analysis-layer.md`;
    * the Milestone 1 documentation;
    * recommendation models and schema;
    * recommendation freezing behavior;
@@ -225,7 +225,7 @@ The expected baseline is:
 
 If the baseline differs, investigate and report the cause before introducing unrelated changes. Do not hide or delete failing tests.
 
-If `docs/milestone-3.md` already exists, inspect it and reconcile it with this prompt. Do not silently ignore conflicting requirements. Prefer the safer and more fail-closed behavior.
+If `docs/milestones/milestone-3.md` already exists, inspect it and reconcile it with this prompt. Do not silently ignore conflicting requirements. Prefer the safer and more fail-closed behavior.
 
 Provide a concise current-state assessment before editing.
 
@@ -816,7 +816,7 @@ pytest tests/ -q
 Create a developer guide consistent with the existing documentation style, such as:
 
 ```text
-docs/milestone3-lumibot-paper-integration.md
+docs/milestones/milestone3-lumibot-paper-integration.md
 ```
 
 Document:

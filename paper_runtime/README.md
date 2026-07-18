@@ -7,8 +7,8 @@ main process (`trading_research`) never imports anything from this package
 and never imports `lumibot` — it talks to this process over a small,
 versioned JSON Lines protocol on stdin/stdout (`paper-runtime.v2`).
 
-See `docs/milestone4-isolated-paper-broker.md`,
-`docs/milestone11-isolated-alpaca-paper-broker.md`, and the associated ADRs
+See `docs/milestones/milestone4-isolated-paper-broker.md`,
+`docs/milestones/milestone11-isolated-alpaca-paper-broker.md`, and the associated ADRs
 in the main repository for the full design.
 
 ## Install (isolated environment)

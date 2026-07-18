@@ -55,8 +55,8 @@ Read only:
 
 ```text
 .claude/scratchpads/milestone8-1-progress.md
-docs/milestone8-1-scheduled-paper-book-integration.md
-docs/milestone8-isolated-paper-portfolios.md
+docs/milestones/milestone8-1-scheduled-paper-book-integration.md
+docs/milestones/milestone8-isolated-paper-portfolios.md
 docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md
 ```
 
@@ -732,7 +732,7 @@ Keep the sample small enough for a fast test.
 Create:
 
 ```text
-docs/milestone9-manual-paper-soak-and-lifecycle.md
+docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md
 docs/runbooks/manual-paper-trading-soak.md
 ```
 

@@ -83,9 +83,9 @@ Read only:
 
 ```text
 .claude/scratchpads/milestone9-2-progress.md
-docs/milestone9-2-soak-evidence-integrity.md
-docs/milestone9-1-controlled-soak-readiness.md
-docs/milestone9-manual-paper-soak-and-lifecycle.md
+docs/milestones/milestone9-2-soak-evidence-integrity.md
+docs/milestones/milestone9-1-controlled-soak-readiness.md
+docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md
 ```
 
 Inspect relevant symbols only in:
@@ -935,14 +935,14 @@ Add one small end-to-end campaign covering at least three market dates.
 Create:
 
 ```text
-docs/milestone9-3-evidence-integrity-and-soak-campaign.md
+docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md
 docs/runbooks/paper-soak-campaign.md
 ```
 
 Update:
 
 ```text
-docs/milestone9-2-soak-evidence-integrity.md
+docs/milestones/milestone9-2-soak-evidence-integrity.md
 ```
 
 with a concise correction section describing:

@@ -40,9 +40,9 @@ credential isolation and concurrency isolation.
   assumes. It now loads credentials only from an explicitly-named
   `PAPER_RUNTIME_ENV_FILE` or an allowlisted subprocess-environment
   pass-through; see
-  [`milestone11-1-external-paper-safety-closure.md`](../milestone11-1-external-paper-safety-closure.md#11-runtime-credential-isolation).
+  [`milestone11-1-external-paper-safety-closure.md`](../milestones/milestone11-1-external-paper-safety-closure.md#11-runtime-credential-isolation).
 - Concurrent preview/submit/retry/cancel/reconcile calls against the same
   order were not serialized, risking a forked local event chain even though
   the broker account itself is already isolated to one book. An order-scope
   lease (`paper_external_order_leases`) now serializes these operations; see
-  [closure doc §6](../milestone11-1-external-paper-safety-closure.md#6-order-scope-submission-lease).
+  [closure doc §6](../milestones/milestone11-1-external-paper-safety-closure.md#6-order-scope-submission-lease).

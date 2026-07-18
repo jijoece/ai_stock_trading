@@ -7,7 +7,7 @@
 
 Milestones 1-4 delivered a fully deterministic pipeline — screener, scorer, risk engine,
 recommendation builder, paper execution, ledger, evaluation — with no LLM anywhere in the
-decision path. `docs/milestone-5.md` asks for a "safe, reproducible Claude-powered research
+decision path. `docs/milestones/milestone-5.md` asks for a "safe, reproducible Claude-powered research
 layer that enhances the existing deterministic screening and scoring pipeline while preserving
 deterministic control over" every decision that touches money: recommendation construction,
 risk decisions, position sizing, paper execution, portfolio state, ledger accounting, broker
@@ -49,12 +49,12 @@ Two offline implementations exist and are what the default test suite and CLI us
   malformed output deterministically.
 
 Because `anthropic` was already a base dependency for an unrelated, pre-existing pipeline, this
-ADR does **not** add a new optional `research` extra as `docs/milestone-5.md` Step 3 suggests in
+ADR does **not** add a new optional `research` extra as `docs/milestones/milestone-5.md` Step 3 suggests in
 the abstract — that would contradict the instruction to follow existing, reasonable repository
 conventions. The default test suite still needs zero credentials and zero network access; it
 simply also happens to have the SDK importable, exactly as it already did before this milestone.
 This is recorded as a known, deliberate deviation from the milestone document's suggestion — see
-"Known limitations" in `docs/milestone5-evidence-backed-claude-research.md`.
+"Known limitations" in `docs/milestones/milestone5-evidence-backed-claude-research.md`.
 
 ## Decision 2: A point-in-time `EvidenceSnapshot` is the only thing a role prompt ever sees
 

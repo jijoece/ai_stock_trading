@@ -3,13 +3,13 @@
 ## Baseline
 - `pytest tests/ -q --tb=short` -> 1394 passed, 14 skipped (matches expected exactly).
 - `cd paper_runtime && pytest tests/ -q --tb=short` -> 33 passed (matches expected exactly).
-- Git status at start: clean except untracked `docs/milestone-9.md` (spec) and this scratchpad.
+- Git status at start: clean except untracked `docs/milestones/milestone-9.md` (spec) and this scratchpad.
 
 ## Existing lifecycle gaps
 Milestone 8/8.1 built isolated books, deterministic risk/execution/reconciliation, and real
 scheduled-cycle entry integration, but no SELL/exit path, no pending-order re-evaluation across
 days, and no persistent multi-day soak tracking/reporting — all recorded as Milestone 9
-candidates in `docs/milestone8-isolated-paper-portfolios.md` Section 21.
+candidates in `docs/milestones/milestone8-isolated-paper-portfolios.md` Section 21.
 
 ## Lifecycle design
 New `paper_books/lifecycle.py::run_paper_book_lifecycle` — fixed processing order (validate ->
@@ -61,9 +61,9 @@ deterministic, advisory-only. Soak report never recomputes/duplicates promotion 
   run-summary row exists (written last) — removed the FK.
 
 ## Documentation
-Created `docs/milestone9-manual-paper-soak-and-lifecycle.md` (architecture record) and
+Created `docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md` (architecture record) and
 `docs/runbooks/manual-paper-trading-soak.md` (operator runbook). Added a short pointer to
-`docs/milestone8-1-scheduled-paper-book-integration.md`.
+`docs/milestones/milestone8-1-scheduled-paper-book-integration.md`.
 
 ## Safety review
 - No forbidden imports in `lifecycle.py`/`exit_policy.py` (grep + AST-scan test confirmed:

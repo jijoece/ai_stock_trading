@@ -2,14 +2,14 @@
 
 Playbooks for operational incidents in the Milestone 7 shadow-operations layer. Pair with
 `docs/runbooks/shadow-operations.md` for routine commands and
-`docs/milestone7-production-shadow-operations.md` for architecture detail.
+`docs/milestones/milestone7-production-shadow-operations.md` for architecture detail.
 
 **Milestone 7.1 update:** `shadow_role_budget_checks` is now a real, queryable audit trail
 (one row per pre-attempt budget decision, before every real Claude call) — when
 investigating an unexpected `BUDGET_REJECTED`/`SKIPPED_BUDGET_EXHAUSTED` outcome, query it
 directly (`SELECT * FROM shadow_role_budget_checks WHERE scheduler_run_id = ?`) rather than
 only inferring budget state from `shadow-budget-status`. See
-`docs/milestone7-1-shadow-integration-closure.md` for the full closure detail.
+`docs/milestones/milestone7-1-shadow-integration-closure.md` for the full closure detail.
 
 **Milestone 7.2 update:** for ANY unexplained `health_status` (`DEGRADED`/`PAUSE_RECOMMENDED`/
 `PAUSE_REQUIRED`), run `shadow-health-explain --scheduler-run-id <id>` first — it returns the
@@ -20,7 +20,7 @@ silent about an automatic pause the way it was before this update. If `retry_exh
 is the triggering dimension, remember its denominator is "roles actually invoked this cycle,"
 not "symbols" — a single required role failing its only attempt can legitimately produce a
 100% rate when only that one role ever ran (see
-`docs/milestone7-2-shadow-health-diagnostics.md` Section 7 for the real, investigated example).
+`docs/milestones/milestone7-2-shadow-health-diagnostics.md` Section 7 for the real, investigated example).
 
 ## First response — always start here
 

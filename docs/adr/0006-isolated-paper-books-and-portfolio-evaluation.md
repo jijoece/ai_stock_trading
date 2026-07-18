@@ -15,7 +15,7 @@ that both the baseline and (structurally blocked) enhanced arms would have share
 enhanced arm ever been allowed to submit. `research/experiment_policy.py` recognizes
 `ENHANCED_ONLY` and `BOTH_SEPARATE_PAPER_BOOKS` as policy names but raises
 `UnsupportedExperimentPolicyError` for both, "because they require separate paper-portfolio
-namespaces this milestone does not implement" (ADR 0004 Decision 6). `docs/milestone-7 pending.md`
+namespaces this milestone does not implement" (ADR 0004 Decision 6). `docs/milestones/milestone-7 pending.md`
 Section 7.2 records this explicitly as deferred future work with its own required-work list
 (isolated balances, isolated positions, independent order IDs, experiment attribution,
 reconciliation, fair comparison, corporate-action handling, portfolio constraints).
@@ -31,7 +31,7 @@ architecture" for full file:line detail):
 * `paper_runtime`'s process-boundary payloads (`OrderIntentPayload`, `AccountSnapshotPayload`,
   `PositionSnapshotPayload`) carry no book_id anywhere.
 
-`docs/milestone-8.md` requires two fully isolated paper books (their own cash, positions,
+`docs/milestones/milestone-8.md` requires two fully isolated paper books (their own cash, positions,
 orders, fills, realized/unrealized P&L, fees/slippage, risk limits) while explicitly
 forbidding a redesign of Milestones 1-7.2 and forbidding any path from the enhanced arm to
 live execution, the baseline book, or the legacy global ledger.
@@ -157,7 +157,7 @@ larger than this milestone's LOCAL-SIMULATED-PAPER scope). `paper_runtime/src/
 trading_paper_runtime/models.py::OrderIntentPayload` gained an additive, optional `book_id:
 str | None = None` field purely for a **possible future** subprocess-per-book integration —
 that field is not read or written by any Milestone 8/8.1 code path today. **Per-book
-`paper_runtime` subprocess execution is deferred** (see `docs/milestone8-1-scheduled-paper-book-integration.md`
+`paper_runtime` subprocess execution is deferred** (see `docs/milestones/milestone8-1-scheduled-paper-book-integration.md`
 "Deferred").
 
 `paper_books/execution.py` never imports `runtime/lumibot/`, never imports a broker credential,

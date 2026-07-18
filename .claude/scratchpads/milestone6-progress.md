@@ -7,7 +7,7 @@ Status: STARTING
 ## Baseline
 - Main test suite: `pytest tests/ -q` -> 571 passed, 2 skipped (matches expected M5 result exactly)
 - Paper runtime suite: `cd paper_runtime && pytest tests/ -q` -> 33 passed (matches expected)
-- Git status: clean except docs/milestone-6.md modified (pre-existing working-tree edit to the milestone spec itself, updating M5's real-outcome narrative — not part of this session's implementation, left as-is) + untracked .claude/scratchpads/milestone6-progress.md (this file)
+- Git status: clean except docs/milestones/milestone-6.md modified (pre-existing working-tree edit to the milestone spec itself, updating M5's real-outcome narrative — not part of this session's implementation, left as-is) + untracked .claude/scratchpads/milestone6-progress.md (this file)
 - Available credentials/providers (boolean only):
   - ANTHROPIC_API_KEY: SET (present in process env, confirmed working in M5 smoke test)
   - ANTHROPIC_MODEL: SET (claude-sonnet-5)
@@ -231,7 +231,7 @@ Architecture decisions (finalized, before writing code):
       real endpoints; news honestly SKIPPED/ENVIRONMENTALLY_PENDING
 - [x] Real scheduled-cycle smoke test — genuinely PASSED (deterministic provider) +
       manual real-Claude validation (see Environmental validation #5)
-- [x] Documentation (docs/milestone6-real-evidence-continuous-evaluation.md) + ADR 0004
+- [x] Documentation (docs/milestones/milestone6-real-evidence-continuous-evaluation.md) + ADR 0004
 - [x] Full main suite + paper_runtime suite re-verified passing after all changes
 - [x] Self-review for secrets/look-ahead/duplication/execution leakage (see below)
 
@@ -259,7 +259,7 @@ Storage: `src/trading_research/storage/evidence_provider_schema.py`,
 Config: `config/evidence_providers.yaml`, `config/scheduled_research.yaml`.
 
 Docs: `docs/adr/0004-real-evidence-provider-boundary.md`,
-`docs/milestone6-real-evidence-continuous-evaluation.md`.
+`docs/milestones/milestone6-real-evidence-continuous-evaluation.md`.
 
 Tests (unit): `test_evidence_provider_cache_and_rate_limits.py`, `test_sec_provider.py`,
 `test_market_data_provider.py`, `test_fundamentals_normalization.py`,
@@ -283,7 +283,7 @@ Tests (integration): `test_scheduled_research_cycle.py`, `test_sec_api_smoke.py`
   `alpaca_market_data_api_secret` fields, redaction-listed
 - `src/trading_research/storage/database.py` — wired
   `apply_evidence_provider_schema`/`apply_research_cycle_schema` into `connect()`
-- `docs/milestone-6.md` — pre-existing working-tree edit from before this session started
+- `docs/milestones/milestone-6.md` — pre-existing working-tree edit from before this session started
   (updates the M5 real-outcome narrative); left untouched, not part of this milestone's work
 
 No Milestone 1-5 source file's behavior changed. No existing test was weakened, skipped, or
@@ -416,7 +416,7 @@ All run 2026-07-12 in this development environment, real network + real credenti
    attempt; output tokens 1,625-3,856 per attempt; `cost_status=PRICING_NOT_CONFIGURED`
    throughout (expected — `config/research_pricing.yaml` is empty by default, cost is never
    fabricated). This is not a repeatable, committed test (real Claude cost + ~2.5 minutes
-   per run) — see docs/milestone6 "Known limitations" #3 for why.
+   per run) — see docs/milestones/milestone6 "Known limitations" #3 for why.
 6. Ad-hoc direct-API probes (not pytest, exploratory during implementation): SEC
    `company_tickers.json` (200), `data.sec.gov/submissions/...` (200),
    `data.sec.gov/api/xbrl/companyfacts/...` (200), Alpaca `/v2/stocks/AAPL/bars` (200, after
@@ -435,7 +435,7 @@ limitations).
 
 ## Known limitations
 
-See `docs/milestone6-real-evidence-continuous-evaluation.md`'s "Known limitations" section
+See `docs/milestones/milestone6-real-evidence-continuous-evaluation.md`'s "Known limitations" section
 for the full, detailed list (8 items). Summary:
 
 1. News and Reddit sentiment are ENVIRONMENTALLY_PENDING (interfaces complete and tested,
@@ -472,7 +472,7 @@ Recommended Milestone 7 (see also the required final response to the user):
 ## Final status
 
 **Milestone 6 is code-complete and environment-validated** as of 2026-07-12. All acceptance
-criteria in docs/milestone-6.md are met:
+criteria in docs/milestones/milestone-6.md are met:
 
 - Main suite: 654 passed, 6 skipped (571 baseline + 83 new tests; 6 skipped = 2 baseline +
   4 correctly-gated opt-in smoke tests).
@@ -628,7 +628,7 @@ Chosen category justification: not claimed as proof of the exact historical caus
 remains an OBSERVABILITY GAP per "Bear-role incident investigation" above). Chosen because
 it is the most evidence-backed *representative* category available: Milestone 5's own real
 Claude API validation already proved this exact validator behavior fires on live model
-output (`docs/milestone5-evidence-backed-claude-research.md`, "Real Claude API
+output (`docs/milestones/milestone5-evidence-backed-claude-research.md`, "Real Claude API
 validation": "one numeric claim ... was correctly rejected by claim_validation.py"), and
 the bear role's job (quantify downside) is structurally the role most likely to have a
 model invent a specific number under the same pressure.
@@ -754,7 +754,7 @@ are unchanged from Milestone 5.
    scheduler, or daemon exists anywhere in this repository (grepped for `crontab`,
    `APScheduler`, `celery`); `run_scheduled_research_cycle` remains idempotent/resumable
    only, exactly as documented in
-   `docs/milestone6-real-evidence-continuous-evaluation.md`'s own
+   `docs/milestones/milestone6-real-evidence-continuous-evaluation.md`'s own
    "IDEMPOTENT SCHEDULED-CYCLE IMPLEMENTATION vs. ACTUAL RECURRING DEPLOYMENT" section.
 8. **MFE/MAE** — `DEFERRED_TO_MILESTONE_7`, unchanged. Still requires an intraday
    high/low data source this milestone set does not have; not derived from daily closes,
@@ -926,7 +926,7 @@ Ran a final grep-based verification pass (not just relying on earlier design rea
 ### Final status
 
 **Milestone 6.1 is code-complete** as of 2026-07-13. All acceptance criteria in
-`docs/milestone-6.1.md` are met:
+`docs/milestones/milestone-6.1.md` are met:
 
 * Main suite: `747 passed, 6 skipped` (654 baseline + 93 new tests; 0 regressions, 0
   weakened/deleted tests).
@@ -1130,7 +1130,7 @@ figures) works against a real live Claude response, not merely the deterministic
 reproduction (`test_bear_role_failure_reproduction.py`) or the invalid-key wiring dry-run
 above. It is a single successful run, not a statistically repeated validation — the
 opt-in test remains uncommitted to CI/default execution for the same cost/latency reasons
-documented in Milestone 5/6 (`docs/milestone5-evidence-backed-claude-research.md`'s "Known
+documented in Milestone 5/6 (`docs/milestones/milestone5-evidence-backed-claude-research.md`'s "Known
 limitations").
 
 ### Test run log (follow-up)

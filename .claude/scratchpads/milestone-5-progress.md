@@ -5,7 +5,7 @@ Started: 2026-07-12
 ## Baseline (confirmed before any edits)
 - Main suite: `pytest tests/ -q` → **422 passed, 1 skipped** ✅ matches expected
 - Paper runtime: `cd paper_runtime && pytest tests/ -q` → **33 passed** ✅ matches expected
-- Git branch: `main`, only untracked file was `docs/milestone-5.md`
+- Git branch: `main`, only untracked file was `docs/milestones/milestone-5.md`
 
 ## Key repo-convention findings (inform design)
 - `anthropic` SDK is already a **base** dependency (pyproject.toml) — used today only by
@@ -51,7 +51,7 @@ Started: 2026-07-12
 - CLI: build-evidence, run-research, replay-research, compare-research-arms,
   research-performance, research-usage — added to existing `cli.py`.
 
-## Step checklist (docs/milestone-5.md Suggested Implementation Order) — ALL DONE
+## Step checklist (docs/milestones/milestone-5.md Suggested Implementation Order) — ALL DONE
 - [x] 1. Inspect repository and run both baselines
 - [x] 2. Gap analysis (this file)
 - [x] 3. Draft research-boundary ADR (docs/adr/0003-claude-research-boundary.md)
@@ -75,7 +75,7 @@ Started: 2026-07-12
 - [x] 21. Offline integration tests (tests/integration/test_research_end_to_end.py, 4 scenarios)
 - [x] 22. Opt-in real Claude smoke test — PASSED for real on 2026-07-12 (see below)
 - [x] 23. Extend evaluation reporting (evaluation/research_comparison.py)
-- [x] 24. Documentation (docs/milestone5-evidence-backed-claude-research.md + ADR 0003)
+- [x] 24. Documentation (docs/milestones/milestone5-evidence-backed-claude-research.md + ADR 0003)
 - [x] 25. Run full main suite — 571 passed, 2 skipped (baseline was 422/1; net +149 new tests, 0 regressions)
 - [x] 26. Run isolated paper-runtime suite — 33 passed, unchanged, zero files touched under paper_runtime/
 - [x] 27. Ran Claude smoke test with real credentials — PASSED after 3 real fixes (see below)
@@ -104,7 +104,7 @@ on fabricated/unknown-evidence-id citations, since the validator correctly rejec
 real-model numeric-derivation claim (not present verbatim in evidence) is the validator working
 as designed, not a defect.
 Final result: `PASSED` — real structured tool-use call, `input_tokens=3222 output_tokens=1804
-latency_ms=16586`. Updated `docs/milestone5-evidence-backed-claude-research.md`'s "Real Claude
+latency_ms=16586`. Updated `docs/milestones/milestone5-evidence-backed-claude-research.md`'s "Real Claude
 API validation" section with the full result and all three fixes.
 Full main suite re-verified after these fixes: 571 passed, 2 skipped, no regressions.
 

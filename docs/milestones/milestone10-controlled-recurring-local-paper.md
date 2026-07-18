@@ -117,7 +117,7 @@ src/trading_research/paper_books/soak_campaign.py
 src/trading_research/paper_books/controlled_soak_readiness.py
 src/trading_research/paper_books/cross_book_verification.py
 src/trading_research/research/provider_provenance.py
-docs/milestone9-3-evidence-integrity-and-soak-campaign.md
+docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md
 ```
 
 Confirm that Milestone 9.3 provides:
@@ -166,7 +166,7 @@ config/paper_books.yaml
 Read:
 
 ```text
-docs/milestone9-3-evidence-integrity-and-soak-campaign.md
+docs/milestones/milestone9-3-evidence-integrity-and-soak-campaign.md
 docs/runbooks/paper-soak-campaign.md
 ```
 
@@ -970,7 +970,7 @@ due market day
 Create:
 
 ```text
-docs/milestone10-controlled-recurring-local-paper.md
+docs/milestones/milestone10-controlled-recurring-local-paper.md
 docs/runbooks/recurring-local-paper-trading.md
 ```
 

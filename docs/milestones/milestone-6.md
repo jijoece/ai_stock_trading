@@ -339,12 +339,12 @@ Before editing:
 3. Read:
 
    * Milestone 1 documentation;
-   * `docs/milestone2-analysis-layer.md`;
-   * `docs/milestone3-lumibot-paper-integration.md`;
-   * `docs/milestone4-isolated-paper-broker.md`;
-   * `docs/milestone5-evidence-backed-claude-research.md`;
+   * `docs/milestones/milestone2-analysis-layer.md`;
+   * `docs/milestones/milestone3-lumibot-paper-integration.md`;
+   * `docs/milestones/milestone4-isolated-paper-broker.md`;
+   * `docs/milestones/milestone5-evidence-backed-claude-research.md`;
    * all existing ADRs;
-   * `docs/milestone-6.md` if it exists;
+   * `docs/milestones/milestone-6.md` if it exists;
    * existing research models and persistence;
    * evidence builders and validators;
    * experiment and comparison modules;
@@ -1627,7 +1627,7 @@ Do not combine first-time provider validation with broker execution.
 Create:
 
 ```text
-docs/milestone6-real-evidence-continuous-evaluation.md
+docs/milestones/milestone6-real-evidence-continuous-evaluation.md
 docs/adr/0004-real-evidence-provider-boundary.md
 ```
 

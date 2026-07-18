@@ -9,7 +9,7 @@ a recurring deployment.
 > **Milestone 7.2 update (2026-07-13):** Section 26's open item — this session's real
 > validation run returning `health_status=PAUSE_REQUIRED` on an otherwise fully successful
 > cycle, with the cause not investigated to avoid further real spend — is now explained,
-> root-caused, and fixed. See `docs/milestone7-2-shadow-health-diagnostics.md` for the full
+> root-caused, and fixed. See `docs/milestones/milestone7-2-shadow-health-diagnostics.md` for the full
 > field-level diagnostic instrumentation, the real-rerun capture, and the demonstrated
 > `RATE-DENOMINATOR BUG` fix (`retry_exhaustion_rate`'s denominator conflated symbol count
 > with role-invocation count). This document's own content below is preserved as Milestone
@@ -17,7 +17,7 @@ a recurring deployment.
 
 ## 1. Original Milestone 7 integration gaps (confirmed from code before editing)
 
-All 13 gaps named in `docs/milestone-7.1.md` were confirmed present in the actual code
+All 13 gaps named in `docs/milestones/milestone-7.1.md` were confirmed present in the actual code
 before any edit (see the scratchpad's "Current integration gaps confirmed" section for the
 exact file/line evidence gathered during Step 2 of this session):
 
@@ -289,7 +289,7 @@ All additive, no destructive migration, no change to any Milestone 1-7 table:
 * `tests/unit/test_shadow_attempt_controller.py` (8 tests)
 * `tests/unit/test_cycle_telemetry.py` (5 tests)
 * `tests/unit/test_shadow_cli_provider_mode.py` (6 tests)
-* `docs/milestone7-1-shadow-integration-closure.md` (this file)
+* `docs/milestones/milestone7-1-shadow-integration-closure.md` (this file)
 
 ## 21. Files modified
 

@@ -10,7 +10,7 @@ recurring deployment.
 
 ## 1. The original, unexplained pause
 
-Milestone 7.1's own real-validation run (`docs/milestone7-1-shadow-integration-closure.md`
+Milestone 7.1's own real-validation run (`docs/milestones/milestone7-1-shadow-integration-closure.md`
 Section 24) completed a real SEC + real Claude shadow cycle successfully — 2/2 attempts
 succeeded, cost reconciled exactly — but returned `health_status=PAUSE_REQUIRED` with no
 captured reasons or triggering flags. That session explicitly deferred investigating it to

@@ -11,7 +11,7 @@ durable architecture record.
 
 **Milestone 8.1 pointer:** the real scheduled-research-cycle-to-isolated-paper-book
 integration this document's Section 20/21 recorded as deferred is now implemented — see
-`docs/milestone8-1-scheduled-paper-book-integration.md`. Section 5's table count below is
+`docs/milestones/milestone8-1-scheduled-paper-book-integration.md`. Section 5's table count below is
 corrected to 14 (was previously misstated as "ten" in an earlier draft of this document).
 
 ---
@@ -274,7 +274,7 @@ Paper runtime:      33 passed                (unchanged)
 
 ## 20. Deferred / explicitly out of scope
 
-Matches `docs/milestone-8.md`'s own non-goals: `unsupported_claim_rate` fix, real
+Matches `docs/milestones/milestone-8.md`'s own non-goals: `unsupported_claim_rate` fix, real
 paper-reconciliation health wiring into shadow, duplicate-prevention health wiring, Reddit
 registration, new news providers, destructive retention, real recurring shadow activation,
 remaining corporate-action types, MFE/MAE, live promotion, Robinhood/live Alpaca trading,

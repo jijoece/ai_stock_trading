@@ -2,7 +2,7 @@
 
 **Milestone 9.1 pointer:** combined paper-soak + shadow-operational activation readiness, the
 single manual `paper-soak-run` operator command, and a lifecycle-CLI clock-anchoring fix are
-now implemented — see `docs/milestone9-1-controlled-soak-readiness.md`. This document's own
+now implemented — see `docs/milestones/milestone9-1-controlled-soak-readiness.md`. This document's own
 `paper-book-lifecycle-run`/`paper-book-soak-report`/`paper-book-soak-readiness` commands
 described below are unchanged (the lifecycle service's own `as_of`-anchored clock default,
 Section 2 below, was always correct — only the CLI's separate wall-clock override was fixed).
@@ -304,7 +304,7 @@ enable any part of this section — only this file can, matching the existing
 
 ## 13. Deferred / explicitly out of scope
 
-Matches `docs/milestone-9.md`'s own non-goals: unattended recurring activation, launchd
+Matches `docs/milestones/milestone-9.md`'s own non-goals: unattended recurring activation, launchd
 installation, an external Alpaca paper broker, a per-book `paper_runtime` subprocess pool,
 partial fills, trailing stops, non-FIFO tax-lot selection, live trading, automated promotion,
 remaining corporate-action types, dividend record-date entitlement correction, and the

@@ -9,7 +9,7 @@
 **Milestone 9 pointer:** the manual daily lifecycle (pending-order resolution, deterministic
 exits, soak reporting/readiness) this document's own Section 13 recorded as a "recommended
 Milestone 9 scope" item is now implemented — see
-`docs/milestone9-manual-paper-soak-and-lifecycle.md`. `run_due_shadow_cycle`'s
+`docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md`. `run_due_shadow_cycle`'s
 `paper_book_integrator` hook described below is unchanged; a second, independent optional hook
 (`paper_book_lifecycle_hook`) was added beside it.
 
@@ -176,7 +176,7 @@ Milestone 8/8.1 uses an in-process, book-aware, deterministic local simulator;
 `OrderIntentPayload`'s additive optional `book_id` field exists for a possible future
 subprocess-per-book integration; per-book `paper_runtime` subprocess execution is deferred. The
 ADR's Section 5 table-count wording ("ten") is also corrected to 14 in
-`docs/milestone8-isolated-paper-portfolios.md`.
+`docs/milestones/milestone8-isolated-paper-portfolios.md`.
 
 ## 12. Tests
 

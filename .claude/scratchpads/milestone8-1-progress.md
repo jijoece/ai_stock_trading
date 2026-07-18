@@ -3,7 +3,7 @@
 ## Baseline
 - `pytest tests/ -q --tb=short` -> 1355 passed, 14 skipped (matches expected exactly).
 - `cd paper_runtime && pytest tests/ -q --tb=short` -> 33 passed (matches expected exactly).
-- Git status at start: clean except untracked `docs/milestone-8.1.md` (this spec) and this
+- Git status at start: clean except untracked `docs/milestones/milestone-8.1.md` (this spec) and this
   scratchpad. No unrelated in-flight work.
 
 ## Scheduled-cycle output mapping
@@ -79,7 +79,7 @@ Files created:
   `integrate_scheduled_cycle_into_paper_books`, `SymbolArmOutcome`/`PaperBookCycleIntegrationResult`,
   `_process_arm` (per-arm eligibility+execution), `_build_market_simulation_input` (3-tier),
   `_resolve_may_submit` (policy try/except wrapper).
-- `docs/milestone8-1-scheduled-paper-book-integration.md`.
+- `docs/milestones/milestone8-1-scheduled-paper-book-integration.md`.
 
 Files modified:
 - `src/trading_research/paper_books/config.py` — new `ScheduledIntegrationSection` (optional,
@@ -92,7 +92,7 @@ Files modified:
   (`paper_book_integration_status`/`_reason`, both default `None`).
 - `docs/adr/0006-isolated-paper-books-and-portfolio-evaluation.md` — Decision 1/9 corrected
   (in-process local simulator, not a `paper_runtime` subprocess call); status line updated.
-- `docs/milestone8-isolated-paper-portfolios.md` — "Ten new tables" corrected to "Fourteen";
+- `docs/milestones/milestone8-isolated-paper-portfolios.md` — "Ten new tables" corrected to "Fourteen";
   pointer note to this milestone added.
 
 Bugs found and fixed during development (caught by targeted tests, fixed before final run):
@@ -157,10 +157,10 @@ the two books' AAPL fills/intents/cash are provably distinct.
   directory not touched this session at all).
 
 ## Documentation
-Created `docs/milestone8-1-scheduled-paper-book-integration.md` (full architecture record: entry
+Created `docs/milestones/milestone8-1-scheduled-paper-book-integration.md` (full architecture record: entry
 point, mapping table, eligibility order, assignment design, market-simulation tiers,
 reconciliation scope, config gate, scheduler wiring, CLI, ADR correction, tests, deferred list).
-Updated `docs/milestone8-isolated-paper-portfolios.md` with a one-paragraph pointer (table-count
+Updated `docs/milestones/milestone8-isolated-paper-portfolios.md` with a one-paragraph pointer (table-count
 correction "ten" -> "fourteen"). Corrected `docs/adr/0006-isolated-paper-books-and-portfolio-
 evaluation.md` Decision 1/9 (in-process local simulator, not a `paper_runtime` subprocess call;
 `OrderIntentPayload.book_id` is for a possible future integration, currently unused) and its

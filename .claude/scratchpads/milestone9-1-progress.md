@@ -3,7 +3,7 @@
 ## Baseline
 - `pytest tests/ -q --tb=short` -> 1454 passed, 14 skipped (matches expected exactly).
 - `cd paper_runtime && pytest tests/ -q --tb=short` -> 33 passed (matches expected exactly).
-- Git status at start: clean except untracked `docs/milestone-9.1.md` (spec) and this scratchpad.
+- Git status at start: clean except untracked `docs/milestones/milestone-9.1.md` (spec) and this scratchpad.
 
 ## Readiness inputs
 Traced all 13 combined-readiness inputs (Section 1 of spec) against real repository code:
@@ -64,9 +64,9 @@ doesn't.
 - Net new: 34 tests. All targeted suites green throughout development.
 
 ## Documentation
-Created `docs/milestone9-1-controlled-soak-readiness.md` (architecture record) and
+Created `docs/milestones/milestone9-1-controlled-soak-readiness.md` (architecture record) and
 `docs/runbooks/controlled-paper-soak.md` (operator runbook). Added a short pointer to
-`docs/milestone9-manual-paper-soak-and-lifecycle.md`. No prior milestone doc rewritten.
+`docs/milestones/milestone9-manual-paper-soak-and-lifecycle.md`. No prior milestone doc rewritten.
 
 ## Safety review
 - No forbidden imports (lumibot/alpaca/robinhood/anthropic/trading_paper_runtime) in any new
