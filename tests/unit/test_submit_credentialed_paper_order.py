@@ -19,7 +19,14 @@ from trading_research.storage.database import connect
 from trading_research.universe.tickers import default_universe
 
 from tests.support.execution_fixtures import buy_candidate_payload, insert_recommendation_row
-from tests.support.runtime_client_fixtures import FakeTransport, fake_transport_factory, start_ready_client
+from tests.support.runtime_client_fixtures import (
+    FakeTransport,
+    capabilities_payload,
+    fake_transport_factory,
+    health_payload,
+    sequential_fake_transport_factory,
+    start_ready_client,
+)
 
 NOW = datetime(2026, 7, 11, 15, 0, tzinfo=timezone.utc)
 CONFIG = load_execution_config()
@@ -158,11 +165,23 @@ def test_ambiguous_submission_recovers_via_lookup_not_blind_retry(conn, policy):
     from trading_research.execution.intent_builder import build_paper_order_intent
 
     intent = build_paper_order_intent(payload, config=CONFIG, git_sha="abc1234")
-    client, fake = _started_client()
+    # Milestone 11.3.1 Item 5: any request timeout tears down the transport
+    # it happened on -- the read-only recovery lookup after submit_order
+    # times out must transparently restart onto a brand-new transport
+    # (fake2), never reusing fake1's now-dead child.
+    fake1, fake2 = FakeTransport(), FakeTransport()
+    client = RuntimeClient(
+        command=["python3", "-m", "trading_paper_runtime"],
+        transport_factory=sequential_fake_transport_factory([fake1, fake2]),
+        startup_timeout_seconds=1.0, request_timeout_seconds=1.0,
+    )
+    start_ready_client(client, fake1)
 
-    fake.queue_failure("UNKNOWN_ORDER", "not found")  # initial lookup: nothing yet
-    fake.queue_timeout()  # submit_order times out — ambiguous
-    fake.queue_success(_order_snapshot(intent.intent_id, status="ACCEPTED"))  # recovery lookup finds it
+    fake1.queue_failure("UNKNOWN_ORDER", "not found")  # initial lookup: nothing yet
+    fake1.queue_timeout()  # submit_order times out — ambiguous
+    fake2.queue_success(health_payload(), operation="health")
+    fake2.queue_success(capabilities_payload(), operation="capabilities")
+    fake2.queue_success(_order_snapshot(intent.intent_id, status="ACCEPTED"))  # recovery lookup finds it, on fake2
 
     outcome = submit_credentialed_paper_order(
         "rec-6", conn=conn, execution_config=CONFIG, eligibility_policy=policy, client=client,

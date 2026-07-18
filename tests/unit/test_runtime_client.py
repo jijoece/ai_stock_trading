@@ -310,3 +310,42 @@ def test_repeated_start_shutdown_cycles_join_pump_threads_without_leaking():
         assert not transport._stderr_thread.is_alive()
     after = {t.ident for t in threading.enumerate()}
     assert after <= before  # no new threads left running
+
+
+def test_transport_termination_escalates_to_kill_when_process_ignores_terminate():
+    """Milestone 11.3.1 Item 5: `_mark_unhealthy_after_timeout` must still
+    fully tear down a child that ignores SIGTERM -- `terminate()` escalates
+    stdin-close -> SIGTERM -> SIGKILL until the process is actually gone."""
+    from trading_research.runtime.client.process_client import SubprocessTransport
+
+    transport = SubprocessTransport([
+        "python3", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+    ])
+    assert transport.is_alive()
+    transport.terminate(timeout=1.0)  # each escalation stage gets 1s
+    assert not transport.is_alive()
+    assert not transport._stdout_thread.is_alive()
+    assert not transport._stderr_thread.is_alive()
+
+
+def test_repeated_real_timeout_restart_cycles_do_not_leak_threads_or_processes():
+    """Milestone 11.3.1 Item 5: several real (non-fake) timeout -> mark-
+    unhealthy -> restart cycles against a child that never answers must
+    leave no extra threads or lingering child processes behind."""
+    import threading
+
+    from trading_research.runtime.client.process_client import SubprocessTransport
+
+    # A child that reads and discards stdin forever without ever writing a
+    # response -- every request against it times out.
+    never_responds = ["python3", "-c", "import sys; sys.stdin.read()"]
+    client = RuntimeClient(
+        command=never_responds, startup_timeout_seconds=0.3, request_timeout_seconds=0.3,
+    )
+    before = {t.ident for t in threading.enumerate()}
+    for _ in range(3):
+        with pytest.raises(RuntimeStartupTimeoutError):
+            client.start()
+        assert client._unhealthy is True
+    after = {t.ident for t in threading.enumerate()}
+    assert after <= before
