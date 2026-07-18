@@ -388,8 +388,29 @@ def snapshot_exists(conn: sqlite3.Connection, book_id: str, snapshot_id: str) ->
     return row is not None
 
 
+class SnapshotIdentityConflictError(RuntimeError):
+    """Raised if a `snapshot_id` already on file maps to a *different*
+    `source_hash` than the one being saved. Milestone 11.3.1 Item 3:
+    `snapshot_id` and `source_hash` are both derived from the identical
+    canonical payload (`valuation.py::build_portfolio_snapshot`), so this
+    should be structurally unreachable outside a SHA-256 collision or a
+    bug — persisting a corrected snapshot silently under its predecessor's
+    identity is never acceptable, so this fails closed rather than
+    discarding the new content or overwriting the old row."""
+
+
 def save_snapshot(conn: sqlite3.Connection, snapshot, position_rows: list[dict]) -> bool:
-    if snapshot_exists(conn, snapshot.book_id, snapshot.snapshot_id):
+    existing = conn.execute(
+        "SELECT source_hash FROM paper_book_snapshots WHERE book_id = ? AND snapshot_id = ?",
+        (snapshot.book_id, snapshot.snapshot_id),
+    ).fetchone()
+    if existing is not None:
+        if existing["source_hash"] != snapshot.source_hash:
+            raise SnapshotIdentityConflictError(
+                f"snapshot_id {snapshot.snapshot_id!r} for book {snapshot.book_id!r} already exists with a "
+                f"different source_hash ({existing['source_hash']!r} != {snapshot.source_hash!r}) — refusing "
+                "to silently discard or overwrite a corrected snapshot"
+            )
         return False
     conn.execute(
         "INSERT INTO paper_book_snapshots (book_id, snapshot_id, as_of, cash_available_usd, "

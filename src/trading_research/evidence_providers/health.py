@@ -80,6 +80,98 @@ def compute_all_provider_health(rows: list[dict]) -> tuple[ProviderHealthSummary
     return tuple(compute_provider_health(rows, p) for p in providers)
 
 
+# -- Milestone 11.3.1 Item 8: bounded severe-error taxonomy, wired from ------
+# -- real persisted request telemetry (never inferred from raw exception ----
+# -- text). `error_code` on `evidence_provider_requests` is always one of a --
+# -- fixed set of exception class names an adapter actually raised ----------
+# -- (`evidence_providers/errors.py`), so this mapping is a lookup over a ---
+# -- bounded, real vocabulary, not a text-pattern guess. ---------------------
+
+SEVERE_AUTHENTICATION_FAILED = "AUTHENTICATION_FAILED"
+SEVERE_DNS_OR_CONNECTION_FAILURE = "DNS_OR_CONNECTION_FAILURE"
+SEVERE_TLS_FAILURE = "TLS_FAILURE"
+SEVERE_PROVIDER_CONFIGURATION_INVALID = "PROVIDER_CONFIGURATION_INVALID"
+SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION = "REPEATED_RATE_LIMIT_EXHAUSTION"
+SEVERE_PROTOCOL_OR_SCHEMA_BREAK = "PROTOCOL_OR_SCHEMA_BREAK"
+
+SEVERE_ERROR_CATEGORIES = (
+    SEVERE_AUTHENTICATION_FAILED, SEVERE_DNS_OR_CONNECTION_FAILURE, SEVERE_TLS_FAILURE,
+    SEVERE_PROVIDER_CONFIGURATION_INVALID, SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION,
+    SEVERE_PROTOCOL_OR_SCHEMA_BREAK,
+)
+
+# Minimum exhausted-retry count on a still-rate-limited failed request before
+# it counts as "repeated" rather than one ordinary rate-limit backoff.
+_REPEATED_RATE_LIMIT_RETRY_THRESHOLD = 2
+
+
+def classify_severe_error(row: dict) -> str | None:
+    """Returns one of `SEVERE_ERROR_CATEGORIES`, or `None` if this request
+    row is either successful or an ordinary (non-severe) failure. Reads only
+    the bounded, already-classified `error_code`/`http_status`/
+    `rate_limited`/`retry_count` fields persisted on the row — never raw
+    exception text."""
+    if row.get("success"):
+        return None
+    http_status = row.get("http_status")
+    error_code = row.get("error_code")
+    if http_status in (401, 403):
+        return SEVERE_AUTHENTICATION_FAILED
+    if error_code == "ProviderConfigurationError":
+        return SEVERE_PROVIDER_CONFIGURATION_INVALID
+    if error_code == "MalformedProviderResponseError":
+        return SEVERE_PROTOCOL_OR_SCHEMA_BREAK
+    if row.get("rate_limited") and (row.get("retry_count") or 0) >= _REPEATED_RATE_LIMIT_RETRY_THRESHOLD:
+        return SEVERE_REPEATED_RATE_LIMIT_EXHAUSTION
+    if error_code == "ProviderRequestError" and http_status is None:
+        # No HTTP response at all reached this adapter -- connection-level
+        # failure. TLS failures are not currently distinguishable from a
+        # generic connection failure at this persisted-field granularity,
+        # so both fold into this bucket (a documented limitation, not a
+        # guess from exception text).
+        return SEVERE_DNS_OR_CONNECTION_FAILURE
+    return None
+
+
+@dataclass(frozen=True)
+class CycleProviderTelemetry:
+    """Authoritative per-cycle provider-request telemetry (Milestone 11.3.1
+    Item 8 Part A) — the real request-attempt count and outcome, not a
+    symbols-attempted proxy. `per_provider` preserves per-provider rates
+    (never collapsed into a single aggregate that could hide one required
+    provider's complete outage behind another provider's success).
+    `required_providers_missing` names any provider in the caller's
+    required set that produced zero requests this cycle — an absent
+    required provider is never treated as a passing/successful result."""
+
+    total_requests: int
+    successful_requests: int
+    aggregate_success_rate: float | None
+    per_provider: dict[str, ProviderHealthSummary]
+    required_providers_missing: tuple[str, ...]
+    severe_error: bool
+    severe_error_categories: tuple[str, ...]
+
+
+def compute_cycle_provider_telemetry(
+    rows: list[dict], *, required_providers: tuple[str, ...] = (),
+) -> CycleProviderTelemetry:
+    total = len(rows)
+    successes = sum(1 for r in rows if r["success"])
+    aggregate_rate = (successes / total) if total > 0 else None
+    providers_seen = sorted({r["provider"] for r in rows})
+    per_provider = {provider: compute_provider_health(rows, provider) for provider in providers_seen}
+    missing = tuple(p for p in required_providers if p not in providers_seen)
+    severe_categories = sorted({
+        category for row in rows for category in (classify_severe_error(row),) if category is not None
+    })
+    return CycleProviderTelemetry(
+        total_requests=total, successful_requests=successes, aggregate_success_rate=aggregate_rate,
+        per_provider=per_provider, required_providers_missing=missing,
+        severe_error=bool(severe_categories), severe_error_categories=tuple(severe_categories),
+    )
+
+
 REDUNDANCY_SINGLE_PROVIDER_PER_CATEGORY = "SINGLE_PROVIDER_PER_CATEGORY"
 
 
