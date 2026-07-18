@@ -60,6 +60,10 @@ class ShadowResearchAttemptController:
     clock: Clock
     scheduler_run_id: str | None = None
     cycle_id: str | None = None
+    max_calls_per_cycle: int | None = None
+    max_calls_per_day: int | None = None
+    max_calls_per_month: int | None = None
+    max_api_equivalent_cost_per_call_usd: Decimal | None = None
     _role_index_by_role: dict[str, int] = field(default_factory=dict)
     _next_role_index: int = field(default=0, init=False)
 
@@ -77,23 +81,58 @@ class ShadowResearchAttemptController:
         cost_per_input_token = (
             (self.pricing.input_price_per_million / Decimal(1_000_000)) if self.pricing is not None else Decimal("0")
         )
-        decision = role_budget_mod.check_role_budget(
-            self.conn, self.reservation, request.role, role_index, request.attempt_number,
-            allowed_roles=self.allowed_roles, max_roles_per_symbol=self.max_roles_per_symbol,
-            max_attempts_per_role=self.max_attempts_per_role,
-            max_possible_output_tokens_for_role=self.max_output_tokens_per_role,
-            max_possible_input_tokens_for_role=self.max_input_tokens_per_role,
-            max_possible_latency_seconds_for_role=self.max_latency_seconds_per_role,
-            estimated_cost_per_output_token=cost_per_output_token,
-            estimated_cost_per_input_token=cost_per_input_token,
-            clock=self.clock,
-        )
-
-        remaining = remaining_reservation_budget(self.conn, self.reservation.reservation_id)
+        decision = None
         max_possible_cost = (
             Decimal(self.max_output_tokens_per_role) * cost_per_output_token
             + Decimal(self.max_input_tokens_per_role) * cost_per_input_token
         )
+        if self.provider == "claude_code":
+            now = self.clock()
+            call_caps = (
+                ("cycle", self.max_calls_per_cycle, self.conn.execute(
+                    "SELECT COUNT(*) FROM shadow_role_budget_checks WHERE reservation_id = ? AND decision = 'PROCEED'",
+                    (self.reservation.reservation_id,),
+                ).fetchone()[0]),
+                ("day", self.max_calls_per_day, self.conn.execute(
+                    "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+                    (now.date().isoformat() + "%",),
+                ).fetchone()[0]),
+                ("month", self.max_calls_per_month, self.conn.execute(
+                    "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+                    (now.strftime("%Y-%m") + "%",),
+                ).fetchone()[0]),
+            )
+            for period, cap, used in call_caps:
+                if cap is not None and used >= cap:
+                    decision = role_budget_mod.RoleBudgetDecision(
+                        decision=role_budget_mod.DECISION_SKIPPED_BUDGET_EXHAUSTED,
+                        role_name=request.role,
+                        reason=f"Claude Code {period} call cap {cap} has been reached",
+                    )
+                    break
+            if (
+                decision is None and self.max_api_equivalent_cost_per_call_usd is not None
+                and max_possible_cost > self.max_api_equivalent_cost_per_call_usd
+            ):
+                decision = role_budget_mod.RoleBudgetDecision(
+                    decision=role_budget_mod.DECISION_SKIPPED_BUDGET_EXHAUSTED,
+                    role_name=request.role,
+                    reason="Claude Code maximum API-equivalent cost per call would be exceeded",
+                )
+        if decision is None:
+            decision = role_budget_mod.check_role_budget(
+                self.conn, self.reservation, request.role, role_index, request.attempt_number,
+                allowed_roles=self.allowed_roles, max_roles_per_symbol=self.max_roles_per_symbol,
+                max_attempts_per_role=self.max_attempts_per_role,
+                max_possible_output_tokens_for_role=self.max_output_tokens_per_role,
+                max_possible_input_tokens_for_role=self.max_input_tokens_per_role,
+                max_possible_latency_seconds_for_role=self.max_latency_seconds_per_role,
+                estimated_cost_per_output_token=cost_per_output_token,
+                estimated_cost_per_input_token=cost_per_input_token,
+                clock=self.clock,
+            )
+
+        remaining = remaining_reservation_budget(self.conn, self.reservation.reservation_id)
         checked_at = self.clock()
         check_id = _compute_check_id(
             reservation_id=self.reservation.reservation_id, research_run_id=request.research_run_id,
@@ -123,6 +162,23 @@ class ShadowResearchAttemptController:
 
     def after_attempt(self, request: AttemptControlRequest, attempt: ResearchAttemptRecord) -> None:
         usage = attempt.usage
+        if self.provider == "claude_code" and not attempt.success:
+            safe_reason = (attempt.failure_reason or "").lower()
+            if any(marker in safe_reason for marker in (
+                "usage metadata", "credits are unavailable", "authentication failed",
+                "oauth token is missing", "version is below", "retry",
+            )):
+                from . import pause as pause_mod
+
+                current = pause_mod.current_state(self.conn)
+                if current.state == pause_mod.STATE_ACTIVE:
+                    pause_mod.request_pause(
+                        self.conn,
+                        reason="Claude Code provider health failed closed",
+                        source=pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE,
+                        target_state=pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
+                        clock=self.clock,
+                    )
         if usage.input_tokens is None or usage.output_tokens is None or usage.latency_ms is None:
             # Never fabricate usage the provider did not actually report
             # (docs/milestone-7.1.md hard boundary) — a non-retryable

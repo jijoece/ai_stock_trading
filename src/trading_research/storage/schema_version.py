@@ -93,6 +93,20 @@ def _migration_2_backfill_execution_namespace_claims(conn: sqlite3.Connection) -
         )
 
 
+def _migration_3_claude_code_usage_provenance(conn: sqlite3.Connection) -> None:
+    """Add honest subscription API-equivalent estimate/provenance fields."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    additions = (
+        ("cost_estimate_basis", "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'"),
+        ("configured_model_alias", "TEXT"),
+        ("resolved_model_name", "TEXT"),
+        ("claude_code_version", "TEXT"),
+    )
+    for column_name, column_type in additions:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE research_attempts ADD COLUMN {column_name} {column_type}")
+
+
 # Ordered, idempotent migrations. Each callable must be safe to invoke more
 # than once (defense in depth on top of the version gate, which normally
 # prevents re-invocation) and must not raise on a database that already has
@@ -102,6 +116,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     2: (
         "backfill paper_order_execution_claims for pre-existing intents (Milestone 11.3.1 Item 6)",
         _migration_2_backfill_execution_namespace_claims,
+    ),
+    3: (
+        "add Claude Code usage estimate basis and provider provenance",
+        _migration_3_claude_code_usage_provenance,
     ),
 }
 
@@ -132,9 +150,11 @@ def apply_pending_schema_migrations(conn: sqlite3.Connection) -> int:
     existing `apply_*_schema` additive DDL has run, so a fresh database
     always starts from the full current table/column/trigger set before any
     migration-specific logic executes."""
-    row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    stored = row[0] if row else None
-    pending = sorted(v for v in _MIGRATIONS if v > (stored or 0))
+    # Determine pending work by the actual version ledger, not only MAX.
+    # This remains correct if an interrupted/manual legacy database has a
+    # gap (for example version 3 present but version 2 absent).
+    applied = {row[0] for row in conn.execute("SELECT version FROM schema_version").fetchall()}
+    pending = sorted(v for v in _MIGRATIONS if v not in applied)
     for version in pending:
         description, migration_fn = _MIGRATIONS[version]
         # Milestone 11.3.1 Item 2: use the shared transaction-ownership

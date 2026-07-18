@@ -35,6 +35,17 @@ COST_USAGE_NOT_RETURNED = "USAGE_NOT_RETURNED"
 COST_NOT_APPLICABLE = "NOT_APPLICABLE"
 COST_STATUSES = (COST_CALCULATED, COST_PRICING_NOT_CONFIGURED, COST_USAGE_NOT_RETURNED, COST_NOT_APPLICABLE)
 
+COST_BASIS_DIRECT_API_ESTIMATE = "DIRECT_API_ESTIMATE"
+COST_BASIS_SUBSCRIPTION_API_EQUIVALENT_ESTIMATE = "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE"
+COST_BASIS_NOT_APPLICABLE = "NOT_APPLICABLE"
+COST_BASIS_USAGE_NOT_RETURNED = "USAGE_NOT_RETURNED"
+COST_ESTIMATE_BASES = (
+    COST_BASIS_DIRECT_API_ESTIMATE,
+    COST_BASIS_SUBSCRIPTION_API_EQUIVALENT_ESTIMATE,
+    COST_BASIS_NOT_APPLICABLE,
+    COST_BASIS_USAGE_NOT_RETURNED,
+)
+
 
 def _require_tz_aware(value: datetime | None, name: str) -> None:
     if value is not None and value.tzinfo is None:
@@ -263,13 +274,25 @@ class UsageRecord:
     pricing_version: str | None
     estimated_cost: Decimal | None
     cost_status: str
+    cost_estimate_basis: str = COST_BASIS_NOT_APPLICABLE
+    configured_model_alias: str | None = None
+    resolved_model_name: str | None = None
+    claude_code_version: str | None = None
 
     def __post_init__(self) -> None:
         _require_enum(self.cost_status, COST_STATUSES, "UsageRecord.cost_status")
+        _require_enum(self.cost_estimate_basis, COST_ESTIMATE_BASES, "UsageRecord.cost_estimate_basis")
         if self.cost_status == COST_CALCULATED and self.estimated_cost is None:
             raise EvidenceValidationError("UsageRecord.cost_status=CALCULATED requires estimated_cost")
         if self.cost_status != COST_CALCULATED and self.estimated_cost is not None:
             raise EvidenceValidationError(f"UsageRecord.cost_status={self.cost_status!r} must not carry estimated_cost")
+        if self.cost_estimate_basis == COST_BASIS_SUBSCRIPTION_API_EQUIVALENT_ESTIMATE:
+            if self.provider != "claude_code":
+                raise EvidenceValidationError("subscription API-equivalent estimates require provider=claude_code")
+            if not self.configured_model_alias or not self.resolved_model_name or not self.claude_code_version:
+                raise EvidenceValidationError(
+                    "Claude Code usage requires configured alias, resolved model, and CLI version provenance"
+                )
 
 
 @dataclass(frozen=True)

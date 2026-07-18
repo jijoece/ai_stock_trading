@@ -1,16 +1,6 @@
-# Shadow-operations configuration (Milestone 7, docs/milestone-7.md Step 12).
-# Disabled by default in every dimension: `shadow_operations.enabled: false`
-# and `schedule.enabled: false`. `allow_baseline_paper_submission` and
-# `allow_enhanced_submission` both default false; `allow_enhanced_submission`
-# is structurally impossible to set true — `shadow/config.py`'s
-# `ShadowOperationsConfig.__post_init__` raises if it is ever `true`,
-# mirroring `research/promotion.py::PromotionGateConfig.allow_live_promotion`.
-# No environment variable can flip any of these — `.env` only ever supplies
-# credentials, never a capability decision (mirrors evidence_providers.yaml).
 version: 1
-
 shadow_operations:
-  enabled: false
+  enabled: true
   mode: SHADOW_ENHANCED
   allow_baseline_paper_submission: false
   allow_enhanced_submission: false
@@ -22,12 +12,10 @@ shadow_operations:
   lease_ttl_seconds: 3600
   stale_run_timeout_seconds: 7200
   continue_on_symbol_failure: true
-
 schedule:
-  enabled: false
+  enabled: true
   cadence: DAILY_MARKET_DAY
   intended_local_time: "06:45"
-
 budgets:
   require_pricing_for_real_claude: true
   max_symbols_per_cycle: 10
@@ -51,15 +39,10 @@ budgets:
   max_claude_code_api_equivalent_cost_per_cycle_usd: 5.00
   max_claude_code_api_equivalent_cost_per_day_usd: 10.00
   max_claude_code_api_equivalent_cost_per_month_usd: 100.00
-
 safety:
   pause_on_provider_failure_rate: 0.50
   pause_on_retry_exhaustion_rate: 0.50
   pause_on_unsupported_claim_rate: 0.25
   pause_on_reconciliation_mismatch: true
   pause_on_budget_breach: true
-  # Milestone 11.3 Part 23: below this many provider requests in a cycle,
-  # provider_failure_rate is INSUFFICIENT_DATA, not a computed pass/fail —
-  # a single failed request in a 1-request cycle is not distinguishable
-  # from noise.
   minimum_requests_for_failure_rate: 5

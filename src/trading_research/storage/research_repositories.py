@@ -189,8 +189,9 @@ class SQLiteResearchRepository:
             "(attempt_id, research_run_id, role, attempt_number, prompt_name, prompt_version, prompt_hash, "
             "system_prompt_hash, schema_version, provider, model_name, success, failure_reason, raw_response_json, "
             "validated_payload_json, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, latency_ms, "
-            "provider_request_id, retry_count, pricing_version, estimated_cost, cost_status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "provider_request_id, retry_count, pricing_version, estimated_cost, cost_status, cost_estimate_basis, "
+            "configured_model_alias, resolved_model_name, claude_code_version, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 attempt.attempt_id, attempt.research_run_id, attempt.role, attempt.attempt_number,
                 attempt.prompt_name, attempt.prompt_version, attempt.prompt_hash, attempt.system_prompt_hash,
@@ -201,6 +202,8 @@ class SQLiteResearchRepository:
                 usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens,
                 usage.latency_ms, usage.provider_request_id, usage.retry_count, usage.pricing_version,
                 str(usage.estimated_cost) if usage.estimated_cost is not None else None, usage.cost_status,
+                usage.cost_estimate_basis, usage.configured_model_alias, usage.resolved_model_name,
+                usage.claude_code_version,
                 attempt.created_at.isoformat(),
             ),
         )
@@ -342,7 +345,8 @@ def list_all_attempt_failures(conn: sqlite3.Connection) -> tuple[ResearchValidat
 def list_attempt_usage_rows(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         "SELECT role, provider, model_name, input_tokens, output_tokens, latency_ms, retry_count, success, "
-        "estimated_cost, cost_status FROM research_attempts"
+        "estimated_cost, cost_status, cost_estimate_basis, configured_model_alias, resolved_model_name, "
+        "claude_code_version FROM research_attempts"
     ).fetchall()
     return [dict(r) for r in rows]
 

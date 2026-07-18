@@ -94,6 +94,33 @@ CODE_PERSISTENCE_FAILURE = "PERSISTENCE_FAILURE"
 CODE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 CODE_UNCLASSIFIED_VALIDATION_FAILURE = "UNCLASSIFIED_VALIDATION_FAILURE"
 
+# Locked-down Claude Code subprocess/provider failures. These are intentionally
+# stable, provider-specific categories; raw subprocess diagnostics are never
+# persisted in their place.
+CLAUDE_CODE_FAILURE_CODES = (
+    "CLAUDE_CODE_BINARY_MISSING",
+    "CLAUDE_CODE_BINARY_NOT_EXECUTABLE",
+    "CLAUDE_CODE_VERSION_UNPARSABLE",
+    "CLAUDE_CODE_VERSION_UNSUPPORTED",
+    "CLAUDE_CODE_NOT_AUTHENTICATED",
+    "CLAUDE_CODE_AUTH_STATUS_FAILED",
+    "CLAUDE_CODE_UNEXPECTED_AUTH_METHOD",
+    "CLAUDE_CODE_OAUTH_TOKEN_MISSING",
+    "CLAUDE_CODE_PROCESS_TIMEOUT",
+    "CLAUDE_CODE_PROCESS_EXITED",
+    "CLAUDE_CODE_OUTPUT_OVERFLOW",
+    "CLAUDE_CODE_STDERR_OVERFLOW",
+    "CLAUDE_CODE_INVALID_ENVELOPE",
+    "CLAUDE_CODE_STRUCTURED_OUTPUT_MISSING",
+    "CLAUDE_CODE_USAGE_METADATA_MISSING",
+    "CLAUDE_CODE_CREDIT_EXHAUSTED",
+    "CLAUDE_CODE_RATE_LIMITED",
+    "CLAUDE_CODE_TRANSIENT_FAILURE",
+    "CLAUDE_CODE_SCHEMA_REJECTED",
+    "CLAUDE_CODE_LOCAL_SCHEMA_FAILED",
+    "CLAUDE_CODE_PROMPT_TOO_LARGE",
+)
+
 CODES = (
     CODE_PROVIDER_TIMEOUT,
     CODE_PROVIDER_RATE_LIMITED,
@@ -128,7 +155,7 @@ CODES = (
     CODE_PERSISTENCE_FAILURE,
     CODE_BUDGET_EXHAUSTED,
     CODE_UNCLASSIFIED_VALIDATION_FAILURE,
-)
+) + CLAUDE_CODE_FAILURE_CODES
 
 # Roles this taxonomy accepts beyond the analyst/manager roles — "system" is used for
 # run-level meta-failures (retry exhaustion / manager skip) that are not attributable to
@@ -155,6 +182,11 @@ ALLOWED_METADATA_KEYS = frozenset(
         "tool_use_block_count",
         "blocking_role_count",
         "attempts_made",
+        "exit_code",
+        "stdout_bytes",
+        "stderr_bytes",
+        "claude_code_version",
+        "usage_present",
     }
 )
 

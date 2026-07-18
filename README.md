@@ -96,6 +96,7 @@ python -m trading_research.cli <command> --help
 | Try scoring without credentials | [Quick start](#quick-start-offline-demo) and [deterministic computation](#deterministic-computation) |
 | Fetch real or fixture evidence | [Research and evidence CLI](#research-and-evidence) |
 | Operate shadow research | [Shadow operations CLI](#shadow-operations) and the [shadow runbook](docs/runbooks/shadow-operations.md) |
+| Use Claude Code subscription research | [Production provider guide](docs/claude-code-production-provider.md) |
 | Work with isolated local books | [Current local paper books](#current-local-paper-books) |
 | Run a controlled soak | [Paper-book CLI](#current-local-paper-books) and the [soak runbook](docs/runbooks/controlled-paper-soak.md) |
 | Configure recurring local runs | [Recurring local simulation](#recurring-local-simulation) and its [runbook](docs/runbooks/recurring-local-paper-trading.md) |

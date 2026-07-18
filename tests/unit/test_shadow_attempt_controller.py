@@ -5,9 +5,11 @@ recording idempotency, and the "never fabricate unavailable usage" boundary.
 from __future__ import annotations
 
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -16,6 +18,7 @@ from trading_research.research.orchestration import AttemptControlRequest, Resea
 from trading_research.research.usage import PricingEntry
 from trading_research.shadow import budget as budget_mod
 from trading_research.shadow.attempt_controller import ShadowResearchAttemptController
+from trading_research.shadow import pause as pause_mod
 from trading_research.storage.database import connect
 from trading_research.storage.shadow_operations_repositories import list_role_budget_checks
 
@@ -45,11 +48,12 @@ def _reservation(conn, *, reserved_output_tokens=10_000, reserved_input_tokens=1
         conn, "test-key", intent, estimate, max_actual_cost_per_day_usd=Decimal("100"),
         max_actual_cost_per_month_usd=Decimal("1000"), clock=lambda: NOW,
     )
+    assert isinstance(reservation, budget_mod.ReservationHandle)
     return reservation, pricing[0]
 
 
 def _controller(conn, reservation, pricing, **overrides):
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         conn=conn, reservation=reservation, provider="anthropic", allowed_roles=("fundamental", "manager"),
         max_roles_per_symbol=5, max_attempts_per_role=2, max_output_tokens_per_role=2000,
         max_input_tokens_per_role=20000, max_latency_seconds_per_role=180, pricing=pricing, clock=lambda: NOW,
@@ -66,7 +70,11 @@ def _request(role="fundamental", attempt_number=1):
     )
 
 
-def _attempt(*, attempt_id="run-1-fundamental-1", success=True, input_tokens=100, output_tokens=50, latency_ms=200, provider="anthropic", model_name="claude-test"):
+def _attempt(
+    *, attempt_id="run-1-fundamental-1", success=True, input_tokens: int | None = 100,
+    output_tokens: int | None = 50, latency_ms: int | None = 200,
+    provider="anthropic", model_name="claude-test",
+):
     usage = UsageRecord(
         provider=provider, model_name=model_name, role="fundamental", input_tokens=input_tokens,
         output_tokens=output_tokens, cache_read_tokens=None, cache_write_tokens=None, latency_ms=latency_ms,
@@ -174,3 +182,29 @@ def test_after_attempt_deterministic_provider_charges_zero_cost_when_tokens_pres
     usage_rows = conn.execute("SELECT actual_cost_usd FROM shadow_budget_usage_attempts a JOIN shadow_budget_usage u ON a.usage_id = u.usage_id").fetchall()
     assert len(usage_rows) == 1
     assert Decimal(usage_rows[0]["actual_cost_usd"]) == Decimal("0")
+
+
+def test_claude_code_cycle_call_cap_counts_allowed_failed_or_successful_calls(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(
+        conn, reservation, pricing, provider="claude_code", max_calls_per_cycle=1,
+        max_calls_per_day=30, max_calls_per_month=300,
+        max_api_equivalent_cost_per_call_usd=Decimal("0.50"),
+    )
+    assert controller.before_attempt(_request()).allowed is True
+    denied = controller.before_attempt(_request(role="manager"))
+    assert denied.allowed is False
+    assert "cycle call cap" in (denied.reason or "")
+
+
+def test_claude_code_missing_usage_activates_provider_health_pause(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="claude_code")
+    failed = replace(
+        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="claude_code"),
+        failure_reason="Claude Code usage metadata was missing",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+    assert state.source == pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE

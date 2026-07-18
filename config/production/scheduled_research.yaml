@@ -1,0 +1,22 @@
+version: 1
+scheduled_research:
+  enabled: true
+  universe_id: default_seed_universe
+  max_candidates_per_cycle: 10
+  experiment_policy: SHADOW_ENHANCED
+  submit_paper_orders: false
+  require_complete_evidence: true
+  require_point_in_time_safe: true
+  continue_on_symbol_failure: true
+promotion:
+  enabled: false
+  policy_version: research-promotion.v1
+  minimum_completed_evaluations: 100
+  minimum_market_regimes: 2
+  max_incomplete_analysis_rate: 0.3
+  max_unsupported_claim_rate: 0.05
+  max_provider_failure_rate: 0.2
+  max_retry_rate: 0.5
+  min_reproducibility_rate: 0.95
+  preferred_excess_return_margin: 0.02
+  allow_live_promotion: false

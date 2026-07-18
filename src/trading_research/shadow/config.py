@@ -41,6 +41,18 @@ def _strict_bool(value: object, field_name: str) -> bool:
     return value
 
 
+def _strict_positive_int(value: object, field_name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ShadowOperationsConfigError(f"{field_name} must be a positive integer")
+    return value
+
+
+def _strict_positive_number(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ShadowOperationsConfigError(f"{field_name} must be a positive number")
+    return float(value)
+
+
 @dataclass(frozen=True)
 class ShadowOperationsSection:
     enabled: bool
@@ -99,6 +111,17 @@ class BudgetsSection:
     max_actual_cost_per_day_usd: float
     max_actual_cost_per_month_usd: float
     emergency_margin_fraction: float
+    max_claude_code_calls_per_cycle: int = 10
+    max_claude_code_calls_per_day: int = 30
+    max_claude_code_calls_per_month: int = 300
+    max_claude_code_input_tokens_per_cycle: int = 100000
+    max_claude_code_output_tokens_per_cycle: int = 50000
+    max_claude_code_latency_seconds_per_role: int = 120
+    max_claude_code_latency_seconds_per_cycle: int = 900
+    max_claude_code_api_equivalent_cost_per_call_usd: float = 0.50
+    max_claude_code_api_equivalent_cost_per_cycle_usd: float = 5.00
+    max_claude_code_api_equivalent_cost_per_day_usd: float = 10.00
+    max_claude_code_api_equivalent_cost_per_month_usd: float = 100.00
 
     def __post_init__(self) -> None:
         positive_int_fields = (
@@ -108,10 +131,26 @@ class BudgetsSection:
         for field_name in positive_int_fields:
             if getattr(self, field_name) <= 0:
                 raise ShadowOperationsConfigError(f"budgets.{field_name} must be > 0")
+        for field_name in (
+            "max_claude_code_calls_per_cycle", "max_claude_code_calls_per_day",
+            "max_claude_code_calls_per_month", "max_claude_code_input_tokens_per_cycle",
+            "max_claude_code_output_tokens_per_cycle", "max_claude_code_latency_seconds_per_role",
+            "max_claude_code_latency_seconds_per_cycle",
+        ):
+            if type(getattr(self, field_name)) is not int or getattr(self, field_name) <= 0:
+                raise ShadowOperationsConfigError(f"budgets.{field_name} must be a positive integer")
         positive_cost_fields = (
             "max_estimated_cost_per_cycle_usd", "max_actual_cost_per_day_usd", "max_actual_cost_per_month_usd",
         )
         for field_name in positive_cost_fields:
+            if getattr(self, field_name) <= 0:
+                raise ShadowOperationsConfigError(f"budgets.{field_name} must be > 0")
+        for field_name in (
+            "max_claude_code_api_equivalent_cost_per_call_usd",
+            "max_claude_code_api_equivalent_cost_per_cycle_usd",
+            "max_claude_code_api_equivalent_cost_per_day_usd",
+            "max_claude_code_api_equivalent_cost_per_month_usd",
+        ):
             if getattr(self, field_name) <= 0:
                 raise ShadowOperationsConfigError(f"budgets.{field_name} must be > 0")
         if not (0.0 <= self.emergency_margin_fraction <= 1.0):
@@ -247,6 +286,17 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
             max_actual_cost_per_day_usd=float(budgets["max_actual_cost_per_day_usd"]),
             max_actual_cost_per_month_usd=float(budgets["max_actual_cost_per_month_usd"]),
             emergency_margin_fraction=float(budgets["emergency_margin_fraction"]),
+            max_claude_code_calls_per_cycle=_strict_positive_int(budgets.get("max_claude_code_calls_per_cycle", 10), "budgets.max_claude_code_calls_per_cycle"),
+            max_claude_code_calls_per_day=_strict_positive_int(budgets.get("max_claude_code_calls_per_day", 30), "budgets.max_claude_code_calls_per_day"),
+            max_claude_code_calls_per_month=_strict_positive_int(budgets.get("max_claude_code_calls_per_month", 300), "budgets.max_claude_code_calls_per_month"),
+            max_claude_code_input_tokens_per_cycle=_strict_positive_int(budgets.get("max_claude_code_input_tokens_per_cycle", 100000), "budgets.max_claude_code_input_tokens_per_cycle"),
+            max_claude_code_output_tokens_per_cycle=_strict_positive_int(budgets.get("max_claude_code_output_tokens_per_cycle", 50000), "budgets.max_claude_code_output_tokens_per_cycle"),
+            max_claude_code_latency_seconds_per_role=_strict_positive_int(budgets.get("max_claude_code_latency_seconds_per_role", 120), "budgets.max_claude_code_latency_seconds_per_role"),
+            max_claude_code_latency_seconds_per_cycle=_strict_positive_int(budgets.get("max_claude_code_latency_seconds_per_cycle", 900), "budgets.max_claude_code_latency_seconds_per_cycle"),
+            max_claude_code_api_equivalent_cost_per_call_usd=_strict_positive_number(budgets.get("max_claude_code_api_equivalent_cost_per_call_usd", 0.50), "budgets.max_claude_code_api_equivalent_cost_per_call_usd"),
+            max_claude_code_api_equivalent_cost_per_cycle_usd=_strict_positive_number(budgets.get("max_claude_code_api_equivalent_cost_per_cycle_usd", 5.00), "budgets.max_claude_code_api_equivalent_cost_per_cycle_usd"),
+            max_claude_code_api_equivalent_cost_per_day_usd=_strict_positive_number(budgets.get("max_claude_code_api_equivalent_cost_per_day_usd", 10.00), "budgets.max_claude_code_api_equivalent_cost_per_day_usd"),
+            max_claude_code_api_equivalent_cost_per_month_usd=_strict_positive_number(budgets.get("max_claude_code_api_equivalent_cost_per_month_usd", 100.00), "budgets.max_claude_code_api_equivalent_cost_per_month_usd"),
         )
         safety_section = SafetySection(
             pause_on_provider_failure_rate=float(safety["pause_on_provider_failure_rate"]),

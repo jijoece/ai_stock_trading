@@ -14,20 +14,27 @@ Files:
   `RunAtLoad` is `false`, so even a copy of this file with the suffix
   dropped is inert until an operator explicitly adds a real trigger.
 - `run_shadow_cycle.sh.example` — the wrapper script the plist invokes. It
-  `cd`s into the repository, activates the repository's own `.venv`, and
-  runs `python -m trading_research.cli run-due-shadow-cycle`, redirecting
-  output to a timestamped log file under an operator-configured `LOG_DIR`.
+  reads the Claude subscription OAuth token from Keychain, invokes the
+  repository's `.venv/bin/python` directly, passes explicit production config
+  paths and a bounded symbol array, and runs only `run-due-shadow-cycle`.
+- `store_claude_oauth_token.sh.example` — optional hidden-input Keychain helper.
 
-## What `run-due-shadow-cycle` is, as of this task
+## Authentication and preflight
 
-`shadow/scheduler.py::run_due_shadow_cycle` (the underlying Python callable)
-is implemented and tested. The `run-due-shadow-cycle` CLI subcommand named
-in this artifact **does not exist yet** in `cli.py` — a later task adds the
-thin argparse wrapper. This artifact documents and validates the intended
-invocation ahead of that CLI wiring, per this task's explicit instructions.
-Until that CLI command exists, running the wrapper script will fail with an
-argparse "unknown command" error — this is expected and does not indicate a
-problem with the artifact itself.
+Generate the token interactively without API-key precedence:
+
+```bash
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+/opt/homebrew/bin/claude setup-token
+cp deploy/launchd/store_claude_oauth_token.sh.example deploy/launchd/store_claude_oauth_token.sh
+chmod 700 deploy/launchd/store_claude_oauth_token.sh
+bash deploy/launchd/store_claude_oauth_token.sh
+```
+
+The token is stored under service `agentic-trading-desk-claude-oauth`. Do not
+put it in `.env`, YAML, the plist, logs, or shell history. Validate before
+activation with `python -m trading_research.cli claude-code-provider-preflight
+--research-config config/production/research.yaml`.
 
 ## Exact activation procedure (NOT performed by this task)
 
@@ -39,8 +46,8 @@ problem with the artifact itself.
       deploy/launchd/run_shadow_cycle.sh
    chmod +x deploy/launchd/run_shadow_cycle.sh
    ```
-2. Edit `run_shadow_cycle.sh`: set `REPO_DIR` to this repository's absolute
-   path and `LOG_DIR` to where per-invocation logs should be written.
+2. Edit `run_shadow_cycle.sh`: set absolute `REPO_DIR`/`LOG_DIR`, review the
+   explicit `SYMBOLS=(AAPL)` array, and review all three production profiles.
 3. Edit the copied plist: set `ProgramArguments`' second element to the
    absolute path of your edited `run_shadow_cycle.sh`, set
    `StandardOutPath`/`StandardErrorPath` to real log paths, and uncomment +

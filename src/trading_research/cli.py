@@ -757,8 +757,18 @@ def run_research_cli(snapshot_id: str, provider_name: str, db_path: Path) -> dic
                 api_key=cfg.anthropic_api_key, request_timeout_seconds=research_config.request_timeout_seconds,
                 pricing_entries=load_pricing_config(),
             ))
+        elif provider_name == "claude_code":
+            from .research.claude_code_provider import ClaudeCodeResearchProvider
+            from .research.usage import load_pricing_config
+
+            research_config.require_ready()
+            model_name = research_config.model
+            provider = ClaudeCodeResearchProvider(
+                research_config.build_claude_code_provider_config(pricing_entries=load_pricing_config())
+            )
+            provider.preflight()
         else:
-            return {"error": f"unknown provider {provider_name!r} — must be 'deterministic' or 'anthropic'"}
+            return {"error": f"unknown provider {provider_name!r}"}
 
         repo = SQLiteResearchRepository(conn)
         result = analyze_with_research_committee(
@@ -774,6 +784,52 @@ def run_research_cli(snapshot_id: str, provider_name: str, db_path: Path) -> dic
         "role_reports": [r.role for r in result.role_reports],
         "decision_rating": result.decision.rating if result.decision else None,
         "incomplete_reasons": list(result.incomplete_reasons),
+    }
+
+
+def claude_code_provider_preflight_cli(research_config_path: Path | None = None) -> dict:
+    """Sanitized version/auth readiness only; never makes an inference call."""
+    from .research.claude_code_provider import ClaudeCodeResearchProvider
+    from .research.configuration import load_research_config
+    from .research.usage import load_pricing_config
+
+    config = load_research_config(research_config_path) if research_config_path is not None else load_research_config()
+    config.require_ready()
+    if config.provider != "claude_code":
+        return {
+            "ready": False,
+            "provider": config.provider,
+            "failure_code": "CLAUDE_CODE_NOT_CONFIGURED",
+        }
+    try:
+        provider = ClaudeCodeResearchProvider(
+            config.build_claude_code_provider_config(pricing_entries=load_pricing_config())
+        )
+        result = provider.preflight(force=True)
+    except Exception as exc:
+        return {
+            "ready": False,
+            "provider": "claude_code",
+            "configured_model": config.model,
+            "binary_version": None,
+            "authenticated": False,
+            "authentication_method": None,
+            "failure_code": getattr(exc, "code", "CLAUDE_CODE_PREFLIGHT_FAILED"),
+        }
+    return {
+        "ready": result.ready,
+        "provider": "claude_code",
+        "configured_model": config.model,
+        "binary_version": result.binary_version,
+        "minimum_version_satisfied": True,
+        "oauth_token_present": True,
+        "authenticated": result.authenticated,
+        "authentication_method": result.authentication_method,
+        "usage_metadata_required": True,
+        "failure_code": result.failure_code,
+        "checked_at": result.checked_at.isoformat(),
+        "paper_submission_enabled": False,
+        "external_execution_reachable": False,
     }
 
 
@@ -864,6 +920,7 @@ def research_usage_cli(db_path: Path) -> dict:
     by_role: dict[str, dict] = {}
     total_cost = Decimal("0")
     cost_available = False
+    estimate_bases: set[str] = set()
     for row in rows:
         agg = by_role.setdefault(row["role"], {
             "attempts": 0, "successes": 0, "total_input_tokens": 0, "total_output_tokens": 0,
@@ -879,6 +936,7 @@ def research_usage_cli(db_path: Path) -> dict:
         if row["cost_status"] == "CALCULATED" and row["estimated_cost"] is not None:
             total_cost += Decimal(row["estimated_cost"])
             cost_available = True
+        estimate_bases.add(row["cost_estimate_basis"])
 
     summary = {}
     for role, agg in by_role.items():
@@ -891,6 +949,10 @@ def research_usage_cli(db_path: Path) -> dict:
         "by_role": summary,
         "total_estimated_cost": str(total_cost) if cost_available else None,
         "cost_status": "CALCULATED" if cost_available else "PRICING_NOT_CONFIGURED_OR_NO_USAGE",
+        "cost_estimate_bases": sorted(estimate_bases),
+        "subscription_cost_is_api_equivalent_estimate": (
+            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" in estimate_bases
+        ),
     }
 
 
@@ -1417,7 +1479,15 @@ def _shadow_scheduler_run_view(row: dict) -> dict:
     return dict(row)
 
 
-def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", symbols: list[str] | None = None) -> dict:
+def run_due_shadow_cycle_cli(
+    db_path: Path,
+    *,
+    provider_mode: str = "fixture",
+    symbols: list[str] | None = None,
+    research_config_path: Path | None = None,
+    scheduled_research_config_path: Path | None = None,
+    shadow_config_path: Path | None = None,
+) -> dict:
     """`run-due-shadow-cycle` CLI command (docs/milestone-7.md Step 18/25;
     docs/milestone-7.1.md Step 20). Thin wiring only — delegates entirely to
     `shadow/scheduler.py::run_due_shadow_cycle`. Every successful-no-op
@@ -1458,22 +1528,29 @@ def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", s
     if provider_mode not in (PROVIDER_MODE_FIXTURE, PROVIDER_MODE_REAL):
         return {"error": f"unknown --provider-mode {provider_mode!r} — must be 'fixture' or 'real'", "status": "INTERNAL_ERROR"}
 
-    shadow_config = load_shadow_operations_config()
-    sr_config = load_scheduled_research_config()
+    shadow_config = (
+        load_shadow_operations_config(shadow_config_path) if shadow_config_path is not None
+        else load_shadow_operations_config()
+    )
+    sr_config = (
+        load_scheduled_research_config(scheduled_research_config_path)
+        if scheduled_research_config_path is not None else load_scheduled_research_config()
+    )
     cycle_config = sr_config.to_cycle_configuration(provider_mode=provider_mode)
-    research_config = load_research_config()
+    research_config = load_research_config(research_config_path) if research_config_path is not None else load_research_config()
     pricing_entries = load_pricing_config()
     cfg = load_config()
 
     if provider_mode == PROVIDER_MODE_REAL:
         research_provider_name = research_config.provider
-        research_model_name = research_config.model if research_config.provider == "anthropic" else f"{research_config.provider}-v1"
+        research_model_name = research_config.model if research_config.provider in {"anthropic", "claude_code"} else f"{research_config.provider}-v1"
     else:
         research_provider_name, research_model_name = "deterministic", "deterministic-v1"
 
     # --- Preflight: fail closed BEFORE any lease/budget/DB-session work
     # (docs/milestone-7.1.md Step 21 pricing-failure requirement: "fail
     # before lease work that could spend money, or before any Claude call").
+    real_research_provider = None
     if provider_mode == PROVIDER_MODE_REAL and research_config.provider == "anthropic":
         research_config.require_ready()  # raises ResearchConfigError if model is unset
         if not cfg.anthropic_api_key:
@@ -1489,6 +1566,44 @@ def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", s
                     f"as_of={as_of_date!r} — scheduled real-Claude operation is blocked (fails closed)"
                 ),
                 "status": "PRICING_NOT_CONFIGURED",
+            }
+    elif provider_mode == PROVIDER_MODE_REAL and research_config.provider == "claude_code":
+        from .research.claude_code_provider import ClaudeCodeResearchProvider
+
+        try:
+            research_config.require_ready()
+            as_of_date = datetime.now(_tz.utc).date().isoformat()
+            if select_pricing(pricing_entries, "claude_code", research_model_name or "", as_of_date) is None:
+                return {
+                    "error": "Claude Code API-equivalent pricing is not configured",
+                    "status": "PRICING_NOT_CONFIGURED",
+                }
+            real_research_provider = ClaudeCodeResearchProvider(
+                research_config.build_claude_code_provider_config(pricing_entries=pricing_entries)
+            )
+            # Version/auth preflight happens before opening a DB session, lease,
+            # or budget reservation and consumes no inference call.
+            real_research_provider.preflight()
+        except Exception as exc:
+            try:
+                from .shadow import pause as pause_mod
+
+                with session(db_path) as preflight_conn:
+                    current = pause_mod.current_state(preflight_conn)
+                    if current.state == pause_mod.STATE_ACTIVE:
+                        pause_mod.request_pause(
+                            preflight_conn,
+                            reason=f"Claude Code preflight failed: {getattr(exc, 'code', 'CLAUDE_CODE_PREFLIGHT_FAILED')}",
+                            source=pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE,
+                            target_state=pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
+                            clock=lambda: datetime.now(_tz.utc),
+                        )
+            except Exception:
+                pass
+            return {
+                "error": "Claude Code provider preflight failed",
+                "status": "PROVIDER_PREFLIGHT_FAILED",
+                "failure_code": getattr(exc, "code", "CLAUDE_CODE_PREFLIGHT_FAILED"),
             }
 
     candidate_symbols = tuple(s.upper() for s in symbols) if symbols else (
@@ -1506,6 +1621,9 @@ def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", s
                 api_key=cfg.anthropic_api_key, request_timeout_seconds=research_config.request_timeout_seconds,
                 pricing_entries=pricing_entries,
             ))
+        elif provider_mode == PROVIDER_MODE_REAL and research_config.provider == "claude_code":
+            assert real_research_provider is not None
+            provider = real_research_provider
         else:
             provider = DeterministicResearchProvider()
         return dict(
@@ -1544,6 +1662,10 @@ def run_due_shadow_cycle_cli(db_path: Path, *, provider_mode: str = "fixture", s
         "budget_reservation_id": result.budget_reservation_id, "budget_reserved_usd": result.budget_reserved_usd,
         "budget_consumed_usd": result.budget_consumed_usd, "failure_reason": result.failure_reason,
         "reason": result.reason,
+        "cost_estimate_basis": (
+            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if research_provider_name == "claude_code"
+            else "DIRECT_API_ESTIMATE" if research_provider_name == "anthropic" else "NOT_APPLICABLE"
+        ),
     }
 
 
@@ -1567,7 +1689,9 @@ def shadow_status_cli(db_path: Path) -> dict:
     }
 
 
-def shadow_readiness_cli(db_path: Path) -> dict:
+def shadow_readiness_cli(
+    db_path: Path, *, research_config_path: Path | None = None, shadow_config_path: Path | None = None,
+) -> dict:
     """`shadow-readiness` CLI command (docs/milestone-7.md Step 23/25;
     docs/milestone-7.2.md Part 12 added the `activation_readiness` block —
     an honest manual-vs-recurring activation decision built on top of the
@@ -1579,14 +1703,55 @@ def shadow_readiness_cli(db_path: Path) -> dict:
     from .shadow.config import load_shadow_operations_config
     from .shadow.readiness import build_readiness_report, evaluate_activation_readiness
 
-    shadow_config = load_shadow_operations_config()
+    shadow_config = (
+        load_shadow_operations_config(shadow_config_path) if shadow_config_path is not None
+        else load_shadow_operations_config()
+    )
     now = datetime.now(_tz.utc)
 
     environmentally_blocked_reason = None
+    provider_preflight = None
     try:
-        research_config = load_research_config()
+        research_config = (
+            load_research_config(research_config_path) if research_config_path is not None
+            else load_research_config()
+        )
         if research_config.provider == "anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
             environmentally_blocked_reason = "research.provider=anthropic but ANTHROPIC_API_KEY is absent"
+        elif research_config.provider == "claude_code":
+            from .research.claude_code_provider import ClaudeCodeResearchProvider
+            from .research.usage import load_pricing_config
+
+            try:
+                provider = ClaudeCodeResearchProvider(
+                    research_config.build_claude_code_provider_config(pricing_entries=load_pricing_config())
+                )
+                preflight = provider.preflight()
+                provider_preflight = {
+                    "provider": "claude_code", "configured_model": research_config.model,
+                    "binary_available": True, "binary_version": preflight.binary_version,
+                    "minimum_version_satisfied": True, "oauth_token_present": True,
+                    "authenticated": preflight.authenticated,
+                    "authentication_method": preflight.authentication_method,
+                    "usage_metadata_required": True,
+                    "cost_estimate_basis": "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE",
+                    "paper_submission_enabled": False, "external_execution_reachable": False,
+                }
+            except Exception as exc:
+                environmentally_blocked_reason = (
+                    f"Claude Code preflight failed: {getattr(exc, 'code', 'CLAUDE_CODE_PREFLIGHT_FAILED')}"
+                )
+                provider_preflight = {
+                    "provider": "claude_code", "configured_model": research_config.model,
+                    "binary_available": False, "binary_version": None,
+                    "minimum_version_satisfied": False,
+                    "oauth_token_present": bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")),
+                    "authenticated": False, "authentication_method": None,
+                    "usage_metadata_required": True,
+                    "cost_estimate_basis": "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE",
+                    "failure_code": getattr(exc, "code", "CLAUDE_CODE_PREFLIGHT_FAILED"),
+                    "paper_submission_enabled": False, "external_execution_reachable": False,
+                }
     except Exception:
         pass  # research config errors are reported by other commands; never block readiness reporting itself
 
@@ -1595,6 +1760,25 @@ def shadow_readiness_cli(db_path: Path) -> dict:
         activation = evaluate_activation_readiness(
             conn, now, shadow_config, environmentally_blocked_reason=environmentally_blocked_reason,
         )
+        if provider_preflight is not None and provider_preflight.get("provider") == "claude_code":
+            today_calls = conn.execute(
+                "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+                (now.date().isoformat() + "%",),
+            ).fetchone()[0]
+            month_calls = conn.execute(
+                "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+                (now.strftime("%Y-%m") + "%",),
+            ).fetchone()[0]
+            latest_model = conn.execute(
+                "SELECT resolved_model_name FROM research_attempts WHERE provider = 'claude_code' "
+                "AND resolved_model_name IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            provider_preflight.update({
+                "resolved_model": latest_model[0] if latest_model else None,
+                "cycle_call_budget_available": shadow_config.budgets.max_claude_code_calls_per_cycle > 0,
+                "daily_call_budget_available": today_calls < shadow_config.budgets.max_claude_code_calls_per_day,
+                "monthly_call_budget_available": month_calls < shadow_config.budgets.max_claude_code_calls_per_month,
+            })
 
     return {
         "as_of": report.as_of.isoformat(), "policy_version": report.policy_version,
@@ -1616,6 +1800,7 @@ def shadow_readiness_cli(db_path: Path) -> dict:
         "reconciliation_mismatch_count": report.reconciliation_mismatch_count,
         "alert_delivery_failure_count": report.alert_delivery_failure_count, "reasons": list(report.reasons),
         "activation_readiness": {"status": activation.status, "reasons": list(activation.reasons)},
+        "provider_preflight": provider_preflight,
     }
 
 
@@ -1645,9 +1830,12 @@ def shadow_budget_status_cli(db_path: Path) -> dict:
 
     from .shadow import budget as budget_mod
     from .shadow.config import load_shadow_operations_config
+    from .research.configuration import load_research_config
     from .storage.shadow_operations_repositories import list_budget_reservations, list_budget_usage
 
     shadow_config = load_shadow_operations_config()
+    research_config = load_research_config()
+    is_claude_code = research_config.provider == "claude_code"
     now = datetime.now(_tz.utc)
     today_prefix = now.date().isoformat()
     month_prefix = now.strftime("%Y-%m")
@@ -1656,19 +1844,43 @@ def shadow_budget_status_cli(db_path: Path) -> dict:
         today_usage = list_budget_usage(conn, usage_date_prefix=today_prefix)
         month_usage = list_budget_usage(conn, usage_date_prefix=month_prefix)
         live_reservations = list_budget_reservations(conn, status=budget_mod.RESERVATION_STATUS_RESERVED)
+        claude_calls_today = conn.execute(
+            "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+            (today_prefix + "%",),
+        ).fetchone()[0]
+        claude_calls_month = conn.execute(
+            "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
+            (month_prefix + "%",),
+        ).fetchone()[0]
 
     spent_today = sum((Decimal(r["actual_cost_usd"]) for r in today_usage), Decimal("0"))
     spent_month = sum((Decimal(r["actual_cost_usd"]) for r in month_usage), Decimal("0"))
     live_reserved = sum((Decimal(r["reserved_estimated_cost_usd"]) for r in live_reservations), Decimal("0"))
+    daily_cap = Decimal(str(
+        shadow_config.budgets.max_claude_code_api_equivalent_cost_per_day_usd if is_claude_code
+        else shadow_config.budgets.max_actual_cost_per_day_usd
+    ))
+    monthly_cap = Decimal(str(
+        shadow_config.budgets.max_claude_code_api_equivalent_cost_per_month_usd if is_claude_code
+        else shadow_config.budgets.max_actual_cost_per_month_usd
+    ))
 
     return {
         "as_of": now.isoformat(),
-        "daily_cap_usd": str(shadow_config.budgets.max_actual_cost_per_day_usd),
-        "monthly_cap_usd": str(shadow_config.budgets.max_actual_cost_per_month_usd),
+        "provider": research_config.provider,
+        "cost_estimate_basis": (
+            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if is_claude_code else "DIRECT_API_ESTIMATE"
+        ),
+        "daily_cap_usd": str(daily_cap),
+        "monthly_cap_usd": str(monthly_cap),
         "spent_today_usd": str(spent_today), "spent_month_usd": str(spent_month),
         "live_reserved_usd": str(live_reserved), "live_reservation_count": len(live_reservations),
-        "remaining_today_usd": str(Decimal(shadow_config.budgets.max_actual_cost_per_day_usd) - spent_today - live_reserved),
-        "remaining_month_usd": str(Decimal(shadow_config.budgets.max_actual_cost_per_month_usd) - spent_month - live_reserved),
+        "remaining_today_usd": str(daily_cap - spent_today - live_reserved),
+        "remaining_month_usd": str(monthly_cap - spent_month - live_reserved),
+        "claude_code_calls_today": claude_calls_today,
+        "claude_code_calls_month": claude_calls_month,
+        "claude_code_daily_call_cap": shadow_config.budgets.max_claude_code_calls_per_day,
+        "claude_code_monthly_call_cap": shadow_config.budgets.max_claude_code_calls_per_month,
     }
 
 
@@ -2113,7 +2325,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run_research = sub.add_parser("run-research", help="Invoke the research committee for a persisted evidence snapshot (Milestone 5)")
     p_run_research.add_argument("--snapshot-id", required=True)
-    p_run_research.add_argument("--provider", choices=("deterministic", "anthropic"), default="deterministic")
+    p_run_research.add_argument("--provider", choices=("deterministic", "anthropic", "claude_code"), default="deterministic")
+
+    p_claude_code_preflight = sub.add_parser(
+        "claude-code-provider-preflight",
+        help="Check Claude Code version and subscription OAuth status without an inference call",
+    )
+    p_claude_code_preflight.add_argument("--research-config", type=Path, default=None)
 
     p_replay_research = sub.add_parser("replay-research", help="Deterministically replay a persisted research run — never calls a provider (Milestone 5)")
     p_replay_research.add_argument("--research-run-id", required=True)
@@ -2167,10 +2385,15 @@ def main(argv: list[str] | None = None) -> int:
     p_run_due_shadow_cycle = sub.add_parser("run-due-shadow-cycle", help="Single-invocation scheduler entry point for shadow operations (Milestone 7)")
     p_run_due_shadow_cycle.add_argument("--provider-mode", choices=("fixture", "real"), default="fixture")
     p_run_due_shadow_cycle.add_argument("--symbol", dest="symbols", action="append", help="Repeatable; required for --provider-mode real")
+    p_run_due_shadow_cycle.add_argument("--research-config", type=Path, default=None)
+    p_run_due_shadow_cycle.add_argument("--scheduled-research-config", type=Path, default=None)
+    p_run_due_shadow_cycle.add_argument("--shadow-config", type=Path, default=None)
 
     sub.add_parser("shadow-status", help="Current pause/kill state and recent shadow scheduler runs (Milestone 7)")
 
-    sub.add_parser("shadow-readiness", help="Shadow-operations readiness report (Milestone 7)")
+    p_shadow_readiness = sub.add_parser("shadow-readiness", help="Shadow-operations readiness report (Milestone 7)")
+    p_shadow_readiness.add_argument("--research-config", type=Path, default=None)
+    p_shadow_readiness.add_argument("--shadow-config", type=Path, default=None)
 
     p_shadow_run_history = sub.add_parser("shadow-run-history", help="Recent shadow scheduler runs/summaries (Milestone 7)")
     p_shadow_run_history.add_argument("--status", default=None)
@@ -2543,6 +2766,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 
+    if args.command == "claude-code-provider-preflight":
+        outcome = claude_code_provider_preflight_cli(args.research_config)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if outcome.get("ready") else 2
+
     if args.command == "research-failures":
         cfg = load_config()
         outcome = research_failures_cli(
@@ -2608,7 +2836,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run-due-shadow-cycle":
         cfg = load_config()
-        outcome = run_due_shadow_cycle_cli(cfg.research_database_path, provider_mode=args.provider_mode, symbols=args.symbols)
+        outcome = run_due_shadow_cycle_cli(
+            cfg.research_database_path,
+            provider_mode=args.provider_mode,
+            symbols=args.symbols,
+            research_config_path=args.research_config,
+            scheduled_research_config_path=args.scheduled_research_config,
+            shadow_config_path=args.shadow_config,
+        )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
@@ -2620,7 +2855,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "shadow-readiness":
         cfg = load_config()
-        outcome = shadow_readiness_cli(cfg.research_database_path)
+        outcome = shadow_readiness_cli(
+            cfg.research_database_path,
+            research_config_path=args.research_config,
+            shadow_config_path=args.shadow_config,
+        )
         print(json.dumps(outcome, indent=2, default=str))
         return 0
 

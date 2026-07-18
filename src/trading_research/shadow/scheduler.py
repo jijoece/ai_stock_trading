@@ -618,14 +618,25 @@ def run_due_shadow_cycle(
         symbols = candidate_symbols()
         bounded_symbols = tuple(symbols[: shadow_config.budgets.max_symbols_per_cycle])
 
+        is_claude_code = research_provider_name == "claude_code"
         intent = budget_mod.CycleIntent(
             provider=research_provider_name, model_name=research_model_name,
             max_symbols_per_cycle=shadow_config.budgets.max_symbols_per_cycle,
             max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
             max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
-            max_output_tokens_per_cycle=shadow_config.budgets.max_output_tokens_per_cycle,
-            max_input_tokens_per_cycle=shadow_config.budgets.max_input_tokens_per_cycle,
-            max_latency_seconds_per_cycle=shadow_config.budgets.max_latency_seconds_per_cycle,
+            max_output_tokens_per_cycle=(
+                shadow_config.budgets.max_claude_code_output_tokens_per_cycle if is_claude_code
+                else shadow_config.budgets.max_output_tokens_per_cycle
+            ),
+            max_input_tokens_per_cycle=(
+                shadow_config.budgets.max_claude_code_input_tokens_per_cycle if is_claude_code
+                else shadow_config.budgets.max_input_tokens_per_cycle
+            ),
+            max_latency_seconds_per_cycle=(
+                shadow_config.budgets.max_claude_code_latency_seconds_per_cycle if is_claude_code
+                else shadow_config.budgets.max_latency_seconds_per_cycle
+            ),
+            max_calls_per_cycle=(shadow_config.budgets.max_claude_code_calls_per_cycle if is_claude_code else None),
         )
         # `intent.provider`/`.model_name` come directly from the caller's
         # `research_provider_name`/`research_model_name` — the actual
@@ -664,12 +675,31 @@ def run_due_shadow_cycle(
                 failure_reason=str(exc), lease_owner=lease_owner, reason="pricing required but not configured",
             )
 
-        reservation_result = budget_mod.reserve_budget(
+        if (
+            is_claude_code and estimate.estimated_cost_usd is not None
+            and estimate.estimated_cost_usd
+            > Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_cycle_usd))
+        ):
+            reservation_result = budget_mod.BudgetRejected(
+                idempotency_key=f"shadow-budget:{intended_schedule_id}",
+                reason="Claude Code cycle API-equivalent cost cap would be exceeded",
+                cap_name="claude_code_cycle_api_equivalent_cost",
+                remaining=Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_cycle_usd)),
+                requested=estimate.estimated_cost_usd,
+            )
+        else:
+            reservation_result = budget_mod.reserve_budget(
             conn, f"shadow-budget:{intended_schedule_id}", intent, estimate,
-            max_actual_cost_per_day_usd=Decimal(str(shadow_config.budgets.max_actual_cost_per_day_usd)),
-            max_actual_cost_per_month_usd=Decimal(str(shadow_config.budgets.max_actual_cost_per_month_usd)),
+            max_actual_cost_per_day_usd=Decimal(str(
+                shadow_config.budgets.max_claude_code_api_equivalent_cost_per_day_usd if is_claude_code
+                else shadow_config.budgets.max_actual_cost_per_day_usd
+            )),
+            max_actual_cost_per_month_usd=Decimal(str(
+                shadow_config.budgets.max_claude_code_api_equivalent_cost_per_month_usd if is_claude_code
+                else shadow_config.budgets.max_actual_cost_per_month_usd
+            )),
             clock=clock,
-        )
+            )
         if isinstance(reservation_result, budget_mod.BudgetRejected):
             _save_failed_run(
                 conn, scheduler_run_id=scheduler_run_id, intended_schedule_id=intended_schedule_id,
@@ -710,22 +740,40 @@ def run_due_shadow_cycle(
         # `research_roles=None` (every existing caller/test) preserves prior
         # behavior exactly — no per-attempt enforcement, `attempt_controller_
         # factory=None` passed to `run_cycle` unchanged from before this task.
-        attempt_controller_factory = None
+        attempt_controller_factory: Callable[[str], attempt_controller_mod.ShadowResearchAttemptController] | None = None
         if research_roles is not None:
             pricing_for_roles = usage_mod.select_pricing(
                 pricing_entries, intent.provider, intent.model_name or "", now.date().isoformat(),
             )
 
-            def attempt_controller_factory(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
+            def _build_attempt_controller(symbol: str) -> attempt_controller_mod.ShadowResearchAttemptController:
+                per_call_divisor = max(1, shadow_config.budgets.max_claude_code_calls_per_cycle)
                 return attempt_controller_mod.ShadowResearchAttemptController(
                     conn=conn, reservation=reservation, provider=intent.provider, allowed_roles=research_roles,
                     max_roles_per_symbol=shadow_config.budgets.max_roles_per_symbol,
                     max_attempts_per_role=shadow_config.budgets.max_attempts_per_role,
-                    max_output_tokens_per_role=shadow_config.budgets.max_output_tokens_per_cycle,
-                    max_input_tokens_per_role=shadow_config.budgets.max_input_tokens_per_cycle,
-                    max_latency_seconds_per_role=shadow_config.budgets.max_latency_seconds_per_cycle,
+                    max_output_tokens_per_role=(
+                        shadow_config.budgets.max_claude_code_output_tokens_per_cycle // per_call_divisor
+                        if is_claude_code else shadow_config.budgets.max_output_tokens_per_cycle
+                    ),
+                    max_input_tokens_per_role=(
+                        shadow_config.budgets.max_claude_code_input_tokens_per_cycle // per_call_divisor
+                        if is_claude_code else shadow_config.budgets.max_input_tokens_per_cycle
+                    ),
+                    max_latency_seconds_per_role=(
+                        shadow_config.budgets.max_claude_code_latency_seconds_per_role
+                        if is_claude_code else shadow_config.budgets.max_latency_seconds_per_cycle
+                    ),
                     pricing=pricing_for_roles, clock=clock, scheduler_run_id=scheduler_run_id, cycle_id=None,
+                    max_calls_per_cycle=(shadow_config.budgets.max_claude_code_calls_per_cycle if is_claude_code else None),
+                    max_calls_per_day=(shadow_config.budgets.max_claude_code_calls_per_day if is_claude_code else None),
+                    max_calls_per_month=(shadow_config.budgets.max_claude_code_calls_per_month if is_claude_code else None),
+                    max_api_equivalent_cost_per_call_usd=(
+                        Decimal(str(shadow_config.budgets.max_claude_code_api_equivalent_cost_per_call_usd))
+                        if is_claude_code else None
+                    ),
                 )
+            attempt_controller_factory = _build_attempt_controller
 
         # --- Step 6: record run start. ---------------------------------------
         start_time = clock()

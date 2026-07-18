@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+read -r -s -p "Claude Code OAuth token: " CLAUDE_TOKEN
+printf '\n'
+if [[ -z "$CLAUDE_TOKEN" ]]; then
+  echo "token must not be empty" >&2
+  exit 1
+fi
+/usr/bin/security add-generic-password \
+  -U \
+  -a "$USER" \
+  -s agentic-trading-desk-claude-oauth \
+  -w "$CLAUDE_TOKEN"
+unset CLAUDE_TOKEN
