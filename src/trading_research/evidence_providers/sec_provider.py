@@ -20,7 +20,7 @@ were genuinely knowable at that time).
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Mapping
 
@@ -39,6 +39,23 @@ DEFAULT_USER_AGENT = "agentic-trading-desk-milestone6 research (contact: researc
 def _parse_accepted_at(raw: str) -> datetime:
     # SEC format: "2026-06-17T22:40:43.000Z"
     return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+
+
+def _date_only_conservative_available_at(filed_date: date) -> datetime:
+    """Milestone 11.3 Part 31: `get_company_facts`'s `filed` field is a
+    DATE only, not a timestamp — SEC accepts filings throughout the trading
+    day (up to ~22:00 UTC / 5:30pm ET for same-day acceptance), so treating
+    a date-only fact as available starting at 00:00 UTC on that date (the
+    previous behavior) let a same-day morning `as_of` see a fact that, in
+    reality, may not have been filed until that afternoon — a real
+    look-ahead bias. Conservatively, a date-only fact is only treated as
+    available starting at 00:00 UTC on the *next* calendar day — a full
+    day's buffer, so no same-day `as_of` (at any hour) can see it, and the
+    fact becomes visible from the first `as_of` on the following day
+    onward. This is intentionally conservative (may treat a fact as
+    unavailable slightly longer than reality) rather than optimistic."""
+    next_day = filed_date + timedelta(days=1)
+    return datetime(next_day.year, next_day.month, next_day.day, tzinfo=timezone.utc)
 
 
 class SecEdgarClient:
@@ -148,7 +165,10 @@ class SecEdgarClient:
                     if not filed_raw:
                         continue
                     filed_at = date.fromisoformat(filed_raw)
-                    if datetime(filed_at.year, filed_at.month, filed_at.day, tzinfo=timezone.utc) > as_of:
+                    # Part 31: date-only `filed` is conservatively available
+                    # only from the next UTC day — see
+                    # _date_only_conservative_available_at's docstring.
+                    if _date_only_conservative_available_at(filed_at) > as_of:
                         continue  # restated/late-filed value not yet known as of as_of — no look-ahead
                     try:
                         value = Decimal(str(entry["val"]))

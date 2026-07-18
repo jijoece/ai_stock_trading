@@ -8,6 +8,9 @@ A personal AI-assisted stock research and paper-trading desk that combines a **d
 
 The ruling principle: **Python computes; Claude explains; you decide and approve.**
 
+For the canonical map of current, operational, architectural, and historical
+documentation, see [`docs/INDEX.md`](docs/INDEX.md).
+
 ---
 
 ## Table of Contents
@@ -311,12 +314,19 @@ python -m trading_research.cli analyze <TICKER>
 # Run the full screening pass
 python -m trading_research.cli run-screen
 
-# Show current paper portfolio status
-python -m trading_research.cli paper-status
+# Show current paper portfolio status (active subsystem)
+python -m trading_research.cli paper-book-show --book-id BASELINE
 
 # Run evaluation metrics
 python -m trading_research.cli evaluate
 ```
+
+The legacy pre-`paper_books` ledger (Milestone 3/4) is quarantined behind
+`legacy-paper-*` command names plus a required
+`--i-understand-this-is-the-legacy-ledger` flag (Milestone 11.3 Part 33) —
+it uses a separate set of database tables and cannot feed campaigns,
+recurring scheduling, or external execution. Prefer the `paper-book-*` /
+`external-paper-*` commands documented below for anything current.
 
 ### Shadow Operations
 

@@ -144,6 +144,16 @@ class CycleHealthInputs:
     duplicate_prevention_violation: bool
     cycle_duration_seconds: float | None
     budget_breached: bool = False
+    # Milestone 11.3 Part 23: sample-size context for provider_failure_rate.
+    # `None` means "caller did not supply a count" (treated as unlimited —
+    # preserves pre-Part-23 behavior for any caller not yet updated).
+    # `provider_severe_error=True` bypasses the sample floor entirely — an
+    # explicit, unambiguous provider outage signal (e.g. a connection
+    # refused / auth-rejected on every attempt) must still pause
+    # immediately even from a single request, distinct from "a noisy 1-of-1
+    # rate looks bad but might just be one flaky call."
+    provider_request_count: int | None = None
+    provider_severe_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +169,12 @@ class HealthPolicyConfig:
     pause_on_reconciliation_mismatch: bool
     pause_on_budget_breach: bool
     max_cycle_duration_seconds: int | None = None
+    # Milestone 11.3 Part 23: below this many provider requests this cycle,
+    # provider_failure_rate is INSUFFICIENT_DATA rather than a computed
+    # pass/fail/degraded rate — a 1-of-1 failure is not distinguishable from
+    # noise. Default of 1 preserves prior behavior (every non-empty sample
+    # was evaluated) for any config that hasn't set this explicitly.
+    minimum_requests_for_failure_rate: int = 1
 
     @classmethod
     def from_shadow_config(cls, config: ShadowOperationsConfiguration, *, policy_version: str = POLICY_VERSION) -> "HealthPolicyConfig":
@@ -170,6 +186,7 @@ class HealthPolicyConfig:
             pause_on_reconciliation_mismatch=config.safety.pause_on_reconciliation_mismatch,
             pause_on_budget_breach=config.safety.pause_on_budget_breach,
             max_cycle_duration_seconds=config.budgets.max_latency_seconds_per_cycle,
+            minimum_requests_for_failure_rate=config.safety.minimum_requests_for_failure_rate,
         )
 
 
@@ -242,6 +259,7 @@ def _worse(a: str, b: str) -> str:
 
 def _rate_check(
     *, check_name: str, value: float | None, threshold: float, label: str, applicable: bool = True,
+    sample_size: int | None = None, minimum_sample_size: int | None = None, sample_floor_bypassed: bool = False,
 ) -> tuple[HealthCheckResult, str | None, str | None]:
     """Builds one rate-vs-pause-threshold `HealthCheckResult`, PLUS returns
     `(reason_text_or_None, degraded_reason_text_or_None)` so
@@ -250,7 +268,15 @@ def _rate_check(
     duplicating the comparison logic. `pause_flag_enabled` reflects whether
     the caller's `threshold > 0` (a `0.0` threshold means "never auto-pause
     for this dimension," matching `apply_health_result`'s own
-    `boolish_flags` interpretation)."""
+    `boolish_flags` interpretation).
+
+    Milestone 11.3 Part 23 sample floor: when `sample_size` and
+    `minimum_sample_size` are both given and `sample_size <
+    minimum_sample_size` (and `sample_floor_bypassed` is not set — e.g. an
+    explicit severe provider error), the check is INSUFFICIENT_DATA rather
+    than a computed PASS/WARNING/FAIL — a small sample's rate is not
+    treated as either "healthy" or an automatic outage. `input_value` still
+    reports the raw computed rate (not hidden) so it remains observable."""
     pause_flag_enabled = threshold > 0
     degraded_threshold = threshold * DEGRADED_FRACTION_OF_PAUSE_THRESHOLD
     if value is None:
@@ -259,6 +285,21 @@ def _rate_check(
             threshold_value=_fmt(threshold), threshold_unit="fraction", comparison=">",
             applicable=applicable, pause_flag_enabled=pause_flag_enabled,
             reason=f"no data this cycle for {label} — not fabricated as 0.0",
+        )
+        return check, None, None
+    below_sample_floor = (
+        not sample_floor_bypassed and sample_size is not None and minimum_sample_size is not None
+        and sample_size < minimum_sample_size
+    )
+    if below_sample_floor:
+        check = HealthCheckResult(
+            check_name=check_name, status=CHECK_STATUS_INSUFFICIENT_DATA, input_value=_fmt(value), input_unit="fraction",
+            threshold_value=_fmt(threshold), threshold_unit="fraction", comparison=">",
+            applicable=applicable, pause_flag_enabled=pause_flag_enabled,
+            reason=(
+                f"{label} sample size {sample_size} < minimum {minimum_sample_size} required for a failure-rate "
+                "verdict — not treated as pass or automatic pause"
+            ),
         )
         return check, None, None
     if value > threshold:
@@ -321,6 +362,8 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
     check, fail_reason, degraded_reason = _rate_check(
         check_name=CHECK_NAME_PROVIDER_FAILURE_RATE, value=provider_failure_rate,
         threshold=config.pause_on_provider_failure_rate, label="provider_failure_rate",
+        sample_size=inputs.provider_request_count, minimum_sample_size=config.minimum_requests_for_failure_rate,
+        sample_floor_bypassed=inputs.provider_severe_error,
     )
     checks[CHECK_NAME_PROVIDER_FAILURE_RATE] = check
     if fail_reason:

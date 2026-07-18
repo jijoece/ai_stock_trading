@@ -114,6 +114,12 @@ class SafetySection:
     pause_on_unsupported_claim_rate: float
     pause_on_reconciliation_mismatch: bool
     pause_on_budget_breach: bool
+    # Milestone 11.3 Part 23: below this many provider requests in a cycle,
+    # provider_failure_rate is INSUFFICIENT_DATA, not a computed pass/fail —
+    # not a required key (defaults to 1, preserving prior "evaluate every
+    # non-empty sample" behavior for configs written before this field
+    # existed).
+    minimum_requests_for_failure_rate: int = 1
 
     def __post_init__(self) -> None:
         rate_fields = (
@@ -123,6 +129,8 @@ class SafetySection:
             value = getattr(self, field_name)
             if not (0.0 <= value <= 1.0):
                 raise ShadowOperationsConfigError(f"safety.{field_name} must be in [0,1]")
+        if type(self.minimum_requests_for_failure_rate) is not int or self.minimum_requests_for_failure_rate < 1:
+            raise ShadowOperationsConfigError("safety.minimum_requests_for_failure_rate must be an integer >= 1")
 
 
 @dataclass(frozen=True)
@@ -225,6 +233,7 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
             pause_on_unsupported_claim_rate=float(safety["pause_on_unsupported_claim_rate"]),
             pause_on_reconciliation_mismatch=bool(safety["pause_on_reconciliation_mismatch"]),
             pause_on_budget_breach=bool(safety["pause_on_budget_breach"]),
+            minimum_requests_for_failure_rate=int(safety.get("minimum_requests_for_failure_rate", 1)),
         )
     except ShadowOperationsConfigError:
         raise

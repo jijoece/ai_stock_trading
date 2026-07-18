@@ -104,10 +104,50 @@ def _looks_like_cover_page_checkbox_context(text: str, match: re.Match, *, windo
     return any(marker in preceding for marker in _COVER_PAGE_CHECKBOX_MARKERS)
 
 
+# Milestone 11.3 Part 29: a going-concern-shaped match can be negated
+# ("no substantial doubt ... ability to continue as a going concern") or
+# alleviated after the fact ("substantial doubt ... has since been
+# alleviated" / "conditions no longer raise substantial doubt"). Neither is
+# an active finding. Two narrow, separately-scoped checks (rather than one
+# wide fuzzy window) keep this from also suppressing genuine positives:
+#
+# * pre-negation: "no"/"not" directly and immediately in front of the
+#   "substantial doubt" token itself (not anywhere in a wide preceding
+#   window, where an unrelated "no" — e.g. "no plans have been finalized"
+#   — would falsely demote a real finding);
+# * post-alleviation: a resolution verb (alleviated/resolved/mitigated/
+#   eliminated) appearing anywhere shortly after the matched phrase.
+_PRE_NEGATION_RE = re.compile(r"\b(?:no|not|none|never|no\s+longer)\b\s*(?:[a-z]+\s+){0,3}$", re.IGNORECASE)
+_POST_ALLEVIATION_RE = re.compile(r"\b(?:alleviat\w*|resolv\w*|mitigat\w*|eliminat\w*)\b", re.IGNORECASE)
+
+_PRE_NEGATION_WINDOW_CHARS = 40
+_POST_ALLEVIATION_WINDOW_CHARS = 120
+
+
+def _normalize_whitespace(text: str) -> str:
+    """Collapse newlines/repeated whitespace (common after HTML-table or
+    line-broken filing text) so a negation/alleviation cue split across
+    lines is still detected as adjacent."""
+    return re.sub(r"\s+", " ", text)
+
+
+def _looks_negated_or_alleviated(text: str, match: re.Match) -> bool:
+    preceding = _normalize_whitespace(text[max(0, match.start() - _PRE_NEGATION_WINDOW_CHARS):match.start()])
+    if _PRE_NEGATION_RE.search(preceding):
+        return True
+    following = _normalize_whitespace(text[match.end():match.end() + _POST_ALLEVIATION_WINDOW_CHARS])
+    if _POST_ALLEVIATION_RE.search(following):
+        return True
+    return False
+
+
 def _find_first_valid_explicit_match(text: str, pattern: re.Pattern) -> re.Match | None:
     for candidate in pattern.finditer(text):
-        if not _looks_like_cover_page_checkbox_context(text, candidate):
-            return candidate
+        if _looks_like_cover_page_checkbox_context(text, candidate):
+            continue
+        if _looks_negated_or_alleviated(text, candidate):
+            continue
+        return candidate
     return None
 
 _BANKRUPTCY_EXPLICIT_RE = re.compile(

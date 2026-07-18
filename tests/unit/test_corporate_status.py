@@ -33,6 +33,7 @@ AS_OF = datetime(2026, 7, 11, 13, 0, tzinfo=timezone.utc)
 def _client(handler, *, max_attempts=2) -> SecEdgarClient:
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"User-Agent": "test-agent contact@example.com"},
         rate_limiter=MinIntervalRateLimiter(0.0, sleep_fn=lambda s: None),
         max_attempts=max_attempts, transport=transport, provider="sec-edgar",

@@ -19,8 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-WORKSPACE = Path(__file__).resolve().parents[3]  # workspace/
-ROOT = WORKSPACE / "agentic-trading-desk"
+ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = ROOT / "scripts"
 
 

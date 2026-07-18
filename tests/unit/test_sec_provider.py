@@ -58,6 +58,7 @@ COMPANY_FACTS_BODY = {
 def _client(handler, *, max_attempts=2) -> SecEdgarClient:
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"User-Agent": "test-agent contact@example.com"},
         rate_limiter=MinIntervalRateLimiter(0.0, sleep_fn=lambda s: None),
         max_attempts=max_attempts, transport=transport, provider="sec-edgar",
@@ -66,7 +67,7 @@ def _client(handler, *, max_attempts=2) -> SecEdgarClient:
 
 
 def test_requires_compliant_user_agent():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     with pytest.raises(ProviderConfigurationError):
         SecEdgarClient(http_client=http, user_agent="no-contact-info")
 

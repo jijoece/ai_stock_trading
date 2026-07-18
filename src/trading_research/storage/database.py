@@ -13,6 +13,7 @@ from .migrations import apply_schema
 from .paper_books_schema import apply_paper_books_schema
 from .research_cycle_schema import apply_research_cycle_schema
 from .research_schema import apply_research_schema
+from .schema_version import apply_pending_schema_migrations, check_schema_not_forward_versioned
 from .shadow_alerts_schema import apply_shadow_alerts_schema
 from .shadow_operations_schema import apply_shadow_operations_schema
 from .trading_schema import apply_trading_schema
@@ -50,6 +51,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    check_schema_not_forward_versioned(conn)
     apply_schema(conn)
     apply_trading_schema(conn)
     apply_execution_schema(conn)
@@ -61,6 +63,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     apply_shadow_operations_schema(conn)
     apply_shadow_alerts_schema(conn)
     apply_paper_books_schema(conn)
+    apply_pending_schema_migrations(conn)
     return conn
 
 

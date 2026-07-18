@@ -36,6 +36,7 @@ FUTURE_BAR_BODY = {
 def _client(handler) -> AlpacaMarketDataClient:
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=MinIntervalRateLimiter(0.0), transport=transport, provider="alpaca-data",
     )
@@ -43,7 +44,7 @@ def _client(handler) -> AlpacaMarketDataClient:
 
 
 def test_requires_credentials():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     with pytest.raises(ProviderConfigurationError):
         AlpacaMarketDataClient(api_key=None, api_secret="s", http_client=http)
     with pytest.raises(ProviderConfigurationError):

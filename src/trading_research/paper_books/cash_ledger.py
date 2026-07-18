@@ -6,11 +6,35 @@ single overwritable balance (contrast with the legacy
 `docs/adr/0006...md` Decision 1/3). Reserved cash is tracked separately from
 settled cash. No function here ever produces negative available cash; a
 reservation that would do so raises `InsufficientCashError` instead.
+
+Settlement policy (Milestone 11.3 Part 32, explicit by design):
+`settle_buy`/`settle_sell` apply a fill's cash effect **immediately**, in
+the same transaction as the fill itself — there is no separate T+1 (or any
+other deferred) settlement step. This is `SETTLEMENT_POLICY_VERSION`
+(`IMMEDIATE_SIMULATED_SETTLEMENT.v1`), a deliberate simulation
+simplification, never real broker/regulatory settlement (which is
+typically T+1 for US equities). Every buying-power, risk, and reservation
+calculation in this subsystem (`available_cash`, `reserved_cash`,
+`settled_cash`, `reserve_for_order`) reads from the *same* immediately-
+settled ledger, so there is no internal inconsistency between "settled"
+and "available" — they differ only by open reservations, never by a
+settlement lag. Any future T+1 implementation would need to introduce a
+genuinely separate pending-settlement state and thread
+`SETTLEMENT_POLICY_VERSION` through every consumer that currently assumes
+immediate settlement; until then this constant is the single source of
+truth for which policy is active.
 """
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+
+# Milestone 11.3 Part 32: explicit, versioned settlement policy. Bump the
+# version suffix (not the identifier) if the *mechanics* of immediate
+# settlement ever change in a way that would affect a recomputed snapshot
+# hash; introduce a new identifier entirely (e.g.
+# "MARKET_DAY_T_PLUS_1.v1") only if/when true deferred settlement is built.
+SETTLEMENT_POLICY_VERSION = "IMMEDIATE_SIMULATED_SETTLEMENT.v1"
 
 from ..storage import paper_books_repositories as repo
 from ..storage.database import begin_immediate

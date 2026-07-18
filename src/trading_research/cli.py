@@ -2042,22 +2042,63 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze = sub.add_parser("analyze", help="Analyze one ticker on mocked data")
     p_analyze.add_argument("ticker")
 
-    sub.add_parser("paper-status", help="Show paper ledger state")
+    # Milestone 11.3 Part 33: the legacy `paper/ledger.py` subsystem (Milestone
+    # 3/4, predates the isolated `paper_books` subsystem hardened through
+    # Milestone 11.2) is quarantined behind a `legacy-paper-*` command-name
+    # prefix plus a required `--i-understand-this-is-the-legacy-ledger` flag,
+    # so it can never be confused with, or accidentally invoked instead of,
+    # the active `paper-book-*`/`external-paper-*` commands. It uses a wholly
+    # separate set of database tables (`simulated_*`/`paper_cash_state`/
+    # `paper_execution_*`, not any `paper_book_*`/`paper_external_*` table)
+    # and cannot feed campaigns, recurring scheduling, or external execution
+    # — none of those subsystems import `paper.ledger` or read its tables.
+    # Retained (not removed) only because it is still exercised by existing
+    # regression tests and there is no destructive-migration plan for it.
+    _LEGACY_PAPER_HELP_SUFFIX = " [DEPRECATED — legacy pre-paper_books ledger; use paper-book-* / external-paper-* instead]"
+
+    p_legacy_status = sub.add_parser(
+        "legacy-paper-status", help="Show legacy paper ledger state" + _LEGACY_PAPER_HELP_SUFFIX
+    )
+    p_legacy_status.add_argument(
+        "--i-understand-this-is-the-legacy-ledger", required=True, action="store_true",
+        help="explicit acknowledgement required: this is the deprecated pre-Milestone-8 ledger, not paper_books",
+    )
 
     p_execute_paper = sub.add_parser(
-        "execute-paper", help="Run one frozen recommendation through paper execution (Milestone 3/4)"
+        "legacy-paper-execute",
+        help="Run one frozen recommendation through legacy paper execution (Milestone 3/4)" + _LEGACY_PAPER_HELP_SUFFIX,
     )
     p_execute_paper.add_argument("--recommendation-id", required=True)
     p_execute_paper.add_argument(
         "--adapter", choices=("deterministic", "credentialed"), default="deterministic",
         help="deterministic (default, offline); credentialed is retained only to return a fail-closed migration error",
     )
+    p_execute_paper.add_argument(
+        "--i-understand-this-is-the-legacy-ledger", required=True, action="store_true",
+        help="explicit acknowledgement required: this is the deprecated pre-Milestone-8 ledger, not paper_books",
+    )
 
     sub.add_parser("paper-runtime-health", help="Health-check the isolated LumiBot paper-runtime process (Milestone 4)")
 
-    sub.add_parser("sync-paper-orders", help="Poll the paper runtime for order-state changes and apply fills (Milestone 4)")
+    p_legacy_sync = sub.add_parser(
+        "legacy-paper-sync-orders",
+        help="Poll the paper runtime for order-state changes and apply fills to the legacy ledger (Milestone 4)"
+        + _LEGACY_PAPER_HELP_SUFFIX,
+    )
+    p_legacy_sync.add_argument(
+        "--i-understand-this-is-the-legacy-ledger", required=True, action="store_true",
+        help="explicit acknowledgement required: this is the deprecated pre-Milestone-8 ledger, not paper_books",
+    )
 
-    sub.add_parser("reconcile-paper", help="Reconcile account/positions against the credentialed paper broker (Milestone 4)")
+    p_legacy_reconcile = sub.add_parser(
+        "legacy-paper-reconcile",
+        help="Reconcile account/positions against the credentialed legacy paper broker (Milestone 4)"
+        + _LEGACY_PAPER_HELP_SUFFIX,
+    )
+    p_legacy_reconcile.add_argument(
+        "--i-understand-this-is-the-legacy-ledger", required=True, action="store_true",
+        help="explicit acknowledgement required: this is the deprecated pre-Milestone-8 ledger, not paper_books",
+    )
 
     p_evaluate = sub.add_parser(
         "evaluate-recommendations", help="Compute forward-performance evaluations for recommendations (Milestone 4)"
@@ -2422,12 +2463,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(rec, indent=2))
         return 0
 
-    if args.command == "paper-status":
+    if args.command == "legacy-paper-status":
         cfg = load_config()
         print(json.dumps(paper_status(cfg.research_database_path), indent=2, default=str))
         return 0
 
-    if args.command == "execute-paper":
+    if args.command == "legacy-paper-execute":
         cfg = load_config()
         outcome = execute_paper(args.recommendation_id, cfg.research_database_path, adapter=args.adapter)
         print(json.dumps(outcome, indent=2, default=str))
@@ -2438,13 +2479,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if outcome.get("available") else 2
 
-    if args.command == "sync-paper-orders":
+    if args.command == "legacy-paper-sync-orders":
         cfg = load_config()
         outcome = sync_paper_orders_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
-    if args.command == "reconcile-paper":
+    if args.command == "legacy-paper-reconcile":
         cfg = load_config()
         outcome = reconcile_paper_cli(cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
