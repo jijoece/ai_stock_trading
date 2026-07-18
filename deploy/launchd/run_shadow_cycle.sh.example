@@ -1,52 +1,52 @@
 #!/usr/bin/env bash
-# Wrapper script invoked by com.agentic-trading-desk.shadow.plist.example
-# (docs/milestone-7.md Step 20). This is a DEPLOYABLE SCHEDULER ARTIFACT
-# only — copying and running this script does not, by itself, constitute an
-# ACTUAL RECURRING DEPLOYMENT; that only happens if an operator separately
-# `launchctl load`s the plist (see deploy/launchd/README.md).
-#
-# No credentials are embedded in this script or in the plist that invokes
-# it. Credentials live only in the repository's `.env` file, which
-# `trading_research/config.py::load_config()` already loads at process
-# startup via `python-dotenv` (`load_dotenv(REPO_ROOT / ".env", override=False)`)
-# — this wrapper does not need to (and does not) source `.env` itself; it
-# only needs to `cd` into the repo so `load_config()`'s default
-# `REPO_ROOT / ".env"` resolves correctly, and activate the repository's
-# virtualenv so `python -m trading_research.cli` resolves to the right
-# interpreter and installed dependencies.
-#
-# Copy this file (drop the .example suffix), fill in REPO_DIR and LOG_DIR
-# below, and reference the copy (not this template) from your copy of the
-# .plist file's ProgramArguments.
-
 set -euo pipefail
+umask 077
 
-# --- Operator-configured paths ------------------------------------------------
-# Fill these in before use. Left unset/placeholder in the template so a stray
-# `bash run_shadow_cycle.sh.example` invocation fails loudly instead of
-# silently doing something in the wrong directory.
+# Operator-configured absolute paths and bounded symbols.
 REPO_DIR="/path/to/agentic-trading-desk"
 LOG_DIR="/path/to/agentic-trading-desk/logs/shadow"
+PYTHON_BIN="$REPO_DIR/.venv/bin/python"
+SYMBOLS=(AAPL)
 
-if [ "$REPO_DIR" = "/path/to/agentic-trading-desk" ]; then
-    echo "run_shadow_cycle.sh.example: REPO_DIR is still the placeholder value — edit this script before use." >&2
-    exit 1
+if [[ "$REPO_DIR" == "/path/to/agentic-trading-desk" ]]; then
+  echo "REPO_DIR is still a placeholder" >&2
+  exit 1
+fi
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "configured Python interpreter is not executable" >&2
+  exit 1
 fi
 
-mkdir -p "$LOG_DIR"
+/bin/mkdir -p "$LOG_DIR"
 
+CLAUDE_CODE_OAUTH_TOKEN="$(
+  /usr/bin/security find-generic-password \
+    -a "$USER" \
+    -s agentic-trading-desk-claude-oauth \
+    -w
+)"
+if [[ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]]; then
+  echo "Claude Code OAuth token was not found in Keychain" >&2
+  exit 1
+fi
+export CLAUDE_CODE_OAUTH_TOKEN
+
+unset ANTHROPIC_API_KEY || true
+unset ANTHROPIC_AUTH_TOKEN || true
+unset ANTHROPIC_BASE_URL || true
+
+ARGS=(
+  -m trading_research.cli
+  run-due-shadow-cycle
+  --provider-mode real
+  --research-config "$REPO_DIR/config/production/research.yaml"
+  --scheduled-research-config "$REPO_DIR/config/production/scheduled_research.yaml"
+  --shadow-config "$REPO_DIR/config/production/shadow_operations.yaml"
+)
+for symbol in "${SYMBOLS[@]}"; do
+  ARGS+=(--symbol "$symbol")
+done
+
+TIMESTAMP="$(/bin/date -u +%Y%m%dT%H%M%SZ)"
 cd "$REPO_DIR"
-
-# Activate the repository's own virtualenv (never assume a global `python`
-# on the PATH launchd gives child processes, which is minimal by design).
-# shellcheck disable=SC1091
-source "$REPO_DIR/.venv/bin/activate"
-
-# `run-due-shadow-cycle` is the only CLI command this wrapper ever invokes
-# (docs/milestone-7.md Step 20: "invokes only run-due-shadow-cycle"). This
-# exact subcommand does not exist yet in cli.py as of this task — a later
-# task adds the thin argparse wrapper around
-# `shadow/scheduler.py::run_due_shadow_cycle`. This artifact documents the
-# intended invocation ahead of that CLI wiring landing.
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-exec python -m trading_research.cli run-due-shadow-cycle >> "$LOG_DIR/shadow-cycle-${TIMESTAMP}.log" 2>&1
+exec "$PYTHON_BIN" "${ARGS[@]}" >> "$LOG_DIR/shadow-cycle-${TIMESTAMP}.log" 2>&1

@@ -35,7 +35,8 @@ RESERVATION_STATUS_RESERVED = "RESERVED"
 RESERVATION_STATUS_SETTLED = "SETTLED"
 RESERVATION_STATUS_EXPIRED = "EXPIRED"
 
-REAL_CLAUDE_PROVIDER = "anthropic"
+REAL_CLAUDE_PROVIDER = "anthropic"  # backwards-compatible singular alias
+REAL_CLAUDE_PROVIDERS = ("anthropic", "claude_code")
 PRICING_EXEMPT_PROVIDERS = ("deterministic", "scripted")
 
 Clock = Callable[[], datetime]
@@ -60,6 +61,7 @@ class CycleIntent:
     max_output_tokens_per_cycle: int
     max_input_tokens_per_cycle: int
     max_latency_seconds_per_cycle: int
+    max_calls_per_cycle: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,12 +112,19 @@ def estimate_cycle_cost(intent: CycleIntent, pricing_entries: tuple[PricingEntry
     (real-Claude provider) but not configured — this is the structural block
     that prevents any scheduled real-Claude call from starting without
     versioned pricing."""
-    max_calls = intent.max_symbols_per_cycle * intent.max_roles_per_symbol * intent.max_attempts_per_role
-    max_output_tokens = max_calls * intent.max_output_tokens_per_cycle
-    max_input_tokens = max_calls * intent.max_input_tokens_per_cycle
-    max_latency_seconds = max_calls * intent.max_latency_seconds_per_cycle
+    max_calls = intent.max_calls_per_cycle or (
+        intent.max_symbols_per_cycle * intent.max_roles_per_symbol * intent.max_attempts_per_role
+    )
+    if intent.max_calls_per_cycle is not None:
+        max_output_tokens = intent.max_output_tokens_per_cycle
+        max_input_tokens = intent.max_input_tokens_per_cycle
+        max_latency_seconds = intent.max_latency_seconds_per_cycle
+    else:
+        max_output_tokens = max_calls * intent.max_output_tokens_per_cycle
+        max_input_tokens = max_calls * intent.max_input_tokens_per_cycle
+        max_latency_seconds = max_calls * intent.max_latency_seconds_per_cycle
 
-    pricing_required = intent.provider == REAL_CLAUDE_PROVIDER
+    pricing_required = intent.provider in REAL_CLAUDE_PROVIDERS
     if not pricing_required:
         return CostEstimate(
             provider=intent.provider, max_input_tokens=max_input_tokens, max_output_tokens=max_output_tokens,

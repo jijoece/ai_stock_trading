@@ -15,6 +15,9 @@ import yaml
 
 from ..config import REPO_ROOT
 from .models import (
+    COST_BASIS_DIRECT_API_ESTIMATE,
+    COST_BASIS_NOT_APPLICABLE,
+    COST_BASIS_USAGE_NOT_RETURNED,
     COST_CALCULATED,
     COST_NOT_APPLICABLE,
     COST_PRICING_NOT_CONFIGURED,
@@ -86,14 +89,27 @@ def build_usage_record(
     success: bool,
     pricing_entries: tuple[PricingEntry, ...] = (),
     as_of_date: str | None = None,
+    cost_estimate_basis: str | None = None,
+    configured_model_alias: str | None = None,
+    resolved_model_name: str | None = None,
+    claude_code_version: str | None = None,
+    pricing_model: str | None = None,
 ) -> UsageRecord:
+    provenance = {
+        "configured_model_alias": configured_model_alias,
+        "resolved_model_name": resolved_model_name,
+        "claude_code_version": claude_code_version,
+    }
     if not success:
+        failure_basis = cost_estimate_basis or COST_BASIS_NOT_APPLICABLE
         return UsageRecord(
             provider=provider, model_name=model_name, role=role, input_tokens=input_tokens,
             output_tokens=output_tokens, cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens, latency_ms=latency_ms,
             provider_request_id=provider_request_id, retry_count=retry_count, success=False,
-            pricing_version=None, estimated_cost=None, cost_status=COST_NOT_APPLICABLE,
+            pricing_version=None, estimated_cost=None,
+            cost_status=(COST_USAGE_NOT_RETURNED if failure_basis == COST_BASIS_USAGE_NOT_RETURNED else COST_NOT_APPLICABLE),
+            cost_estimate_basis=failure_basis, **provenance,
         )
 
     if provider == "deterministic":
@@ -103,6 +119,7 @@ def build_usage_record(
             cache_write_tokens=cache_write_tokens, latency_ms=latency_ms,
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_NOT_APPLICABLE,
+            cost_estimate_basis=COST_BASIS_NOT_APPLICABLE, **provenance,
         )
 
     if input_tokens is None or output_tokens is None:
@@ -112,9 +129,10 @@ def build_usage_record(
             cache_write_tokens=cache_write_tokens, latency_ms=latency_ms,
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_USAGE_NOT_RETURNED,
+            cost_estimate_basis=COST_BASIS_USAGE_NOT_RETURNED, **provenance,
         )
 
-    pricing = select_pricing(pricing_entries, provider, model_name, as_of_date or "9999-12-31")
+    pricing = select_pricing(pricing_entries, provider, pricing_model or model_name, as_of_date or "9999-12-31")
     if pricing is None:
         return UsageRecord(
             provider=provider, model_name=model_name, role=role, input_tokens=input_tokens,
@@ -122,6 +140,7 @@ def build_usage_record(
             cache_write_tokens=cache_write_tokens, latency_ms=latency_ms,
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_PRICING_NOT_CONFIGURED,
+            cost_estimate_basis=cost_estimate_basis or COST_BASIS_DIRECT_API_ESTIMATE, **provenance,
         )
 
     cost = (Decimal(input_tokens) / Decimal(1_000_000)) * pricing.input_price_per_million + (
@@ -133,4 +152,5 @@ def build_usage_record(
         cache_write_tokens=cache_write_tokens, latency_ms=latency_ms,
         provider_request_id=provider_request_id, retry_count=retry_count, success=True,
         pricing_version=pricing.pricing_version, estimated_cost=cost, cost_status=COST_CALCULATED,
+        cost_estimate_basis=cost_estimate_basis or COST_BASIS_DIRECT_API_ESTIMATE, **provenance,
     )

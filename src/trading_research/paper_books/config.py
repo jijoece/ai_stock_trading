@@ -19,6 +19,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..runtime.client.process_client import DEFAULT_REQUEST_TIMEOUT_SECONDS
+
 import yaml
 
 from ..config import REPO_ROOT
@@ -116,7 +118,7 @@ class ExternalBrokerSection:
     permitted_order_types: tuple[str, ...]
     permitted_time_in_force: tuple[str, ...]
     maximum_retry_attempts: int = 1
-    order_lease_ttl_seconds: int = 30
+    order_lease_ttl_seconds: int = 45
     order_lease_heartbeat_seconds: int = 10
 
     def __post_init__(self) -> None:
@@ -179,6 +181,19 @@ class ExternalBrokerSection:
         if self.order_lease_ttl_seconds < self.order_lease_heartbeat_seconds * 2:
             raise PaperBooksConfigError(
                 "external_broker.order_lease_ttl_seconds must be at least 2x order_lease_heartbeat_seconds"
+            )
+        # Milestone 11.3.1 Item 4: the TTL must comfortably outlast the
+        # longest single isolated-runtime request plus a heartbeat margin --
+        # a 30s TTL sitting exactly at the runtime client's own 30s default
+        # request timeout (the pre-11.3.1 fallback) means one slow-but-legit
+        # broker call can expire the lease mid-operation, letting a second
+        # caller acquire a new generation while the first is still writing.
+        minimum_ttl = int(DEFAULT_REQUEST_TIMEOUT_SECONDS) + self.order_lease_heartbeat_seconds
+        if self.order_lease_ttl_seconds <= minimum_ttl:
+            raise PaperBooksConfigError(
+                "external_broker.order_lease_ttl_seconds must exceed the isolated runtime's maximum single "
+                f"request timeout ({int(DEFAULT_REQUEST_TIMEOUT_SECONDS)}s) plus the heartbeat margin "
+                f"({self.order_lease_heartbeat_seconds}s) — minimum is {minimum_ttl + 1}s"
             )
 
 
@@ -706,7 +721,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
                 "external_broker.maximum_retry_attempts", minimum=1, maximum=3,
             ),
             order_lease_ttl_seconds=_strict_int(
-                external_raw.get("order_lease_ttl_seconds", 30),
+                external_raw.get("order_lease_ttl_seconds", 45),
                 "external_broker.order_lease_ttl_seconds", minimum=1, maximum=3_600,
             ),
             order_lease_heartbeat_seconds=_strict_int(

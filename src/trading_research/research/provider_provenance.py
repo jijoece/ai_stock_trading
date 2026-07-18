@@ -55,7 +55,7 @@ PROVIDER_MODE_UNKNOWN = "UNKNOWN"
 # Claude provider-name taxonomy (research/configuration.py::KNOWN_PROVIDERS,
 # shadow/budget.py::REAL_CLAUDE_PROVIDER/PRICING_EXEMPT_PROVIDERS) — the
 # axis this module reuses verbatim rather than re-deriving.
-_REAL_CLAUDE_PROVIDER_NAMES = ("anthropic",)
+_REAL_CLAUDE_PROVIDER_NAMES = ("anthropic", "claude_code")
 _FIXTURE_CLAUDE_PROVIDER_NAMES = ("deterministic", "scripted")
 
 

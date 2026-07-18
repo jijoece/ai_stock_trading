@@ -1589,6 +1589,12 @@ def test_local_fill_blocks_subsequent_external_preview():
         risk_decision_id="risk-1", portfolio_snapshot_id="snap-1", config_hash="cfg-m11",
         created_at=NOW,
     )
+    # `_seed` inserts intent-1 directly (mirroring an external-style flow
+    # that owns its own reservation timing), but a real local BUY always
+    # reserves cash atomically with the intent (Milestone 11.3.1 Item 6
+    # Part A) -- reserve here so this pre-seeded intent matches that
+    # invariant before driving a local fill through it.
+    cash_ledger.reserve_for_order(conn, "BASELINE", "intent-1", Decimal("80"), NOW)
     result = execution.submit_and_simulate(
         conn, order_intent, execution.MarketSimulationInput(Decimal("39"), Decimal("39")), NOW,
     )

@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS research_attempts (
     pricing_version TEXT,
     estimated_cost TEXT,
     cost_status TEXT NOT NULL,
+    cost_estimate_basis TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+    configured_model_alias TEXT,
+    resolved_model_name TEXT,
+    claude_code_version TEXT,
     created_at TEXT NOT NULL
 );
 

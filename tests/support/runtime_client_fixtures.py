@@ -100,6 +100,23 @@ def fake_transport_factory(fake: FakeTransport):
     return _factory
 
 
+def sequential_fake_transport_factory(fakes):
+    """Milestone 11.3.1 Item 5: returns a new `FakeTransport` from `fakes`
+    (in order) on each `transport_factory(...)` call -- matching real
+    `SubprocessTransport` semantics, where every `start()` spawns a genuinely
+    new child process. `fake_transport_factory` above deliberately returns
+    the *same* fake forever, which cannot model a restart onto a clean
+    process at all; use this one for any test that exercises `start()` being
+    called more than once (an explicit restart, or the client's own
+    transparent restart-on-retryable-timeout)."""
+    fakes_iter = iter(fakes)
+
+    def _factory(command, cwd=None, env=None):
+        return next(fakes_iter)
+
+    return _factory
+
+
 def health_payload(**overrides) -> dict:
     base = {
         "available": True,

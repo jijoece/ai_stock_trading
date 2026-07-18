@@ -502,6 +502,7 @@ def _unavailable_usage(provider: str, model_name: str, role: str, attempt_number
         provider=provider, model_name=model_name, role=role, input_tokens=None, output_tokens=None,
         cache_read_tokens=None, cache_write_tokens=None, latency_ms=latency_ms, provider_request_id=None,
         retry_count=attempt_number - 1, success=False,
+        cost_estimate_basis="USAGE_NOT_RETURNED" if provider == "claude_code" else None,
     )
 
 

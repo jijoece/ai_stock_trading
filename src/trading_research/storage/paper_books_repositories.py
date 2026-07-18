@@ -170,7 +170,7 @@ def order_exists(conn: sqlite3.Connection, book_id: str, paper_order_intent_id: 
     return row is not None
 
 
-def save_order_intent(conn: sqlite3.Connection, intent) -> bool:
+def save_order_intent(conn: sqlite3.Connection, intent, *, commit: bool = True) -> bool:
     if order_exists(conn, intent.book_id, intent.paper_order_intent_id):
         return False
     conn.execute(
@@ -186,7 +186,7 @@ def save_order_intent(conn: sqlite3.Connection, intent) -> bool:
             intent.config_hash, _ts(intent.created_at), intent.status,
         ),
     )
-    conn.commit()
+    _commit_if(conn, commit)
     return True
 
 
@@ -1622,6 +1622,68 @@ def list_external_submission_queue(conn: sqlite3.Connection, book_id: str) -> li
         (book_id,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+EXECUTION_NAMESPACE_LOCAL = "LOCAL_SIMULATED"
+EXECUTION_NAMESPACE_EXTERNAL = "EXTERNAL_PAPER"
+
+
+class ExecutionNamespaceConflictError(RuntimeError):
+    """Raised when a caller tries to claim a `(book_id, paper_order_intent_id)`
+    for one execution namespace while it is already durably claimed for the
+    other. Milestone 11.3.1 Item 6 Part B: local simulation and external
+    paper submission must never both be able to act on the same intent."""
+
+    def __init__(self, message: str, *, existing_namespace: str) -> None:
+        super().__init__(message)
+        self.existing_namespace = existing_namespace
+
+
+def load_execution_namespace_claim(
+    conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_order_execution_claims WHERE book_id = ? AND paper_order_intent_id = ?",
+        (book_id, paper_order_intent_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def claim_execution_namespace(
+    conn: sqlite3.Connection, book_id: str, paper_order_intent_id: str, execution_namespace: str,
+    claimed_at: datetime, claimed_by: str, *, commit: bool = True,
+) -> bool:
+    """Atomically claim `(book_id, paper_order_intent_id)` for exactly one
+    execution namespace ('LOCAL_SIMULATED' or 'EXTERNAL_PAPER').
+
+    Idempotent no-op (returns False) if this exact namespace already holds
+    the claim -- a retried service invocation never re-claims. Raises
+    `ExecutionNamespaceConflictError` if the intent is already claimed by
+    the *other* namespace -- never silently overwritten. Callers running
+    inside an outer `begin_immediate`/`transaction()` block (the common
+    case: the claim is inserted atomically alongside the intent and its
+    first reservation/preview) must pass `commit=False`; SQLite's
+    BEGIN IMMEDIATE write lock is what actually serializes concurrent
+    claim attempts against the same intent -- the read-then-insert here is
+    only safe because it always runs under that lock.
+    """
+    existing = load_execution_namespace_claim(conn, book_id, paper_order_intent_id)
+    if existing is not None:
+        if existing["execution_namespace"] != execution_namespace:
+            raise ExecutionNamespaceConflictError(
+                f"paper intent {paper_order_intent_id!r} in book {book_id!r} is already claimed by "
+                f"{existing['execution_namespace']} execution — cannot also claim {execution_namespace}",
+                existing_namespace=existing["execution_namespace"],
+            )
+        return False
+    conn.execute(
+        "INSERT INTO paper_order_execution_claims "
+        "(book_id, paper_order_intent_id, execution_namespace, claim_generation, claimed_at, claimed_by) "
+        "VALUES (?, ?, ?, 1, ?, ?)",
+        (book_id, paper_order_intent_id, execution_namespace, _ts(claimed_at), claimed_by),
+    )
+    _commit_if(conn, commit)
+    return True
 
 
 def has_external_execution_evidence(

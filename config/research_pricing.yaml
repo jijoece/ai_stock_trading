@@ -18,4 +18,14 @@
 #     output_price_per_million: "15.00"
 #     pricing_version: anthropic-2026-01-01
 version: 1
-pricing: []
+pricing:
+  # Conservative API-equivalent estimate for the mutable Claude Code
+  # `sonnet` alias. Every usage row also persists the resolved model ID, so
+  # this estimate is never represented as authoritative subscription billing.
+  - provider: claude_code
+    model: sonnet
+    effective_date: "2026-07-17"
+    currency: USD
+    input_price_per_million: "3.00"
+    output_price_per_million: "15.00"
+    pricing_version: claude-code-sonnet-api-equivalent-2026-07-17

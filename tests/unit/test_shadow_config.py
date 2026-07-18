@@ -226,3 +226,71 @@ def test_valid_boundary_values_accepted():
     config = load_shadow_operations_config(path)
     assert config.safety.pause_on_provider_failure_rate == 0.0
     assert config.budgets.emergency_margin_fraction == 0.0
+
+
+# --- Milestone 11.3.1 Item 7: strict boolean parsing for every boolean field -
+
+STRICT_BOOL_FIELDS = [
+    ("shadow_operations", "enabled"),
+    ("shadow_operations", "allow_baseline_paper_submission"),
+    ("shadow_operations", "allow_enhanced_submission"),
+    ("shadow_operations", "require_market_open_day"),
+    ("shadow_operations", "continue_on_symbol_failure"),
+    ("schedule", "enabled"),
+    ("budgets", "require_pricing_for_real_claude"),
+    ("safety", "pause_on_reconciliation_mismatch"),
+    ("safety", "pause_on_budget_breach"),
+]
+
+
+@pytest.mark.parametrize("section,key", STRICT_BOOL_FIELDS)
+@pytest.mark.parametrize("value", ["true", "false", "yes", "no", 1, 0, None])
+def test_strict_bool_rejects_permissive_values(section, key, value):
+    raw = _mutate(section, key, value)
+    path = _write_config(raw)
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+@pytest.mark.parametrize("section,key", STRICT_BOOL_FIELDS)
+def test_strict_bool_rejects_list_and_mapping(section, key):
+    for value in ([True], {"a": True}):
+        raw = _mutate(section, key, value)
+        path = _write_config(raw)
+        with pytest.raises(ShadowOperationsConfigError):
+            load_shadow_operations_config(path)
+
+
+@pytest.mark.parametrize("section,key", STRICT_BOOL_FIELDS)
+@pytest.mark.parametrize("value", [True, False])
+def test_strict_bool_accepts_real_booleans(section, key, value):
+    if (section, key) == ("shadow_operations", "allow_enhanced_submission") and value is True:
+        pytest.skip("allow_enhanced_submission=true is structurally rejected regardless of boolean strictness")
+    raw = _mutate(section, key, value)
+    path = _write_config(raw)
+    config = load_shadow_operations_config(path)
+    section_obj = getattr(config, section)
+    assert getattr(section_obj, key) is value
+
+
+def test_malformed_boolean_fails_before_any_downstream_use():
+    # A malformed required boolean must raise during load_shadow_operations_config
+    # itself -- before any scheduler, lease, budget, provider, Claude, or broker
+    # code ever sees a ShadowOperationsConfiguration built from it.
+    raw = _mutate("shadow_operations", "enabled", "false")
+    path = _write_config(raw)
+    with pytest.raises(ShadowOperationsConfigError):
+        load_shadow_operations_config(path)
+
+
+def test_repository_default_config_still_loads_with_strict_bool_parsing():
+    config = load_shadow_operations_config(DEFAULT_SHADOW_OPERATIONS_CONFIG_PATH)
+    assert config.shadow_operations.enabled is False
+    assert config.schedule.enabled is False
+
+
+def test_config_hash_remains_deterministic_with_strict_bool_parsing():
+    path = _write_config(VALID_RAW)
+    c1 = load_shadow_operations_config(path)
+    c2 = load_shadow_operations_config(path)
+    assert c1.config_hash == c2.config_hash

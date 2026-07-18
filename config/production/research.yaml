@@ -1,0 +1,43 @@
+version: 1
+research:
+  enabled: true
+  provider: claude_code
+  model: sonnet
+  max_attempts_per_role: 2
+  request_timeout_seconds: 120
+  # 40k characters aligns with the conservative 10k-token per-call
+  # reservation derived from the 100k-token / 10-call cycle ceiling.
+  max_input_characters: 40000
+  max_evidence_items: 100
+  max_items_per_source_category: 25
+  max_claims_per_role: 20
+  max_output_tokens: 4000
+  require_point_in_time_safe: true
+  require_evidence_for_material_claims: true
+  fail_on_stale_required_evidence: true
+  allow_parallel_roles: false
+claude_code:
+  binary_path: /opt/homebrew/bin/claude
+  minimum_version: "2.1.205"
+  terminate_grace_seconds: 5
+  maximum_stdout_bytes: 1048576
+  maximum_stderr_bytes: 65536
+  maximum_schema_bytes: 262144
+  maximum_prompt_bytes: 524288
+  maximum_budget_usd_per_call: "0.50"
+  maximum_turns: 1
+  working_directory: /private/tmp/agentic-trading-desk-claude-code
+  require_oauth_authentication: true
+  require_usage_metadata: true
+roles:
+  - fundamental
+  - technical
+  - bull
+  - bear
+  - manager
+overlay:
+  policy_version: research-overlay.v1
+  allow_score_increase: false
+  allow_position_size_increase: false
+  incomplete_action: ANALYSIS_INCOMPLETE
+  critical_risk_action: FORCE_NO_ACTION

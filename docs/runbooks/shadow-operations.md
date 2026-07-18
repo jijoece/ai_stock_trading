@@ -5,6 +5,25 @@ Operator-facing procedures for the Milestone 7 shadow-operations control layer. 
 rationale, and `docs/adr/0005-production-shadow-operations-boundary.md` for why each
 boundary exists.
 
+For the subscription-backed provider, read
+`docs/claude-code-production-provider.md`. The safe base configuration remains
+disabled; the launch wrapper explicitly selects the dormant files under
+`config/production/`. Claude Code authentication comes only from the Keychain
+service `agentic-trading-desk-claude-oauth`, never `.env`.
+
+Before any scheduled rollout, run the inference-free preflight:
+
+```bash
+python -m trading_research.cli claude-code-provider-preflight \
+  --research-config config/production/research.yaml
+```
+
+Version/auth failures block before scheduler lease and budget reservation and
+create an automatic provider-health pause only when the system was ACTIVE.
+Manual pause and kill state are never cleared automatically. Missing usage,
+credit exhaustion, retry exhaustion, and call/token/latency/API-equivalent-cost
+caps fail closed through the existing attempt, health, budget, and pause paths.
+
 **Before you start:** shadow operations ships fully disabled. `config/shadow_operations.yaml`
 has `shadow_operations.enabled: false` and `schedule.enabled: false` out of the box. No
 recurring schedule has ever been activated on any machine this code has run on — read
@@ -44,7 +63,9 @@ An automatic health-triggered pause (or `PAUSE_RECOMMENDED` verdict) now also ra
 
 ## Enable shadow operations
 
-1. Open `config/shadow_operations.yaml`. The shipped defaults:
+1. Open `config/shadow_operations.yaml` for safe defaults, or review the
+   explicit dormant `config/production/` profile used by launchd. The shipped
+   base defaults:
 
    ```yaml
    shadow_operations:
