@@ -861,6 +861,21 @@ def claude_code_provider_preflight_cli(research_config_path: Path | None = None)
     }
 
 
+def _codex_supported_ranges_report() -> list[dict]:
+    """Sanitized (no paths/credentials) view of `SUPPORTED_CODEX_CLI_RANGES`
+    for readiness reports (Milestone 12.1 Item 2)."""
+    from .research.codex_version_policy import SUPPORTED_CODEX_CLI_RANGES
+
+    return [
+        {
+            "minimum": ".".join(str(p) for p in r.minimum),
+            "maximum_exclusive": ".".join(str(p) for p in r.maximum_exclusive),
+            "adapter_version": r.adapter_version,
+        }
+        for r in SUPPORTED_CODEX_CLI_RANGES
+    ]
+
+
 def codex_provider_preflight_cli(research_config_path: Path | None = None) -> dict:
     """Sanitized version/auth readiness only; never makes an inference call."""
     from .research.codex_provider import CodexResearchProvider
@@ -889,6 +904,8 @@ def codex_provider_preflight_cli(research_config_path: Path | None = None) -> di
             "authenticated": False,
             "authentication_method": None,
             "failure_code": getattr(exc, "code", "CODEX_PREFLIGHT_FAILED"),
+            "supported_cli_ranges": _codex_supported_ranges_report(),
+            "adapter_version": None,
         }
     return {
         "ready": result.ready,
@@ -901,6 +918,8 @@ def codex_provider_preflight_cli(research_config_path: Path | None = None) -> di
         "usage_metadata_required": True,
         "failure_code": result.failure_code,
         "checked_at": result.checked_at.isoformat(),
+        "supported_cli_ranges": _codex_supported_ranges_report(),
+        "adapter_version": result.adapter_version,
         "paper_submission_enabled": False,
         "external_execution_reachable": False,
     }

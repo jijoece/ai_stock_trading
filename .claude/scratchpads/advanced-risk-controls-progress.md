@@ -43,7 +43,7 @@ Status: implementation and verification complete
 - Added a minimal deterministic multi-symbol daily-bar engine with next-session entries, ATR sizing, lifecycle exits, daily/drawdown/blackout gates, fees, slippage, metrics, and persisted audit artifacts.
 
 ## Schema and migrations
-- Added schema migration 6 and additive tables for daily risk, lifecycle states/events, partial stages, economic events/decisions, safety events, and backtest runs/states/orders/fills/metrics.
+- Added schema migration 10 (renumbered from 6 after integrating Milestone 12.1 from `main`) and additive tables for daily risk, lifecycle states/events, partial stages, economic events/decisions, safety events, and backtest runs/states/orders/fills/metrics.
 - Added nullable `paper_book_exit_decisions.partial_stage_id`, indexes, and append-only/audit triggers.
 
 ## Files created

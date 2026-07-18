@@ -75,6 +75,16 @@ def _parse_usage(usage_obj: object) -> CodexUsage:
     ):
         if value is not None and (type(value) is not int or value < 0):
             raise _fail("CODEX_USAGE_METADATA_MISSING", f"Codex usage.{name} was malformed", retryable=False)
+    # Milestone 12.1 Item 4: Codex's documented contract (see
+    # codex_provider.py's module docstring) is that reasoning tokens are a
+    # subset of output_tokens, never additional to it — a reported
+    # reasoning_output_tokens exceeding output_tokens is a contract
+    # violation this provider fails closed on rather than silently trusting.
+    if isinstance(reasoning_output_tokens, int) and reasoning_output_tokens > output_tokens:
+        raise _fail(
+            "CODEX_REASONING_TOKENS_INVALID",
+            "Codex usage.reasoning_output_tokens exceeded usage.output_tokens", retryable=False,
+        )
     return CodexUsage(
         input_tokens=input_tokens, output_tokens=output_tokens,
         cached_input_tokens=cached_input_tokens, reasoning_output_tokens=reasoning_output_tokens,

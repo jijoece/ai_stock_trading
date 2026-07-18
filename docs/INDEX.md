@@ -27,7 +27,9 @@ read multiple milestone variants unless the task requires comparing them.
 | System boundaries and target architecture | [`AI-Driven-Stock-Trading-Architecture.md`](AI-Driven-Stock-Trading-Architecture.md) |
 | Original roadmap and acceptance criteria | [`AI-Stock-Trading-Implementation-Plan.md`](AI-Stock-Trading-Implementation-Plan.md) |
 | External research-source policy | [`AI-Stock-Trading-Research-Sources.md`](AI-Stock-Trading-Research-Sources.md) |
-| Latest completed integrity implementation | [`milestone11-3-2-operational-integrity.md`](milestone11-3-2-operational-integrity.md) |
+| Latest completed integrity implementation | [`milestone12-1-provider-health-ci-integrity.md`](milestone12-1-provider-health-ci-integrity.md) |
+| CI job requirements and branch-protection configuration | [`ci-branch-protection.md`](ci-branch-protection.md) |
+| Prior completed integrity implementation | [`milestone11-3-2-operational-integrity.md`](milestone11-3-2-operational-integrity.md) |
 | Prior integrity implementation | [`milestone11-3-1-safety-closure.md`](milestone11-3-1-safety-closure.md) |
 | Milestone 11.3.1 specification | [`milestones/milestone-11.3.1.md`](milestones/milestone-11.3.1.md) |
 | Prior completed integrity implementation | [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md) |

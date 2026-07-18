@@ -44,6 +44,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -256,6 +257,7 @@ def _build_health_inputs_from_cycle_result(
     window_end: datetime | None = None,
     provider_coverage_policy: provider_health_mod.ProviderCoveragePolicy | None = None,
     expected_cycle_id: str | None = None,
+    scheduler_run_id: str | None = None,
 ) -> health_mod.CycleHealthInputs:
     """Computes real aggregate rates from `ResearchCycleResult.symbol_results`
     plus, since docs/milestone-7.1.md Step 18, a real `ResearchCycleTelemetry`
@@ -291,10 +293,22 @@ def _build_health_inputs_from_cycle_result(
     del bounded_symbols, window_start, window_end  # timestamps/symbols never establish request ownership
     provider_policy = provider_coverage_policy or provider_health_mod.ProviderCoveragePolicy()
     provider_cycle_id = cycle_result.cycle_id if cycle_result is not None else expected_cycle_id
-    provider_rows = (
-        provider_persistence_mod.list_provider_requests_for_cycle(conn, provider_cycle_id)
-        if provider_cycle_id is not None else []
-    )
+    if provider_cycle_id is None:
+        provider_rows: list[dict] = []
+    elif scheduler_run_id is not None:
+        # Milestone 12.1 Item 7: THIS scheduler run's own operational health
+        # decision must see only requests this exact run made — never an
+        # earlier or later scheduler run's requests against the same
+        # deterministic cycle ID (a catch-up/resumption invocation revisiting
+        # the same cycle), and never a manual/research-cycle-only request.
+        provider_rows = provider_persistence_mod.list_provider_requests_for_scheduled_run(
+            conn, research_cycle_id=provider_cycle_id, scheduler_run_id=scheduler_run_id,
+        )
+    else:
+        # No scheduler_run_id supplied — historical/manual-mode caller.
+        # Cycle-only telemetry remains correct here (never used for an
+        # operational scheduled-run pause decision in that case).
+        provider_rows = provider_persistence_mod.list_provider_requests_for_cycle(conn, provider_cycle_id)
     provider_telemetry = provider_health_mod.compute_cycle_provider_telemetry(
         provider_rows, coverage_policy=provider_policy,
     )
@@ -319,6 +333,7 @@ def _build_health_inputs_from_cycle_result(
         "provider_observed_providers": provider_telemetry.observed_providers,
         "provider_missing_required_providers": provider_telemetry.required_providers_missing,
         "provider_missing_required_categories": provider_telemetry.missing_required_categories,
+        "provider_unhealthy_required_categories": provider_telemetry.unhealthy_required_categories,
         "provider_per_provider_metrics": provider_metrics,
         "provider_severe_error_categories": provider_telemetry.severe_error_categories,
         "provider_policy_version": provider_telemetry.policy_version,
@@ -1030,6 +1045,7 @@ def run_due_shadow_cycle(
             expected_cycle_id=derive_cycle_id(
                 cycle_configuration.universe_id, intended_schedule_time, cycle_configuration.config_hash,
             ),
+            scheduler_run_id=scheduler_run_id,
         )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)
         health_result = health_mod.evaluate_cycle_health(health_inputs, health_config)
@@ -1041,11 +1057,40 @@ def run_due_shadow_cycle(
         # from one noisy cycle in `shadow_health_hysteresis_state`. A cycle
         # counts as "qualified" only if real provider-request data existed
         # this cycle -- never fabricated from a zero-request cycle.
-        hysteresis_decision = health_hysteresis_mod.evaluate_and_persist_hysteresis(
-            conn, cycle_id=cycle_id or scheduler_run_id, cycle_status=health_result.status,
-            qualified=health_mod.provider_health_is_qualified(health_result),
+        # Milestone 12.1 Item 5: hysteresis is evaluated independently PER
+        # rate-based dimension (its own `scope`, its own `qualified`, its own
+        # single-dimension `cycle_status`) — an insufficient evidence-provider
+        # sample must affect only the evidence-provider dimension's streak,
+        # never silently swallow a genuinely FAILing retry-exhaustion or
+        # unsupported-claim rate for the whole cycle. The evidence-provider
+        # dimension keeps the pre-existing `DEFAULT_SCOPE` name so upgrading
+        # does not reset its already-persisted streak; the other two
+        # dimensions get their own new, independently-tracked scopes.
+        _immediate_pause_for_hysteresis = health_mod.immediate_pause_required(
+            health_result, provider_severe_categories=health_inputs.provider_severe_error_categories,
+        )
+        # Milestone 12.1 Item 9: thresholds come from the strict, frozen
+        # `shadow_operations.yaml::health_hysteresis` section (via
+        # `shadow_config.health_hysteresis`) — never a hard-coded Python
+        # default — with one independent `PersistentHealthPolicyConfig` per
+        # dimension, each producing its own `policy_hash` so a configuration
+        # change resets exactly that dimension's streak at a clean boundary.
+        def _dimension_policy_config(section) -> health_hysteresis_mod.PersistentHealthPolicyConfig:
+            return health_hysteresis_mod.PersistentHealthPolicyConfig(
+                policy_version=shadow_config.health_hysteresis.policy_version,
+                warning_after_n_failures=section.warning_after_failures,
+                pause_recommended_after_n_failures=section.pause_recommended_after_failures,
+                pause_required_after_m_failures=section.pause_required_after_failures,
+                recovery_streak=section.recovery_streak,
+            )
+
+        evidence_provider_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_PROVIDER_FAILURE_RATE)
+        evidence_provider_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
+            conn, scope=health_hysteresis_mod.DEFAULT_SCOPE, cycle_id=cycle_id or scheduler_run_id,
+            cycle_status=health_mod.dimension_cycle_status(evidence_provider_check),
+            qualified=health_mod.dimension_is_qualified(evidence_provider_check),
             severe_error=health_inputs.provider_severe_error,
-            config=health_hysteresis_mod.PersistentHealthPolicyConfig(), clock=clock,
+            config=_dimension_policy_config(shadow_config.health_hysteresis.evidence_provider), clock=clock,
             evidence=health_hysteresis_mod.HysteresisEvaluationEvidence(
                 sample_size=health_inputs.provider_request_count or 0,
                 minimum_sample_size=health_config.minimum_requests_for_failure_rate,
@@ -1059,9 +1104,36 @@ def run_due_shadow_cycle(
                 severe_error_categories=health_inputs.provider_severe_error_categories,
                 provider_policy_hash=health_inputs.provider_policy_hash,
             ),
-            immediate_pause=health_mod.immediate_pause_required(
-                health_result, provider_severe_categories=health_inputs.provider_severe_error_categories,
-            ),
+            immediate_pause=_immediate_pause_for_hysteresis,
+        )
+        retry_exhaustion_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_RETRY_EXHAUSTION_RATE)
+        retry_exhaustion_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
+            conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_RETRY_EXHAUSTION}",
+            cycle_id=cycle_id or scheduler_run_id,
+            cycle_status=health_mod.dimension_cycle_status(retry_exhaustion_check),
+            qualified=health_mod.dimension_is_qualified(retry_exhaustion_check),
+            config=_dimension_policy_config(shadow_config.health_hysteresis.retry_exhaustion), clock=clock,
+            immediate_pause=_immediate_pause_for_hysteresis,
+        )
+        unsupported_claims_check = health_mod.check_by_name(health_result, health_mod.CHECK_NAME_UNSUPPORTED_CLAIM_RATE)
+        unsupported_claims_hysteresis = health_hysteresis_mod.evaluate_and_persist_hysteresis(
+            conn, scope=f"{health_hysteresis_mod.DEFAULT_SCOPE}:{health_mod.DIMENSION_UNSUPPORTED_CLAIMS}",
+            cycle_id=cycle_id or scheduler_run_id,
+            cycle_status=health_mod.dimension_cycle_status(unsupported_claims_check),
+            qualified=health_mod.dimension_is_qualified(unsupported_claims_check),
+            config=_dimension_policy_config(shadow_config.health_hysteresis.unsupported_claims), clock=clock,
+            immediate_pause=_immediate_pause_for_hysteresis,
+        )
+        # The overall hysteresis status a scheduler-level pause decision acts
+        # on is the worst of every independently-evaluated dimension — this
+        # is exactly what stops an insufficient evidence-provider sample from
+        # masking a real retry-exhaustion or unsupported-claim streak.
+        hysteresis_decision = dataclasses.replace(
+            evidence_provider_hysteresis,
+            decision=health_mod.worst_health_status((
+                evidence_provider_hysteresis.decision, retry_exhaustion_hysteresis.decision,
+                unsupported_claims_hysteresis.decision,
+            )),
         )
         effective_decision = health_mod.combine_effective_health_decision(
             health_result, hysteresis_decision.decision,

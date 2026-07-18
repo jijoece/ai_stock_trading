@@ -148,6 +148,13 @@ CODEX_FAILURE_CODES = (
     "CODEX_FINAL_OUTPUT_MALFORMED",
     "CODEX_USAGE_METADATA_MISSING",
     "CODEX_MODEL_PROVENANCE_MISSING",
+    # Milestone 12.1 Item 3: centralized terminal-failure classification
+    # categories, reachable identically from a nonzero process exit or a
+    # zero-exit `turn.failed` JSONL event.
+    "CODEX_NETWORK_FAILURE",
+    "CODEX_UNSUPPORTED_MODEL",
+    "CODEX_INVALID_CONFIGURATION",
+    "CODEX_REASONING_TOKENS_INVALID",
 )
 
 CODES = (

@@ -63,3 +63,30 @@ safety:
   # a single failed request in a 1-request cycle is not distinguishable
   # from noise.
   minimum_requests_for_failure_rate: 5
+
+# Milestone 12.1 Item 9: persistent hysteresis thresholds, versioned and
+# frozen here rather than a hard-coded Python default — one independent
+# threshold set per rate-based health dimension (see shadow/health.py's
+# dimension-specific hysteresis, Milestone 12.1 Item 5). These values
+# reproduce this repository's pre-existing hard-coded defaults exactly, so
+# adopting this section changes no observed behavior on its own.
+health_hysteresis:
+  policy_version: persistent-health/v2
+
+  evidence_provider:
+    warning_after_failures: 1
+    pause_recommended_after_failures: 2
+    pause_required_after_failures: 3
+    recovery_streak: 2
+
+  retry_exhaustion:
+    warning_after_failures: 1
+    pause_recommended_after_failures: 2
+    pause_required_after_failures: 3
+    recovery_streak: 2
+
+  unsupported_claims:
+    warning_after_failures: 1
+    pause_recommended_after_failures: 2
+    pause_required_after_failures: 3
+    recovery_streak: 2

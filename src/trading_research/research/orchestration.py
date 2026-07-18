@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .claim_validation import classify_claim_rejection_reason, validate_decision, validate_role_report
 from .configuration import MANAGER_ROLE, ResearchConfiguration
@@ -88,6 +88,16 @@ class ResearchAttemptRecord:
     validated_payload_json: dict | None
     usage: UsageRecord
     created_at: datetime
+    # Milestone 12.1 Item 1: the stable typed taxonomy (research/errors.py,
+    # research/failure_taxonomy.py) a failed attempt was classified under —
+    # copied directly from the already-validated/allowlisted
+    # `ResearchValidationFailure` that documents this same attempt, never
+    # re-derived from `failure_reason` free text. `None` on a successful
+    # attempt and on legacy rows loaded before this milestone.
+    failure_code: str | None = None
+    failure_stage: str | None = None
+    failure_retryable: bool | None = None
+    failure_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -193,6 +203,20 @@ def _schema_for_role(role: str, configuration: ResearchConfiguration) -> dict:
 
 def _attempt_id(research_run_id: str, role: str, attempt_number: int) -> str:
     return f"{research_run_id}-{role}-{attempt_number}"
+
+
+def _structured_failure_fields(
+    failures: "list[ResearchValidationFailure] | tuple[ResearchValidationFailure, ...]",
+) -> tuple[str | None, str | None, bool | None, Mapping[str, Any]]:
+    """Copies the stable `code`/`stage`/`retryable`/`metadata` of the first
+    failure attributed to this attempt onto `ResearchAttemptRecord` (Milestone
+    12.1 Item 1). The source `ResearchValidationFailure` already sanitized and
+    allowlisted its own metadata in `__post_init__` — this never re-derives or
+    re-validates anything from free text, it only copies already-typed data."""
+    if not failures:
+        return None, None, None, {}
+    first = failures[0]
+    return first.code, first.stage, first.retryable, dict(first.metadata)
 
 
 def _failure_from_exc(
@@ -311,6 +335,7 @@ def _run_role_with_retries(
                     schema_version=prompt_def.schema_version, occurred_at=created_at,
                 )
                 all_failures.append(gate_failure)
+                gate_code, gate_stage, gate_retryable, gate_metadata = _structured_failure_fields([gate_failure])
                 attempts.append(ResearchAttemptRecord(
                     attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
                     prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
@@ -319,6 +344,8 @@ def _run_role_with_retries(
                     failure_reason=f"attempt gated: {control_decision.reason or control_decision.code}",
                     raw_response_json=None, validated_payload_json=None,
                     usage=_unavailable_usage(provider_name, model_name, role, attempt_number), created_at=created_at,
+                    failure_code=gate_code, failure_stage=gate_stage, failure_retryable=gate_retryable,
+                    failure_metadata=gate_metadata,
                 ))
                 break
 
@@ -331,6 +358,7 @@ def _run_role_with_retries(
                 schema_version=prompt_def.schema_version, occurred_at=created_at,
             )]
             all_failures.extend(attempt_failures)
+            pf_code, pf_stage, pf_retryable, pf_metadata = _structured_failure_fields(attempt_failures)
             attempts.append(ResearchAttemptRecord(
                 attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
                 prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
@@ -338,6 +366,8 @@ def _run_role_with_retries(
                 provider=provider_name, model_name=model_name, success=False, failure_reason=f"provider unavailable: {exc}",
                 raw_response_json=None, validated_payload_json=None,
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
+                failure_code=pf_code, failure_stage=pf_stage, failure_retryable=pf_retryable,
+                failure_metadata=pf_metadata,
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
@@ -361,6 +391,7 @@ def _run_role_with_retries(
                     schema_version=prompt_def.schema_version, occurred_at=created_at,
                 )]
             all_failures.extend(attempt_failures)
+            rt_code, rt_stage, rt_retryable, rt_metadata = _structured_failure_fields(attempt_failures)
             attempts.append(ResearchAttemptRecord(
                 attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
                 prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
@@ -368,6 +399,8 @@ def _run_role_with_retries(
                 provider=provider_name, model_name=model_name, success=False, failure_reason=str(exc),
                 raw_response_json=None, validated_payload_json=None,
                 usage=_unavailable_usage(provider_name, model_name, role, attempt_number, exc), created_at=created_at,
+                failure_code=rt_code, failure_stage=rt_stage, failure_retryable=rt_retryable,
+                failure_metadata=rt_metadata,
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
@@ -429,6 +462,7 @@ def _run_role_with_retries(
                     schema_version=prompt_def.schema_version, occurred_at=created_at,
                 )]
             all_failures.extend(attempt_failures)
+            ro_code, ro_stage, ro_retryable, ro_metadata = _structured_failure_fields(attempt_failures)
             attempts.append(ResearchAttemptRecord(
                 attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
                 prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
@@ -436,6 +470,8 @@ def _run_role_with_retries(
                 provider=provider_name, model_name=model_name, success=False, failure_reason=str(exc),
                 raw_response_json=dict(response.parsed_json), validated_payload_json=None,
                 usage=response.usage, created_at=created_at,
+                failure_code=ro_code, failure_stage=ro_stage, failure_retryable=ro_retryable,
+                failure_metadata=ro_metadata,
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
@@ -451,6 +487,7 @@ def _run_role_with_retries(
 
         if not validation.is_valid:
             reasons = tuple(f.message for f in claim_failures) or ("claim validation failed",)
+            cv_code, cv_stage, cv_retryable, cv_metadata = _structured_failure_fields(claim_failures)
             attempts.append(ResearchAttemptRecord(
                 attempt_id=attempt_id, research_run_id=research_run_id, role=role, attempt_number=attempt_number,
                 prompt_name=prompt_def.name, prompt_version=prompt_def.version, prompt_hash=prompt_def.text_hash,
@@ -459,6 +496,8 @@ def _run_role_with_retries(
                 failure_reason="claim validation failed: " + "; ".join(reasons),
                 raw_response_json=dict(response.parsed_json), validated_payload_json=None,
                 usage=response.usage, created_at=created_at,
+                failure_code=cv_code, failure_stage=cv_stage, failure_retryable=cv_retryable,
+                failure_metadata=cv_metadata,
             ))
             if attempt_controller is not None and control_request is not None:
                 attempt_controller.after_attempt(control_request, attempts[-1])
@@ -641,6 +680,14 @@ def analyze_with_research_committee(
             if research_repository is not None:
                 research_repository.save_attempt_failures((required_role_failure,))
             continue
+        # This loop only ever runs analyst roles (the manager is invoked
+        # separately, below) — `_run_role_with_retries` is shared by both,
+        # so its return type is the union; this assertion documents and
+        # enforces that an analyst-role call never actually returns a
+        # `ResearchDecision` (Milestone 12.1 Item 10 safety-critical type
+        # check: narrows the type for `valid_reports`/`save_role_report`
+        # rather than silently accepting the wrong type).
+        assert isinstance(report, RoleResearchReport)
         valid_reports.append(report)
         if research_repository is not None:
             research_repository.save_role_report(report, attempts[-1].attempt_id, clock())

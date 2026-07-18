@@ -108,7 +108,7 @@ strategy quality.
 
 ## Persistence and rollout
 
-Schema migration 6 adds exact-Decimal append-only risk, lifecycle, calendar,
+Schema migration 10 adds exact-Decimal append-only risk, lifecycle, calendar,
 blackout, safety, and backtest structures. Existing records are not rewritten.
 The default YAML keeps the paper subsystem, lifecycle, ATR, trailing,
 breakeven, partial-profit, economic blackout, and external paper submission

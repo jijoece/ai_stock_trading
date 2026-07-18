@@ -195,10 +195,40 @@ def list_provider_requests_in_window(
 
 
 def list_provider_requests_for_cycle(conn: sqlite3.Connection, research_cycle_id: str) -> list[dict]:
-    """Exact immutable ownership query. Legacy uncorrelated rows never match."""
+    """Exact immutable ownership query, scoped only by cycle. Legacy
+    uncorrelated rows never match. Milestone 12.1 Item 7: this remains the
+    right query for historical cycle-wide reporting / aggregate provenance /
+    manual analysis / auditing — but NOT for a single scheduler run's
+    operational health decision, since a deterministic cycle ID can be
+    revisited by more than one scheduler run (a later catch-up/resumption
+    invocation), and this query alone cannot distinguish which run's
+    requests are which. Use `list_provider_requests_for_scheduled_run` for
+    that instead."""
     rows = conn.execute(
         "SELECT * FROM evidence_provider_requests WHERE research_cycle_id = ? "
         "ORDER BY created_at, request_id",
         (research_cycle_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_provider_requests_for_scheduled_run(
+    conn: sqlite3.Connection, *, research_cycle_id: str, scheduler_run_id: str,
+) -> list[dict]:
+    """Milestone 12.1 Item 7: the exact, operational-health-decision query —
+    scoped by BOTH `research_cycle_id` AND `scheduler_run_id`, and restricted
+    to `correlation_mode='SCHEDULED'` so a manual/research-cycle-only request
+    against the same deterministic cycle ID can never leak into a scheduled
+    run's health decision, and so a later scheduler run that revisits the
+    same cycle ID (a catch-up/resumption invocation) never sees an earlier
+    run's requests, or vice versa. This is the query
+    `_build_health_inputs_from_cycle_result` must use for the CURRENT
+    scheduler run's pause/hysteresis decision — `list_provider_requests_for_cycle`
+    remains correct only for historical/aggregate cycle-wide reporting."""
+    rows = conn.execute(
+        "SELECT * FROM evidence_provider_requests "
+        "WHERE correlation_mode = 'SCHEDULED' AND research_cycle_id = ? AND scheduler_run_id = ? "
+        "ORDER BY created_at, request_id",
+        (research_cycle_id, scheduler_run_id),
     ).fetchall()
     return [dict(row) for row in rows]

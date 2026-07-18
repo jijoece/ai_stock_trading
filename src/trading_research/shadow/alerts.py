@@ -188,7 +188,13 @@ class AlertDeliveryResult:
 
 
 class AlertSink(Protocol):
-    name: str
+    # A read-only property (not a plain mutable attribute) so a frozen
+    # dataclass implementation's `name` field — read-only by construction —
+    # satisfies this Protocol under Pyright's variance rules (Milestone 12.1
+    # Item 10 safety-critical type check: this was a real, if narrow, type
+    # error at the `_default_alert_sinks` call site in `shadow/scheduler.py`).
+    @property
+    def name(self) -> str: ...
 
     def send(self, alert: OperationalAlert) -> AlertDeliveryResult: ...
 
