@@ -496,6 +496,11 @@ def test_pricing_failure_cli_preflight_blocks_before_db_session(monkeypatch, db_
 
     from trading_research import cli as cli_mod
 
+    class _CfgStub:
+        anthropic_api_key = "sk-test-present"
+
+    monkeypatch.setattr(cli_mod, "load_config", lambda *a, **k: _CfgStub())
+
     result = cli_mod.run_due_shadow_cycle_cli(db_path, provider_mode="real", symbols=["AAPL"])
     assert result["status"] == "PRICING_NOT_CONFIGURED"
     assert not db_path.exists() or conn_has_no_scheduler_runs(db_path)

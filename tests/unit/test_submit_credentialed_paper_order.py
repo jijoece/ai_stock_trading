@@ -190,6 +190,15 @@ def test_submission_unknown_when_recovery_lookup_also_fails(conn, policy):
     assert outcome.status == STATUS_SUBMISSION_UNKNOWN
     assert outcome.submission.submission_status == "SUBMISSION_UNKNOWN"
 
+    # Milestone 11.2 Part 22: the recovery lookup's own failure must be
+    # persisted as bounded evidence, not silently discarded.
+    rows = conn.execute(
+        "SELECT stage FROM paper_execution_failures WHERE intent_id = ? ORDER BY occurred_at", (outcome.intent.intent_id,)
+    ).fetchall()
+    stages = [row["stage"] for row in rows]
+    assert "credentialed_recovery_lookup" in stages
+    assert "credentialed_submit" in stages
+
 
 def test_runtime_unavailable_during_initial_lookup(conn, policy):
     payload = buy_candidate_payload(rec_id="rec-8", symbol="SOFI", now=NOW)

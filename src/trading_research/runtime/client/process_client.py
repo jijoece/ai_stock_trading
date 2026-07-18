@@ -16,6 +16,7 @@ from typing import Protocol
 
 from . import PROTOCOL_VERSION
 from .errors import (
+    ProtocolViolationError,
     RuntimeCapabilityError,
     RuntimeOperationError,
     RuntimeRequestTimeoutError,
@@ -100,20 +101,43 @@ class SubprocessTransport:
         return self._process.poll() is None
 
     def terminate(self, timeout: float) -> None:
-        if not self.is_alive():
-            return
-        try:
-            self._process.stdin.close()
-        except Exception:
-            pass
-        try:
-            self._process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._process.terminate()
+        # Milestone 11.2 Part 20: always join the stdout/stderr pump
+        # threads and drop any buffered stdout after the process exits —
+        # even if it was already dead on entry — so repeated start/
+        # shutdown cycles never leak threads, and a stale queued response
+        # from before this terminate() can never be read by a future
+        # transport's caller (queues are per-instance, but clearing here
+        # is cheap insurance and keeps memory bounded).
+        if self.is_alive():
+            try:
+                self._process.stdin.close()
+            except Exception:
+                pass
             try:
                 self._process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self._process.kill()
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    try:
+                        self._process.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        pass
+        self._stdout_thread.join(timeout=timeout)
+        self._stderr_thread.join(timeout=timeout)
+        try:
+            while True:
+                self._stdout_queue.get_nowait()
+        except queue.Empty:
+            pass
+        for stream in (self._process.stdout, self._process.stderr, self._process.stdin):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
 
 class RuntimeClient:
@@ -142,9 +166,20 @@ class RuntimeClient:
         self._runtime_version: str | None = None
         self.last_health: dict | None = None
         self.last_capabilities: dict | None = None
+        # Milestone 11.2 Part 19: after an uncertain timeout, a late
+        # response can still be sitting in the transport's stdout queue.
+        # Reusing the same process for a later request risks that later
+        # request reading the *prior* request's stale response instead of
+        # its own — `parse_response_line`'s request_id check would catch
+        # the immediate mismatch, but every subsequent call remains
+        # permanently off-by-one after that. Once a timeout occurs this
+        # transport is marked unhealthy and torn down; no further request
+        # is ever sent on it — the caller must call `start()` again.
+        self._unhealthy = False
 
     def start(self) -> None:
         self._transport = self._transport_factory(self._command, cwd=self._cwd, env=self._env)
+        self._unhealthy = False
         try:
             health = self._request("health", {}, timeout=self._startup_timeout_seconds)
         except RuntimeRequestTimeoutError as exc:
@@ -181,6 +216,20 @@ class RuntimeClient:
         if self._transport is not None:
             self._transport.terminate(timeout)
 
+    def _mark_unhealthy_after_timeout(self) -> None:
+        """Milestone 11.2 Part 19: never reuse this transport once a
+        response mismatch proves its stdout stream is desynced (a stale,
+        late response from a prior timed-out request was just consumed by
+        a different request). Terminates the child and joins its pump
+        threads (Part 20) immediately rather than waiting for an explicit
+        `shutdown()` that may never come."""
+        self._unhealthy = True
+        if self._transport is not None:
+            try:
+                self._transport.terminate(self._startup_timeout_seconds)
+            except Exception:
+                pass
+
     def diagnostics(self) -> list[str]:
         """Drain stderr without crossing third-party text into the main process.
 
@@ -197,6 +246,11 @@ class RuntimeClient:
     def _request(self, operation: str, payload: dict, *, timeout: float | None = None) -> dict:
         if self._transport is None:
             raise RuntimeUnavailableError("runtime client has not been started")
+        if self._unhealthy:
+            raise RuntimeUnavailableError(
+                "runtime transport is unhealthy after a prior request timeout — "
+                "a clean restart (start()) is required before any further request"
+            )
         timeout = timeout if timeout is not None else self._request_timeout_seconds
         request_id, line = build_request_line(operation, payload)
         if not self._transport.is_alive():
@@ -208,6 +262,15 @@ class RuntimeClient:
         try:
             raw = self._transport.read_line(timeout)
         except queue.Empty as exc:
+            # Deliberately does NOT mark the transport unhealthy here: a
+            # bounded, explicitly-allowlisted read-only follow-up lookup
+            # (`_RETRYABLE_ON_TIMEOUT`, e.g. `get_order` after a timed-out
+            # `submit_order`) is the documented, tested recovery path for
+            # resolving an ambiguous outcome — it must keep working. If the
+            # timed-out call's late response is still queued when that
+            # follow-up reads, `parse_response_line`'s request_id/operation
+            # check below catches the mismatch and marks unhealthy there,
+            # exactly when desync is actually detected.
             retryable = operation in _RETRYABLE_ON_TIMEOUT
             raise RuntimeRequestTimeoutError(
                 f"no response to {operation!r} (request_id={request_id}) within {timeout}s", retryable=retryable,
@@ -222,7 +285,15 @@ class RuntimeClient:
                 f"runtime is available again (stderr: {self.diagnostics()!r})"
             )
 
-        response = parse_response_line(raw, expected_request_id=request_id, expected_operation=operation)
+        try:
+            response = parse_response_line(raw, expected_request_id=request_id, expected_operation=operation)
+        except ProtocolViolationError:
+            # A response that doesn't match what we asked for means the
+            # stdout stream is desynced (e.g. a prior timed-out request's
+            # late response was just consumed here) — never trust this
+            # transport again without a clean restart.
+            self._mark_unhealthy_after_timeout()
+            raise
         if not response["success"]:
             error = response["error"]
             raise RuntimeOperationError(error["code"], error["message"], retryable=response["retryable"])

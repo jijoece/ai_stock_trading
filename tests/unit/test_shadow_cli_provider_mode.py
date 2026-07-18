@@ -51,7 +51,11 @@ def test_real_mode_anthropic_missing_pricing_fails_closed(db_path, monkeypatch):
         def require_ready(self):
             return None
 
+    class _CfgStub:
+        anthropic_api_key = "sk-test-present"
+
     monkeypatch.setattr(research_configuration_mod, "load_research_config", lambda: _Stub())
+    monkeypatch.setattr(cli_mod, "load_config", lambda *a, **k: _CfgStub())
     result = cli_mod.run_due_shadow_cycle_cli(db_path, provider_mode="real", symbols=["AAPL"])
     assert result["status"] == "PRICING_NOT_CONFIGURED"
     assert not db_path.exists()

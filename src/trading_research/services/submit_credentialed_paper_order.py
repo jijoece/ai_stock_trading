@@ -132,12 +132,21 @@ def submit_credentialed_paper_order(
         response = client.submit_order(payload)
     except (RuntimeUnavailableError, RuntimeRequestTimeoutError, RuntimeOperationError) as exc:
         # Ambiguous: the broker may have received the order despite the
-        # error. One recovery lookup, never a blind resubmit.
+        # error. One recovery lookup, never a blind resubmit. Milestone
+        # 11.2 Part 22: a failure of this recovery lookup itself must not
+        # be silently discarded — it is bounded, sanitized evidence in its
+        # own right (distinct from the original submit failure recorded
+        # below), since it could indicate a different, more urgent problem
+        # (e.g. credentials expired between the submit and the lookup).
         recovered = None
         try:
             recovered = client.get_order(client_order_id)
-        except Exception:
+        except Exception as lookup_exc:
             recovered = None
+            exec_repo.record_failure(
+                conn, recommendation_id=recommendation_id, intent_id=intent.intent_id,
+                stage="credentialed_recovery_lookup", reason=str(lookup_exc), now=now,
+            )
         if recovered is not None:
             exec_repo.update_submission_status(
                 conn, intent_id=intent.intent_id, submission_status=recovered["status"],

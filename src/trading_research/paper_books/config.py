@@ -116,6 +116,8 @@ class ExternalBrokerSection:
     permitted_order_types: tuple[str, ...]
     permitted_time_in_force: tuple[str, ...]
     maximum_retry_attempts: int = 1
+    order_lease_ttl_seconds: int = 30
+    order_lease_heartbeat_seconds: int = 10
 
     def __post_init__(self) -> None:
         if self.provider not in KNOWN_EXTERNAL_BROKER_PROVIDERS:
@@ -168,6 +170,16 @@ class ExternalBrokerSection:
             )
         if not self.require_explicit_preview:
             raise PaperBooksConfigError("external_broker.require_explicit_preview must be true")
+        if not 1 <= self.order_lease_ttl_seconds <= 3600:
+            raise PaperBooksConfigError("external_broker.order_lease_ttl_seconds must be in [1,3600]")
+        if not 1 <= self.order_lease_heartbeat_seconds <= 3600:
+            raise PaperBooksConfigError("external_broker.order_lease_heartbeat_seconds must be in [1,3600]")
+        # Part 10: TTL must exceed heartbeat x safety factor so a heartbeat
+        # sent just before expiry always lands with margin to spare.
+        if self.order_lease_ttl_seconds < self.order_lease_heartbeat_seconds * 2:
+            raise PaperBooksConfigError(
+                "external_broker.order_lease_ttl_seconds must be at least 2x order_lease_heartbeat_seconds"
+            )
 
 
 @dataclass(frozen=True)
@@ -653,6 +665,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
                 "require_explicit_preview", "require_recent_preview_seconds",
                 "maximum_order_notional_usd", "permitted_order_types",
                 "permitted_time_in_force", "maximum_retry_attempts",
+                "order_lease_ttl_seconds", "order_lease_heartbeat_seconds",
             },
             "external_broker",
         )
@@ -691,6 +704,14 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             maximum_retry_attempts=_strict_int(
                 external_raw.get("maximum_retry_attempts", 1),
                 "external_broker.maximum_retry_attempts", minimum=1, maximum=3,
+            ),
+            order_lease_ttl_seconds=_strict_int(
+                external_raw.get("order_lease_ttl_seconds", 30),
+                "external_broker.order_lease_ttl_seconds", minimum=1, maximum=3_600,
+            ),
+            order_lease_heartbeat_seconds=_strict_int(
+                external_raw.get("order_lease_heartbeat_seconds", 10),
+                "external_broker.order_lease_heartbeat_seconds", minimum=1, maximum=3_600,
             ),
         )
     except PaperBooksConfigError:

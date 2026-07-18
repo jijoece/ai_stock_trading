@@ -1,6 +1,8 @@
 # Agentic Trading Desk
 
-> **Research and paper-trading only. No real orders are placed, prepared, previewed, or staged anywhere in this codebase. Not financial advice.**
+> **Research and paper-trading only. Live trading is not implemented anywhere in this codebase. Not financial advice.**
+>
+> Local-simulated paper execution is the default. Milestone 11 added an explicit, operator-initiated external paper-execution path limited to Alpaca's paper-trading account only (never a live/production broker endpoint) — it previews and submits real Alpaca **paper** orders, but only when an operator explicitly enables it in configuration and explicitly invokes preview/submit; it is disabled by default, and recurring/scheduled runs never submit externally. See [External Paper Broker (Milestone 11)](#external-paper-broker-milestone-11) below.
 
 A personal AI-assisted stock research and paper-trading desk that combines a **deterministic Python pipeline** (screening, scoring, risk management, paper ledger, evaluation) with **bounded Claude AI reasoning** (sentiment classification, rationale writing) and a **read-only Robinhood MCP** interface for interactive portfolio-aware analysis.
 
@@ -790,4 +792,4 @@ You: "Analyze AAPL for a potential entry"
 
 ---
 
-*Research and evaluation only. Not financial advice. No real orders were placed, prepared, previewed, or staged in this repository.*
+*Research and evaluation only. Not financial advice. Live trading is not implemented. External order preview/submission, when present, is limited to an explicitly operator-enabled Alpaca **paper**-account path (disabled by default) — see the safety banner at the top of this file.*

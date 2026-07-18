@@ -726,7 +726,8 @@ CREATE TABLE IF NOT EXISTS paper_external_order_leases (
     heartbeat_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     released_at TEXT,
-    status TEXT NOT NULL
+    status TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -1029,11 +1030,34 @@ BEFORE DELETE ON paper_external_broker_fills
 BEGIN SELECT RAISE(ABORT, 'paper external broker fills are immutable'); END;
 -- Every field is immutable except the one-time transition of
 -- consumed_by_retry_event_id from NULL to a retry event ID (Part 5: a
--- consumed lookup can never be reused to authorize another retry).
+-- consumed lookup can never be reused to authorize another retry). This
+-- trigger's *body* is versioned explicitly in _TRIGGER_UPGRADES below
+-- (Milestone 11.2 Part 3/18) — CREATE TRIGGER IF NOT EXISTS alone cannot
+-- change the behavior of a trigger that already exists under this name on
+-- a database created by older code (e.g. a pre-11.2 "prohibit every
+-- update" or the interim "only checks OLD.consumed_by_retry_event_id"
+-- version), so upgrading here only affects brand-new databases.
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_update
 BEFORE UPDATE ON paper_external_order_lookups
-WHEN OLD.consumed_by_retry_event_id IS NOT NULL
-BEGIN SELECT RAISE(ABORT, 'paper external order lookup consumption is recorded once'); END;
+WHEN NOT (
+    NEW.lookup_id IS OLD.lookup_id
+    AND NEW.book_id IS OLD.book_id
+    AND NEW.paper_order_intent_id IS OLD.paper_order_intent_id
+    AND NEW.client_order_id IS OLD.client_order_id
+    AND NEW.account_fingerprint IS OLD.account_fingerprint
+    AND NEW.result IS OLD.result
+    AND NEW.authoritative IS OLD.authoritative
+    AND NEW.runtime_request_id IS OLD.runtime_request_id
+    AND NEW.created_at IS OLD.created_at
+    AND NEW.attempt_number IS OLD.attempt_number
+    AND NEW.ambiguous_event_id IS OLD.ambiguous_event_id
+    AND NEW.payload_hash IS OLD.payload_hash
+    AND NEW.lookup_started_at IS OLD.lookup_started_at
+    AND NEW.lookup_completed_at IS OLD.lookup_completed_at
+    AND OLD.consumed_by_retry_event_id IS NULL
+    AND NEW.consumed_by_retry_event_id IS NOT NULL
+)
+BEGIN SELECT RAISE(ABORT, 'paper external order lookup rows are immutable except a single NULL to non-NULL consumed_by_retry_event_id transition'); END;
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_lookups_no_delete
 BEFORE DELETE ON paper_external_order_lookups
 BEGIN SELECT RAISE(ABORT, 'paper external order lookups are immutable'); END;
@@ -1097,6 +1121,12 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
         "lookup_completed_at": "TEXT",
         "consumed_by_retry_event_id": "TEXT",
     },
+    # Milestone 11.2 Part 10: a fencing generation, incremented on every
+    # acquisition (fresh or reclaimed-stale), so a stale owner's write after
+    # a takeover can be rejected even if it still believes it holds the lease.
+    "paper_external_order_leases": {
+        "generation": "INTEGER NOT NULL DEFAULT 1",
+    },
 }
 
 
@@ -1110,9 +1140,56 @@ def _ensure_columns(conn) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
 
+# Milestone 11.2 Part 3/18: `CREATE TRIGGER IF NOT EXISTS` cannot change the
+# *behavior* of a trigger that already exists under the same name on a
+# database created by older code. Any trigger whose semantics change across
+# a milestone must bump its version here so `_upgrade_triggers` explicitly
+# drops the stale definition before the (versionless) CREATE statements in
+# `PAPER_BOOKS_TRIGGERS` recreate it with current behavior.
+_TRIGGER_VERSIONS = {
+    # v1 (Milestone 11.1): `WHEN OLD.consumed_by_retry_event_id IS NOT NULL`
+    #     — blocks re-consumption but otherwise permits arbitrary field
+    #     changes on an unconsumed row.
+    # v2 (Milestone 11.2 Part 18): permits only the single controlled
+    #     NULL -> non-NULL `consumed_by_retry_event_id` transition; every
+    #     other field, and any other kind of change to that field, aborts.
+    "trg_paper_external_lookups_no_update": 2,
+}
+
+
+def _upgrade_triggers(conn) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS paper_books_trigger_versions ("
+        "trigger_name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+    )
+    stored = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT trigger_name, version FROM paper_books_trigger_versions").fetchall()
+    }
+    existing_triggers = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall()
+    }
+    for name, current_version in _TRIGGER_VERSIONS.items():
+        recorded = stored.get(name)
+        if recorded is None:
+            # Unversioned trigger predates this table: if it already exists
+            # on disk it may carry stale (e.g. pre-Milestone-11.2) behavior,
+            # so treat it as version 0 and force the drop/recreate below.
+            recorded = 0 if name in existing_triggers else current_version
+        if recorded < current_version:
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(
+                "INSERT INTO paper_books_trigger_versions (trigger_name, version) VALUES (?, ?) "
+                "ON CONFLICT(trigger_name) DO UPDATE SET version = excluded.version",
+                (name, current_version),
+            )
+
+
 def apply_paper_books_schema(conn) -> None:
     conn.executescript(PAPER_BOOKS_DDL)
     _ensure_columns(conn)
     conn.executescript(PAPER_BOOKS_INDEXES)
+    _upgrade_triggers(conn)
     conn.executescript(PAPER_BOOKS_TRIGGERS)
     conn.commit()

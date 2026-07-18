@@ -20,6 +20,7 @@ from ..hashing import hash_config
 from ..research.provider_provenance import compute_real_provider_history
 from ..shadow import pause as pause_mod
 from ..shadow import readiness as shadow_readiness
+from ..storage.database import begin_immediate
 from ..storage import paper_books_repositories as pb_repo
 from ..storage import shadow_alerts_repositories as alerts_repo
 from ..storage.research_cycle_repositories import SQLiteResearchCycleRepository
@@ -278,10 +279,28 @@ def validate_activation_review(
     if not successful_verifications:
         reasons.append("activation review has no successful, fresh cross-book verification")
 
-    success_count = int((review.get("provider_success_counts") or {}).get("real_provider_success_cycles", 0))
-    required = paper_books_config.soak_campaign.minimum_successful_real_provider_cycles
-    if success_count < required:
-        reasons.append(f"successful real-provider cycles {success_count} < required {required}")
+    # Milestone 11.2 Part 16: `real_provider_success_cycles` counts a cycle
+    # merely because at least one real provider succeeded — it is not the
+    # project's required-provider policy and does not disqualify a cycle
+    # where another required real provider FAILED alongside a success.
+    # `qualifying_real_provider_cycles` (provider_provenance.py's
+    # `qualifying_real_provider_cycle_count`) is the strict metric: every
+    # observed real-provider row in the cycle must have succeeded. A
+    # legacy review persisted before this field existed has no key here at
+    # all (as opposed to a legitimate 0) and must fail closed rather than
+    # silently falling back to the looser metric or treating absence as 0
+    # cycles by coincidence.
+    provider_success_counts = review.get("provider_success_counts") or {}
+    if "qualifying_real_provider_cycles" not in provider_success_counts:
+        reasons.append(
+            "activation review predates qualifying-provider-cycle evidence "
+            "(legacy review) — regenerate the activation review"
+        )
+    else:
+        qualifying_count = int(provider_success_counts["qualifying_real_provider_cycles"])
+        required = paper_books_config.soak_campaign.minimum_successful_real_provider_cycles
+        if qualifying_count < required:
+            reasons.append(f"qualifying real-provider cycles {qualifying_count} < required {required}")
 
     created_at = datetime.fromisoformat(review["created_at"])
     if created_at.tzinfo is None:
@@ -604,8 +623,8 @@ def acquire_recurring_lease(
     owner_id = _bounded_text(owner_id, "owner_id")
     now = _aware(now, "now")
     expires = now + timedelta(seconds=ttl_seconds)
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         row = conn.execute(
             "SELECT * FROM paper_recurring_scheduler_leases WHERE lease_name = ?", (LEASE_NAME,)
         ).fetchone()
@@ -750,8 +769,8 @@ def _claim_queue_items(
     lease_ttl_seconds: int,
 ) -> list[dict]:
     cutoff = (now - timedelta(seconds=lease_ttl_seconds)).isoformat()
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         # Recover only abandoned claims: same deterministic retry run, a
         # terminal failed run, or an expired orphan with no run evidence.
         conn.execute(
@@ -800,8 +819,8 @@ def _finalize_queue_items(
     operator_run_id: str | None, now: datetime,
 ) -> None:
     processed = set(processed_cycle_ids)
-    conn.execute("BEGIN IMMEDIATE")
     try:
+        begin_immediate(conn)
         for item in items:
             if item["cycle_id"] in processed:
                 conn.execute(

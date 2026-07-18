@@ -13,6 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..storage import paper_books_repositories as repo
+from ..storage.database import begin_immediate
 from .models import (
     CASH_EVENT_BUY_RESERVATION,
     CASH_EVENT_BUY_SETTLEMENT,
@@ -87,12 +88,38 @@ def reserve_for_order(
     conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime,
     *, commit: bool = True,
 ) -> bool:
+    """Milestone 11.2 Part 7: the settled-cash/existing-reservations read and
+    the reservation insert must be serialized at book scope — otherwise two
+    concurrent BUY intents can both observe enough available cash before
+    either commits and together reserve more than exists. When `commit=True`
+    (the only mode any caller currently uses) this function owns its own
+    `BEGIN IMMEDIATE` book-scoped lock end-to-end. `commit=False` is reserved
+    for a caller that has *already* acquired its own book-scoped write lock
+    (e.g. is itself inside a `begin_immediate` block) and wants this
+    reservation to participate in that outer transaction instead."""
     idem = f"reserve:{paper_order_intent_id}"
+    if not commit:
+        return _reserve_for_order_locked(conn, book_id, paper_order_intent_id, notional_usd, now, idem, commit=False)
+    try:
+        begin_immediate(conn)
+        result = _reserve_for_order_locked(conn, book_id, paper_order_intent_id, notional_usd, now, idem, commit=False)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _reserve_for_order_locked(
+    conn, book_id: str, paper_order_intent_id: str, notional_usd: Decimal, now: datetime, idem: str,
+    *, commit: bool,
+) -> bool:
     if repo.cash_ledger_entry_exists(conn, book_id, idem):
         return False
-    if notional_usd > available_cash(conn, book_id):
+    current_available = available_cash(conn, book_id)
+    if notional_usd > current_available:
         raise InsufficientCashError(
-            f"book {book_id}: cannot reserve {notional_usd} — only {available_cash(conn, book_id)} available"
+            f"book {book_id}: cannot reserve {notional_usd} — only {current_available} available"
         )
     entry = CashLedgerEntry(
         book_id=book_id, ledger_entry_id=idem, event_type=CASH_EVENT_BUY_RESERVATION,

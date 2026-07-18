@@ -363,6 +363,23 @@ def external_paper_retry_cli(
     )
 
 
+def external_paper_refresh_retry_preview_cli(
+    db_path: Path, *, book_id: str, intent_id: str, operator: str, reason: str,
+) -> dict:
+    """Part 17: read-only, no broker/runtime call — does not route through
+    `_external_paper_cli` (which spawns the isolated runtime subprocess)."""
+    from .paper_books.config import load_paper_books_config
+    from .paper_books.external_broker import refresh_retry_preview
+    try:
+        with session(db_path) as conn:
+            return refresh_retry_preview(
+                conn, book_id=book_id, paper_order_intent_id=intent_id, operator=operator,
+                reason=reason, config=load_paper_books_config(),
+            )
+    except Exception as exc:
+        return {"error": _sanitized_cli_error(exc)}
+
+
 def external_paper_order_show_cli(db_path: Path, *, book_id: str, client_order_id: str) -> dict:
     from .paper_books.external_broker import show_external_paper_order
     try:
@@ -2379,6 +2396,14 @@ def main(argv: list[str] | None = None) -> int:
     p_external_retry.add_argument("--intent-id", required=True)
     p_external_retry.add_argument("--operator", required=True)
     p_external_retry.add_argument("--reason", required=True)
+    p_external_refresh = sub.add_parser(
+        "external-paper-refresh-retry-preview",
+        help="Refresh an expired preview for an order confirmed UNKNOWN_REQUIRES_RECONCILIATION (read-only, no broker call)",
+    )
+    p_external_refresh.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_refresh.add_argument("--intent-id", required=True)
+    p_external_refresh.add_argument("--operator", required=True)
+    p_external_refresh.add_argument("--reason", required=True)
     p_external_queue = sub.add_parser(
         "external-paper-queue-show", help="Show the external submission queue's derived status (read-only)",
     )
@@ -2944,6 +2969,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "external-paper-retry-submit":
         cfg = load_config()
         outcome = external_paper_retry_cli(
+            cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
+            operator=args.operator, reason=args.reason,
+        )
+    elif args.command == "external-paper-refresh-retry-preview":
+        cfg = load_config()
+        outcome = external_paper_refresh_retry_preview_cli(
             cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
             operator=args.operator, reason=args.reason,
         )

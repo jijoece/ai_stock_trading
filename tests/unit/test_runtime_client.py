@@ -194,3 +194,77 @@ def test_safe_shutdown_terminates_transport():
     start_ready_client(client, fake)
     client.shutdown()
     assert fake.terminated is True
+
+
+def test_timeout_alone_does_not_block_the_documented_recovery_lookup():
+    """Milestone 11.2 Part 19: a timeout on a mutating call must not itself
+    disable the client — the explicitly-allowlisted read-only follow-up
+    lookup (e.g. get_order after submit_order times out) is the documented
+    recovery path and must still be able to run cleanly on the same
+    transport when no actual desync occurred."""
+    fake = FakeTransport()
+    client = _client(fake)
+    start_ready_client(client, fake)
+    fake.queue_timeout()
+    with pytest.raises(RuntimeRequestTimeoutError):
+        client.submit_order({"intent_id": "i1"})
+    fake.queue_success({"intent_id": "i1", "status": "ACCEPTED"})
+    result = client.get_order("i1")
+    assert result["status"] == "ACCEPTED"
+
+
+def test_late_stale_response_after_timeout_poisons_the_next_call_and_client_is_marked_unhealthy():
+    """Milestone 11.2 Part 19/36: request A times out; its late response
+    (still carrying A's own request_id/operation) is the next thing on the
+    wire when request B is sent. B must detect the mismatch (never silently
+    treat A's response as its own), and the client must then refuse any
+    further request until an explicit restart — no request C may be sent on
+    this now-desynced transport."""
+    fake = FakeTransport()
+    client = _client(fake)
+    start_ready_client(client, fake)
+
+    fake.queue_timeout()
+    with pytest.raises(RuntimeRequestTimeoutError):
+        client.submit_order({"intent_id": "i1"})
+    stale_request_line = fake.written_lines[-1]
+    import json as _json
+
+    stale = _json.loads(stale_request_line)
+
+    # Request B (a different, later call) receives A's late response.
+    fake.queue_raw_line(_json.dumps({
+        "protocol_version": stale["protocol_version"], "request_id": stale["request_id"],
+        "operation": stale["operation"], "runtime_version": "fake-runtime-1",
+        "success": True, "retryable": False, "error": None,
+        "payload": {"intent_id": "i1", "status": "ACCEPTED"},
+    }))
+    with pytest.raises(ProtocolViolationError):
+        client.get_order("i2")  # B: a different, unrelated request
+
+    # Request C must never reach the wire on this transport.
+    lines_before = len(fake.written_lines)
+    with pytest.raises(RuntimeUnavailableError, match="unhealthy"):
+        client.get_order("i3")
+    assert len(fake.written_lines) == lines_before  # C was never even written
+    assert fake.terminated is True  # transport was torn down
+
+
+def test_repeated_start_shutdown_cycles_join_pump_threads_without_leaking():
+    """Milestone 11.2 Part 20: uses the real `SubprocessTransport` (a real,
+    trivial child process) across several start/shutdown cycles and asserts
+    no pump threads are left running afterward."""
+    import threading
+
+    from trading_research.runtime.client.process_client import SubprocessTransport
+
+    before = {t.ident for t in threading.enumerate()}
+    for _ in range(3):
+        transport = SubprocessTransport(["python3", "-c", "import sys; sys.stdin.read()"])
+        assert transport.is_alive()
+        transport.terminate(timeout=5.0)
+        assert not transport.is_alive()
+        assert not transport._stdout_thread.is_alive()
+        assert not transport._stderr_thread.is_alive()
+    after = {t.ident for t in threading.enumerate()}
+    assert after <= before  # no new threads left running

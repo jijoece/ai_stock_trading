@@ -291,6 +291,113 @@ def test_authoritative_not_found_allows_one_explicit_retry():
         )
 
 
+def test_refresh_retry_preview_unblocks_retry_after_original_preview_expires():
+    """Milestone 11.2 Part 17/37: UNKNOWN -> authoritative NOT_FOUND ->
+    original preview expires -> explicit refresh-retry-preview -> explicit
+    retry -> lookup consumed exactly once."""
+    from trading_research.paper_books.external_broker import refresh_retry_preview
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    lookup = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert lookup["status"] == "ORDER_MISSING_AT_BROKER"
+
+    # Original preview (require_recent_preview_seconds=300) has now expired.
+    much_later = NOW + timedelta(seconds=600)
+    runtime.raise_submit = False
+    with pytest.raises(ExternalPaperError, match="expired"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry with stale preview", runtime=runtime, config=cfg, clock=lambda: much_later,
+        )
+
+    refreshed = refresh_retry_preview(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="original preview expired while broker lookup was pending", config=cfg, clock=lambda: much_later,
+    )
+    assert refreshed["result"] == "APPROVED"
+    assert refreshed["preview_id"] != preview["preview_id"]  # new preview ID and expiry
+    assert refreshed["expires_at"] > much_later.isoformat()
+
+    # The lookup is still unconsumed by the refresh itself.
+    lookup_row = repo.load_latest_external_lookup(conn, "BASELINE", preview["client_order_id"])
+    assert lookup_row["consumed_by_retry_event_id"] is None
+    original_lookup_id = lookup_row["lookup_id"]
+
+    retried = retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="retry after refresh", runtime=runtime, config=cfg, clock=lambda: much_later,
+    )
+    assert retried["status"] == STATE_SUBMITTED
+    assert runtime.submit_calls == 2
+
+    # The original lookup that authorized this retry is now consumed exactly
+    # once (a later, unrelated reconciliation lookup for the new SUBMITTED
+    # state may also exist — that one is untouched by consumption).
+    consumed = conn.execute(
+        "SELECT consumed_by_retry_event_id FROM paper_external_order_lookups WHERE lookup_id = ?",
+        (original_lookup_id,),
+    ).fetchone()
+    assert consumed["consumed_by_retry_event_id"] is not None
+
+
+def test_refresh_retry_preview_rejected_once_broker_order_is_found():
+    """Refresh cannot occur after the broker order is actually found —
+    once reconciliation resolves UNKNOWN to a real state, there is nothing
+    left to refresh."""
+    from trading_research.paper_books.external_broker import refresh_retry_preview
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    with pytest.raises(ExternalPaperError, match="UNKNOWN_REQUIRES_RECONCILIATION") as excinfo:
+        refresh_retry_preview(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="should not be allowed", config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "REFRESH_NOT_ALLOWED"
+
+
+def test_refresh_retry_preview_makes_no_broker_call():
+    from trading_research.paper_books.external_broker import refresh_retry_preview
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    calls_before = runtime.submit_calls
+    refresh_retry_preview(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="refresh only", config=cfg, clock=lambda: NOW + timedelta(seconds=600),
+    )
+    assert runtime.submit_calls == calls_before  # no broker mutation
+
+
 def test_consumed_lookup_cannot_authorize_a_second_retry_until_fresh_evidence():
     conn = connect(":memory:")
     _seed(conn)
@@ -389,7 +496,7 @@ def test_concurrent_submit_blocked_by_order_lease_performs_no_runtime_mutation()
         owner_id="other-caller", operation="SUBMIT", now=NOW.isoformat(),
         expires_at=(NOW + timedelta(seconds=30)).isoformat(),
     )
-    assert held is True
+    assert isinstance(held, int) and held >= 1  # acquired generation (Part 10)
     with pytest.raises(ExternalPaperError, match="lease"):
         submit_external_paper_order(
             conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
@@ -533,6 +640,105 @@ def test_fill_application_internal_failure_persists_critical_reconciliation(monk
     assert result["critical"] == 1
 
 
+class _InstantFillRuntime(FakeRuntime):
+    """Milestone 11.2 Part 12/13: a broker that fills the order synchronously
+    within the submit/cancel response itself (no separate reconciliation
+    round-trip needed to observe the fill) — used to exercise the fill sweep
+    that runs directly inside `_submit_once`/`cancel_external_paper_order`,
+    as opposed to the separately-tested reconciliation-triggered sweep."""
+
+    def submit_limit_order(self, payload):
+        order = super().submit_limit_order(payload)
+        self.add_fill(payload["quantity"])
+        return dict(self.order)
+
+    def cancel_external_order(self, book_id, client_order_id, account_fingerprint):
+        if not self.fills:
+            self.add_fill(Decimal(str(self.order["quantity"])) / 2)
+        self.cancel_calls += 1
+        self.order["status"] = "CANCELLED"
+        return dict(self.order)
+
+
+class _CancelFillsRuntime(FakeRuntime):
+    """Fills half the order only when cancellation is requested (submission
+    itself leaves the order open) — models a fill that raced ahead of a
+    cancel request and is only discovered in the cancel response."""
+
+    def cancel_external_order(self, book_id, client_order_id, account_fingerprint):
+        if not self.fills:
+            self.add_fill(Decimal(str(self.order["quantity"])) / 2)
+        self.cancel_calls += 1
+        self.order["status"] = "CANCELLED"
+        return dict(self.order)
+
+
+def test_post_submit_fill_sweep_failure_persists_critical_reconciliation_before_raising(monkeypatch):
+    """Milestone 11.2 Part 12: a fill-application failure that happens
+    *inside* `_submit_once`'s own post-submit fill sweep (not a later
+    reconciliation call) must still persist critical evidence before the
+    exception propagates — previously this sweep was completely
+    unprotected."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), _InstantFillRuntime()
+    preview = _preview(conn, runtime, cfg)
+    import trading_research.paper_books.external_broker as external_broker_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated crash applying the instant fill")
+
+    monkeypatch.setattr(external_broker_module.positions, "apply_buy_fill", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+            operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    records = repo.list_external_reconciliations(conn, "BASELINE", preview["client_order_id"])
+    assert len(records) == 1
+    assert records[0]["critical"] == 1
+    assert records[0]["status"] == "FILL_APPLICATION_FAILED"
+    assert records[0]["details"]["stage"] == "post_submit_fill_sweep"
+
+
+def test_post_cancel_fill_sweep_failure_persists_critical_and_withholds_reservation_release(monkeypatch):
+    """Milestone 11.2 Part 13: a fill discovered inside a cancellation
+    response's own fill sweep that fails to apply must persist critical
+    evidence, and must NOT release the reservation or mark the order
+    terminal — the exposure stays visibly unresolved."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), _CancelFillsRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    import trading_research.paper_books.external_broker as external_broker_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated crash applying the pre-cancel fill")
+
+    monkeypatch.setattr(external_broker_module.positions, "apply_buy_fill", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        cancel_external_paper_order(
+            conn, book_id="BASELINE", client_order_id=preview["client_order_id"],
+            operator="alice", reason="risk reduction", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    records = repo.list_external_reconciliations(conn, "BASELINE", preview["client_order_id"])
+    assert records[-1]["critical"] == 1
+    assert records[-1]["details"]["stage"] == "post_cancel_fill_sweep"
+
+    # Order status was never advanced to a terminal cancelled state.
+    order = repo.load_order_intent(conn, "BASELINE", "intent-1")
+    assert order["status"] != "CANCELLED"
+    # Cash reservation remains — it was never released.
+    remaining = cash_ledger.remaining_buy_reservation(conn, "BASELINE", "intent-1")
+    assert remaining > 0
+
+
 def test_reconciliation_internal_error_from_numeric_conversion_is_critical(monkeypatch):
     conn = connect(":memory:")
     _seed(conn)
@@ -621,6 +827,52 @@ def test_materially_identical_order_under_another_client_id_is_duplicate():
     assert result["status"] == "BROKER_ORDER_DUPLICATE"
     assert result["critical"] == 1
     assert result["details"]["duplicate_client_order_id"] == shadow["client_order_id"]
+
+
+def test_manually_created_order_without_project_prefix_is_detected_as_duplicate():
+    """Milestone 11.2 Part 15: a manually-created (or another application's)
+    Alpaca order never carries this project's `epb-{book_id}-` client_order_id
+    prefix — it must still be detected as a duplicate by shape/timing, not
+    silently skipped merely because the prefix is absent."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    manual = dict(runtime.order)
+    manual["client_order_id"] = "manual-web-ui-order-0001"  # no epb-baseline- prefix at all
+    manual["broker_order_id"] = "broker-manual"
+    runtime.recent_orders = [dict(runtime.order), manual]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "BROKER_ORDER_DUPLICATE"
+    assert result["critical"] == 1
+    assert result["details"]["duplicate_client_order_id"] == "manual-web-ui-order-0001"
+
+
+def test_malformed_recent_orders_response_fails_closed():
+    """Malformed/oversized recent-order results must raise (fail closed),
+    not silently report 'no duplicate found'."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="paper test", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.recent_orders = ["not-a-dict"]
+    result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert result["status"] == "RECONCILIATION_INTERNAL_ERROR"
+    assert result["critical"] == 1
 
 
 def test_unrelated_recent_order_is_not_flagged_duplicate():
@@ -1321,3 +1573,57 @@ def test_external_evidence_permanently_blocks_local_simulated_fill():
             conn, intent, execution.MarketSimulationInput(Decimal("39"), Decimal("39")), NOW,
         )
     assert repo.list_fills_for_intent(conn, "BASELINE", "intent-1") == []
+
+
+def test_local_fill_blocks_subsequent_external_preview():
+    """Milestone 11.2 Part 9 (reverse invariant): once the local simulator
+    has filled an intent, external preview/submit/retry must refuse it —
+    no intent may be filled in both namespaces."""
+    conn = connect(":memory:")
+    _seed(conn)
+    order_intent = PaperBookOrderIntent(
+        paper_order_intent_id="intent-1", book_id="BASELINE", experiment_arm="BASELINE",
+        cycle_id="cycle-1", recommendation_id="rec-1", symbol="AAPL", side="BUY",
+        order_type="LIMIT", quantity=Decimal("2"), limit_price=Decimal("40"),
+        notional_usd=Decimal("80"), time_in_force="DAY", as_of=NOW,
+        risk_decision_id="risk-1", portfolio_snapshot_id="snap-1", config_hash="cfg-m11",
+        created_at=NOW,
+    )
+    result = execution.submit_and_simulate(
+        conn, order_intent, execution.MarketSimulationInput(Decimal("39"), Decimal("39")), NOW,
+    )
+    assert result["status"] == "FILLED"
+
+    with pytest.raises(ExternalPaperError, match="terminal local status") as excinfo:
+        _preview(conn, FakeRuntime(), _config())
+    assert excinfo.value.code == "INTENT_NOT_ELIGIBLE_FOR_EXTERNAL"
+
+
+def test_local_cancel_blocks_subsequent_external_submit():
+    conn = connect(":memory:")
+    _seed(conn)
+    order_intent = PaperBookOrderIntent(
+        paper_order_intent_id="intent-1", book_id="BASELINE", experiment_arm="BASELINE",
+        cycle_id="cycle-1", recommendation_id="rec-1", symbol="AAPL", side="BUY",
+        order_type="LIMIT", quantity=Decimal("2"), limit_price=Decimal("40"),
+        notional_usd=Decimal("80"), time_in_force="DAY", as_of=NOW,
+        risk_decision_id="risk-1", portfolio_snapshot_id="snap-1", config_hash="cfg-m11",
+        created_at=NOW,
+    )
+    execution.cancel_pending_intent(conn, order_intent, NOW)
+
+    with pytest.raises(ExternalPaperError, match="terminal local status") as excinfo:
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id="does-not-matter",
+            operator="alice", reason="retry", runtime=FakeRuntime(), config=_config(), clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "INTENT_NOT_ELIGIBLE_FOR_EXTERNAL"
+
+
+def test_pending_intent_still_previews_normally():
+    """Sanity: the eligibility check does not regress the ordinary path —
+    an untouched PENDING_SUBMISSION intent still previews successfully."""
+    conn = connect(":memory:")
+    _seed(conn)
+    record = _preview(conn, FakeRuntime(), _config())
+    assert record["result"] == "APPROVED"
