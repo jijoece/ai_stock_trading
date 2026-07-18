@@ -64,6 +64,7 @@ Use runbooks for operator procedures; use code and tests for exact behavior.
 | Soak evidence and alerts | [`runbooks/soak-evidence-and-alert-operations.md`](runbooks/soak-evidence-and-alert-operations.md) |
 | Shadow operations | [`runbooks/shadow-operations.md`](runbooks/shadow-operations.md) |
 | Claude Code production research | [`claude-code-production-provider.md`](claude-code-production-provider.md) |
+| Codex production research | [`codex-production-provider.md`](codex-production-provider.md) |
 | Shadow incident response | [`runbooks/shadow-incident-response.md`](runbooks/shadow-incident-response.md) |
 
 ## Supporting references

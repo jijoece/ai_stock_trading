@@ -5,17 +5,24 @@ Operator-facing procedures for the Milestone 7 shadow-operations control layer. 
 rationale, and `docs/adr/0005-production-shadow-operations-boundary.md` for why each
 boundary exists.
 
-For the subscription-backed provider, read
-`docs/claude-code-production-provider.md`. The safe base configuration remains
-disabled; the launch wrapper explicitly selects the dormant files under
-`config/production/`. Claude Code authentication comes only from the Keychain
-service `agentic-trading-desk-claude-oauth`, never `.env`.
+For the subscription-backed providers, read
+`docs/claude-code-production-provider.md` and `docs/codex-production-provider.md`.
+The safe base configuration remains disabled; the launch wrapper explicitly
+selects the dormant files under `config/production/`. Claude Code
+authentication comes only from the Keychain service
+`agentic-trading-desk-claude-oauth`, never `.env`. Codex authentication comes
+only from the operating-system user's cached `codex login` (ChatGPT) session,
+never `.env` and never `OPENAI_API_KEY`.
 
-Before any scheduled rollout, run the inference-free preflight:
+Before any scheduled rollout, run the inference-free preflight for whichever
+provider `config/production/research*.yaml` selects:
 
 ```bash
 python -m trading_research.cli claude-code-provider-preflight \
   --research-config config/production/research.yaml
+
+python -m trading_research.cli codex-provider-preflight \
+  --research-config config/production/research-codex.yaml
 ```
 
 Version/auth failures block before scheduler lease and budget reservation and

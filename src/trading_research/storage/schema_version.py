@@ -107,6 +107,19 @@ def _migration_3_claude_code_usage_provenance(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE research_attempts ADD COLUMN {column_name} {column_type}")
 
 
+def _migration_4_codex_provider_cli_version(conn: sqlite3.Connection) -> None:
+    """Add the generic `provider_cli_version` provenance column (Milestone
+    12: Codex provider). Deliberately additive, not a rename of the existing
+    `claude_code_version` column — every pre-existing Claude Code row stays
+    readable exactly as written, and `claude_code_version` keeps meaning
+    what it always meant. New Codex attempts populate `provider_cli_version`
+    instead; Claude Code attempts continue to populate `claude_code_version`
+    only."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(research_attempts)").fetchall()}
+    if "provider_cli_version" not in existing:
+        conn.execute("ALTER TABLE research_attempts ADD COLUMN provider_cli_version TEXT")
+
+
 # Ordered, idempotent migrations. Each callable must be safe to invoke more
 # than once (defense in depth on top of the version gate, which normally
 # prevents re-invocation) and must not raise on a database that already has
@@ -120,6 +133,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     3: (
         "add Claude Code usage estimate basis and provider provenance",
         _migration_3_claude_code_usage_provenance,
+    ),
+    4: (
+        "add generic provider_cli_version column for the Codex provider (Milestone 12)",
+        _migration_4_codex_provider_cli_version,
     ),
 }
 

@@ -36,7 +36,7 @@ RESERVATION_STATUS_SETTLED = "SETTLED"
 RESERVATION_STATUS_EXPIRED = "EXPIRED"
 
 REAL_CLAUDE_PROVIDER = "anthropic"  # backwards-compatible singular alias
-REAL_CLAUDE_PROVIDERS = ("anthropic", "claude_code")
+REAL_CLAUDE_PROVIDERS = ("anthropic", "claude_code", "codex")
 PRICING_EXEMPT_PROVIDERS = ("deterministic", "scripted")
 
 Clock = Callable[[], datetime]

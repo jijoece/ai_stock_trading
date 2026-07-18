@@ -21,7 +21,7 @@ from .models import OVERLAY_ACTIONS
 
 DEFAULT_RESEARCH_CONFIG_PATH = REPO_ROOT / "config" / "research.yaml"
 
-KNOWN_PROVIDERS = ("deterministic", "scripted", "anthropic", "claude_code")
+KNOWN_PROVIDERS = ("deterministic", "scripted", "anthropic", "claude_code", "codex")
 KNOWN_ROLES = ("fundamental", "technical", "catalyst", "news", "sentiment", "bull", "bear", "manager")
 ANALYST_ROLES = ("fundamental", "technical", "catalyst", "news", "sentiment", "bull", "bear")
 MANAGER_ROLE = "manager"
@@ -54,6 +54,22 @@ class ClaudeCodeYamlConfiguration:
 
 
 @dataclass(frozen=True)
+class CodexYamlConfiguration:
+    binary_path: Path
+    minimum_version: str
+    terminate_grace_seconds: int
+    maximum_stdout_bytes: int
+    maximum_stderr_bytes: int
+    maximum_jsonl_line_bytes: int
+    maximum_jsonl_events: int
+    maximum_schema_bytes: int
+    maximum_prompt_bytes: int
+    working_directory: Path
+    require_chatgpt_authentication: bool
+    require_usage_metadata: bool
+
+
+@dataclass(frozen=True)
 class ResearchConfiguration:
     version: int
     enabled: bool
@@ -79,6 +95,7 @@ class ResearchConfiguration:
     config_hash: str
     raw: dict
     claude_code: ClaudeCodeYamlConfiguration | None = None
+    codex: CodexYamlConfiguration | None = None
 
     def analyst_roles(self) -> tuple[str, ...]:
         return tuple(r for r in self.roles if r != MANAGER_ROLE)
@@ -87,10 +104,12 @@ class ResearchConfiguration:
         """Raise if this configuration cannot actually be used to run research
         right now — called only at the point research is invoked, never at
         load time (so a disabled/unconfigured file still loads cleanly)."""
-        if self.provider in {"anthropic", "claude_code"} and not self.model:
+        if self.provider in {"anthropic", "claude_code", "codex"} and not self.model:
             raise ResearchConfigError(f"research.model must be set explicitly to use provider={self.provider}")
         if self.provider == "claude_code" and self.claude_code is None:
             raise ResearchConfigError("provider=claude_code requires the top-level claude_code configuration")
+        if self.provider == "codex" and self.codex is None:
+            raise ResearchConfigError("provider=codex requires the top-level codex configuration")
 
     def build_claude_code_provider_config(self, *, pricing_entries=()):
         if self.provider != "claude_code" or self.claude_code is None:
@@ -116,6 +135,30 @@ class ResearchConfiguration:
             model_alias=self.model or "",
         )
 
+    def build_codex_provider_config(self, *, pricing_entries=()):
+        if self.provider != "codex" or self.codex is None:
+            raise ResearchConfigError("research.provider is not codex")
+        from .codex_provider import CodexProviderConfig
+
+        cfg = self.codex
+        return CodexProviderConfig(
+            binary_path=cfg.binary_path,
+            minimum_version=cfg.minimum_version,
+            model=self.model or "",
+            request_timeout_seconds=self.request_timeout_seconds,
+            terminate_grace_seconds=cfg.terminate_grace_seconds,
+            maximum_stdout_bytes=cfg.maximum_stdout_bytes,
+            maximum_stderr_bytes=cfg.maximum_stderr_bytes,
+            maximum_jsonl_line_bytes=cfg.maximum_jsonl_line_bytes,
+            maximum_jsonl_events=cfg.maximum_jsonl_events,
+            maximum_schema_bytes=cfg.maximum_schema_bytes,
+            maximum_prompt_bytes=cfg.maximum_prompt_bytes,
+            working_directory=cfg.working_directory,
+            pricing_entries=tuple(pricing_entries),
+            require_chatgpt_authentication=cfg.require_chatgpt_authentication,
+            require_usage_metadata=cfg.require_usage_metadata,
+        )
+
 
 def load_research_config(path: str | Path | None = None) -> ResearchConfiguration:
     config_path = Path(path) if path else DEFAULT_RESEARCH_CONFIG_PATH
@@ -136,7 +179,7 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
     if not isinstance(overlay, dict):
         raise ResearchConfigError("research config missing top-level 'overlay' section")
 
-    allowed_top_level = {"version", "research", "claude_code", "roles", "overlay"}
+    allowed_top_level = {"version", "research", "claude_code", "codex", "roles", "overlay"}
     unknown_top_level = set(raw) - allowed_top_level
     if unknown_top_level:
         raise ResearchConfigError(f"research config has unknown top-level keys: {sorted(unknown_top_level)}")
@@ -210,6 +253,45 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
             ),
         )
 
+    codex_config = None
+    codex_section = raw.get("codex")
+    if codex_section is not None:
+        if not isinstance(codex_section, dict):
+            raise ResearchConfigError("codex must be a mapping")
+        required_codex_keys = {
+            "binary_path", "minimum_version", "terminate_grace_seconds", "maximum_stdout_bytes",
+            "maximum_stderr_bytes", "maximum_jsonl_line_bytes", "maximum_jsonl_events",
+            "maximum_schema_bytes", "maximum_prompt_bytes", "working_directory",
+            "require_chatgpt_authentication", "require_usage_metadata",
+        }
+        missing_codex = required_codex_keys - set(codex_section)
+        unknown_codex = set(codex_section) - required_codex_keys
+        if missing_codex:
+            raise ResearchConfigError(f"codex config missing keys: {sorted(missing_codex)}")
+        if unknown_codex:
+            raise ResearchConfigError(f"codex config has unknown keys: {sorted(unknown_codex)}")
+        try:
+            codex_config = CodexYamlConfiguration(
+                binary_path=Path(str(codex_section["binary_path"])),
+                minimum_version=str(codex_section["minimum_version"]),
+                terminate_grace_seconds=int(codex_section["terminate_grace_seconds"]),
+                maximum_stdout_bytes=int(codex_section["maximum_stdout_bytes"]),
+                maximum_stderr_bytes=int(codex_section["maximum_stderr_bytes"]),
+                maximum_jsonl_line_bytes=int(codex_section["maximum_jsonl_line_bytes"]),
+                maximum_jsonl_events=int(codex_section["maximum_jsonl_events"]),
+                maximum_schema_bytes=int(codex_section["maximum_schema_bytes"]),
+                maximum_prompt_bytes=int(codex_section["maximum_prompt_bytes"]),
+                working_directory=Path(str(codex_section["working_directory"])),
+                require_chatgpt_authentication=_strict_bool(
+                    codex_section["require_chatgpt_authentication"], "codex.require_chatgpt_authentication"
+                ),
+                require_usage_metadata=_strict_bool(
+                    codex_section["require_usage_metadata"], "codex.require_usage_metadata"
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ResearchConfigError(f"invalid codex config value: {exc}") from exc
+
     return ResearchConfiguration(
         version=raw.get("version", 1),
         enabled=_strict_bool(research_section["enabled"], "research.enabled"),
@@ -235,4 +317,5 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
         config_hash=hash_config(raw),
         raw=raw,
         claude_code=claude_code_config,
+        codex=codex_config,
     )

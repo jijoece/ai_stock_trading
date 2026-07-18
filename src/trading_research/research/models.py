@@ -278,6 +278,9 @@ class UsageRecord:
     configured_model_alias: str | None = None
     resolved_model_name: str | None = None
     claude_code_version: str | None = None
+    provider_cli_version: str | None = None
+
+    _SUBSCRIPTION_ESTIMATE_PROVIDERS = ("claude_code", "codex")
 
     def __post_init__(self) -> None:
         _require_enum(self.cost_status, COST_STATUSES, "UsageRecord.cost_status")
@@ -287,12 +290,24 @@ class UsageRecord:
         if self.cost_status != COST_CALCULATED and self.estimated_cost is not None:
             raise EvidenceValidationError(f"UsageRecord.cost_status={self.cost_status!r} must not carry estimated_cost")
         if self.cost_estimate_basis == COST_BASIS_SUBSCRIPTION_API_EQUIVALENT_ESTIMATE:
-            if self.provider != "claude_code":
-                raise EvidenceValidationError("subscription API-equivalent estimates require provider=claude_code")
-            if not self.configured_model_alias or not self.resolved_model_name or not self.claude_code_version:
+            if self.provider not in self._SUBSCRIPTION_ESTIMATE_PROVIDERS:
                 raise EvidenceValidationError(
-                    "Claude Code usage requires configured alias, resolved model, and CLI version provenance"
+                    f"subscription API-equivalent estimates require provider in {self._SUBSCRIPTION_ESTIMATE_PROVIDERS}"
                 )
+            if self.provider == "claude_code":
+                if not self.configured_model_alias or not self.resolved_model_name or not self.claude_code_version:
+                    raise EvidenceValidationError(
+                        "Claude Code usage requires configured alias, resolved model, and CLI version provenance"
+                    )
+            elif self.provider == "codex":
+                # Codex's JSONL event stream never reports an independently
+                # resolved model — only the configured model and CLI version
+                # are required provenance here (resolved_model_name honestly
+                # stays unset rather than being duplicated from the config).
+                if not self.configured_model_alias or not self.provider_cli_version:
+                    raise EvidenceValidationError(
+                        "Codex usage requires configured model and CLI version provenance"
+                    )
 
 
 @dataclass(frozen=True)

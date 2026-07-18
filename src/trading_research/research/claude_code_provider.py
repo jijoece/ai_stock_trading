@@ -10,20 +10,24 @@ from __future__ import annotations
 import json
 import os
 import re
-import signal
 import stat
-import subprocess
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Mapping
 
 from jsonschema import Draft7Validator
 
 from ..config import REPO_ROOT
+from .bounded_subprocess import (
+    BoundedProcessConfig,
+    BoundedProcessResult,
+    BoundedProcessRunner,
+    ProcessOutputOverflow,
+    ProcessShutdownError,
+    ProcessTimeoutError,
+)
 from .errors import (
     MalformedOutputError,
     ProviderRateLimitError,
@@ -141,186 +145,45 @@ class ClaudeCodePreflight:
     checked_at: datetime
 
 
-@dataclass(frozen=True)
-class _ProcessResult:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-    latency_ms: int
+_ProcessResult = BoundedProcessResult
 
 
-class _Overflow(Exception):
-    def __init__(self, stream_name: str, stdout_bytes: int, stderr_bytes: int):
-        super().__init__(stream_name)
-        self.stream_name = stream_name
-        self.stdout_bytes = stdout_bytes
-        self.stderr_bytes = stderr_bytes
+class _ClaudeCodeProcessRunner:
+    """Thin Claude-Code-specific adapter over the provider-neutral
+    `bounded_subprocess.BoundedProcessRunner` — maps the runner's generic
+    exceptions back to this provider's existing typed errors and failure
+    codes, so external behavior is byte-for-byte unchanged."""
 
-
-class _BoundedProcessRunner:
     def __init__(self, config: ClaudeCodeProviderConfig):
-        self._config = config
+        self._runner = BoundedProcessRunner(BoundedProcessConfig(
+            working_directory=config.working_directory,
+            request_timeout_seconds=config.request_timeout_seconds,
+            terminate_grace_seconds=config.terminate_grace_seconds,
+            maximum_stdout_bytes=config.maximum_stdout_bytes,
+            maximum_stderr_bytes=config.maximum_stderr_bytes,
+        ))
 
-    @staticmethod
-    def _terminate_group(process: subprocess.Popen[bytes], grace_seconds: int) -> None:
+    def run(self, argv: list[str], *, env, stdin_data: bytes = b"") -> _ProcessResult:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except PermissionError:
-            if process.poll() is None:
-                process.terminate()
-            try:
-                process.wait(timeout=grace_seconds)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=grace_seconds)
-            return
-        deadline = time.monotonic() + grace_seconds
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(process.pid, 0)
-            except (ProcessLookupError, PermissionError):
-                break
-            time.sleep(0.01)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            process.wait(timeout=grace_seconds)
-        except subprocess.TimeoutExpired:
-            # A direct child should always be reapable after SIGKILL. Keep this
-            # bounded and let the caller surface a safe unavailable error.
-            pass
-
-    def run(self, argv: list[str], *, env: Mapping[str, str], stdin_data: bytes = b"") -> _ProcessResult:
-        started = time.monotonic()
-        process: subprocess.Popen[bytes] | None = None
-        stdout_buffer = bytearray()
-        stderr_buffer = bytearray()
-        overflow = threading.Event()
-        overflow_stream: list[str] = []
-        pump_errors: list[BaseException] = []
-
-        def pump(pipe, target: bytearray, limit: int, name: str) -> None:
-            try:
-                while True:
-                    chunk = pipe.read(8192)
-                    if not chunk:
-                        return
-                    remaining = limit - len(target)
-                    if remaining > 0:
-                        target.extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        overflow_stream.append(name)
-                        overflow.set()
-                        return
-            except BaseException as exc:  # cleaned up and mapped by the owning thread
-                pump_errors.append(exc)
-
-        def write_stdin(pipe) -> None:
-            try:
-                if stdin_data:
-                    pipe.write(stdin_data)
-                    pipe.flush()
-            except BrokenPipeError:
-                pass
-            except BaseException as exc:
-                pump_errors.append(exc)
-            finally:
-                try:
-                    pipe.close()
-                except BaseException:
-                    pass
-
-        threads: list[threading.Thread] = []
-        try:
-            process = subprocess.Popen(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=self._config.working_directory,
-                env=dict(env),
-                shell=False,
-                start_new_session=True,
-            )
-            assert process.stdin is not None and process.stdout is not None and process.stderr is not None
-            threads = [
-                threading.Thread(target=pump, args=(process.stdout, stdout_buffer, self._config.maximum_stdout_bytes, "stdout"), daemon=False),
-                threading.Thread(target=pump, args=(process.stderr, stderr_buffer, self._config.maximum_stderr_bytes, "stderr"), daemon=False),
-                threading.Thread(target=write_stdin, args=(process.stdin,), daemon=False),
-            ]
-            for thread in threads:
-                thread.start()
-
-            deadline = started + self._config.request_timeout_seconds
-            while process.poll() is None:
-                if overflow.is_set():
-                    self._terminate_group(process, self._config.terminate_grace_seconds)
-                    break
-                if time.monotonic() >= deadline:
-                    self._terminate_group(process, self._config.terminate_grace_seconds)
-                    for thread in threads:
-                        thread.join(timeout=self._config.terminate_grace_seconds)
-                    raise ProviderTimeoutError(
-                        "Claude Code process timed out",
-                        code="CLAUDE_CODE_PROCESS_TIMEOUT",
-                        retryable=True,
-                        metadata={"latency_ms": int((time.monotonic() - started) * 1000)},
-                    )
-                time.sleep(0.01)
-
-            if process.poll() is None:
-                self._terminate_group(process, self._config.terminate_grace_seconds)
-            process.wait(timeout=self._config.terminate_grace_seconds)
-            for thread in threads:
-                thread.join(timeout=self._config.terminate_grace_seconds)
-            if any(thread.is_alive() for thread in threads):
-                raise ProviderUnavailableError(
-                    "Claude Code subprocess I/O did not shut down cleanly",
-                    code="CLAUDE_CODE_PROCESS_EXITED",
-                    retryable=False,
-                )
-            if overflow_stream:
-                raise _Overflow(overflow_stream[0], len(stdout_buffer), len(stderr_buffer))
-            if pump_errors:
-                raise ProviderUnavailableError(
-                    "Claude Code subprocess I/O failed",
-                    code="CLAUDE_CODE_PROCESS_EXITED",
-                    retryable=False,
-                )
-            return _ProcessResult(
-                returncode=process.returncode,
-                stdout=bytes(stdout_buffer),
-                stderr=bytes(stderr_buffer),
-                latency_ms=int((time.monotonic() - started) * 1000),
-            )
-        except BaseException:
-            if process is not None:
-                self._terminate_group(process, self._config.terminate_grace_seconds)
-                for pipe in (process.stdin, process.stdout, process.stderr):
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except BaseException:
-                            pass
-                try:
-                    process.wait(timeout=self._config.terminate_grace_seconds)
-                except BaseException:
-                    pass
-            for thread in threads:
-                thread.join(timeout=self._config.terminate_grace_seconds)
+            return self._runner.run(argv, env=env, stdin_data=stdin_data)
+        except ProcessTimeoutError as exc:
+            raise ProviderTimeoutError(
+                "Claude Code process timed out",
+                code="CLAUDE_CODE_PROCESS_TIMEOUT",
+                retryable=True,
+                metadata={"latency_ms": exc.latency_ms},
+            ) from exc
+        except ProcessShutdownError as exc:
+            raise ProviderUnavailableError(
+                "Claude Code subprocess I/O did not shut down cleanly",
+                code="CLAUDE_CODE_PROCESS_EXITED",
+                retryable=False,
+            ) from exc
+        except ProcessOutputOverflow:
             raise
-        finally:
-            if process is not None:
-                for pipe in (process.stdin, process.stdout, process.stderr):
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except BaseException:
-                            pass
+
+
+_BoundedProcessRunner = _ClaudeCodeProcessRunner
 
 
 def _sanitized_environment() -> dict[str, str]:
@@ -389,7 +252,7 @@ class ClaudeCodeResearchProvider:
     def _run(self, argv: list[str], *, stdin_data: bytes = b"") -> _ProcessResult:
         try:
             return self._runner.run(argv, env=_sanitized_environment(), stdin_data=stdin_data)
-        except _Overflow as exc:
+        except ProcessOutputOverflow as exc:
             code = "CLAUDE_CODE_OUTPUT_OVERFLOW" if exc.stream_name == "stdout" else "CLAUDE_CODE_STDERR_OVERFLOW"
             raise MalformedOutputError(
                 f"Claude Code {exc.stream_name} exceeded its configured byte limit",

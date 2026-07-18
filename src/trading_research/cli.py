@@ -785,6 +785,16 @@ def run_research_cli(snapshot_id: str, provider_name: str, db_path: Path) -> dic
                 research_config.build_claude_code_provider_config(pricing_entries=load_pricing_config())
             )
             provider.preflight()
+        elif provider_name == "codex":
+            from .research.codex_provider import CodexResearchProvider
+            from .research.usage import load_pricing_config
+
+            research_config.require_ready()
+            model_name = research_config.model
+            provider = CodexResearchProvider(
+                research_config.build_codex_provider_config(pricing_entries=load_pricing_config())
+            )
+            provider.preflight()
         else:
             return {"error": f"unknown provider {provider_name!r}"}
 
@@ -841,6 +851,51 @@ def claude_code_provider_preflight_cli(research_config_path: Path | None = None)
         "binary_version": result.binary_version,
         "minimum_version_satisfied": True,
         "oauth_token_present": True,
+        "authenticated": result.authenticated,
+        "authentication_method": result.authentication_method,
+        "usage_metadata_required": True,
+        "failure_code": result.failure_code,
+        "checked_at": result.checked_at.isoformat(),
+        "paper_submission_enabled": False,
+        "external_execution_reachable": False,
+    }
+
+
+def codex_provider_preflight_cli(research_config_path: Path | None = None) -> dict:
+    """Sanitized version/auth readiness only; never makes an inference call."""
+    from .research.codex_provider import CodexResearchProvider
+    from .research.configuration import load_research_config
+    from .research.usage import load_pricing_config
+
+    config = load_research_config(research_config_path) if research_config_path is not None else load_research_config()
+    config.require_ready()
+    if config.provider != "codex":
+        return {
+            "ready": False,
+            "provider": config.provider,
+            "failure_code": "CODEX_NOT_CONFIGURED",
+        }
+    try:
+        provider = CodexResearchProvider(
+            config.build_codex_provider_config(pricing_entries=load_pricing_config())
+        )
+        result = provider.preflight(force=True)
+    except Exception as exc:
+        return {
+            "ready": False,
+            "provider": "codex",
+            "configured_model": config.model,
+            "binary_version": None,
+            "authenticated": False,
+            "authentication_method": None,
+            "failure_code": getattr(exc, "code", "CODEX_PREFLIGHT_FAILED"),
+        }
+    return {
+        "ready": result.ready,
+        "provider": "codex",
+        "configured_model": config.model,
+        "binary_version": result.binary_version,
+        "minimum_version_satisfied": True,
         "authenticated": result.authenticated,
         "authentication_method": result.authentication_method,
         "usage_metadata_required": True,
@@ -1588,7 +1643,7 @@ def run_due_shadow_cycle_cli(
 
     if provider_mode == PROVIDER_MODE_REAL:
         research_provider_name = research_config.provider
-        research_model_name = research_config.model if research_config.provider in {"anthropic", "claude_code"} else f"{research_config.provider}-v1"
+        research_model_name = research_config.model if research_config.provider in {"anthropic", "claude_code", "codex"} else f"{research_config.provider}-v1"
     else:
         research_provider_name, research_model_name = "deterministic", "deterministic-v1"
 
@@ -1650,6 +1705,44 @@ def run_due_shadow_cycle_cli(
                 "status": "PROVIDER_PREFLIGHT_FAILED",
                 "failure_code": getattr(exc, "code", "CLAUDE_CODE_PREFLIGHT_FAILED"),
             }
+    elif provider_mode == PROVIDER_MODE_REAL and research_config.provider == "codex":
+        from .research.codex_provider import CodexResearchProvider
+
+        try:
+            research_config.require_ready()
+            as_of_date = datetime.now(_tz.utc).date().isoformat()
+            if select_pricing(pricing_entries, "codex", research_model_name or "", as_of_date) is None:
+                return {
+                    "error": "Codex API-equivalent pricing is not configured",
+                    "status": "PRICING_NOT_CONFIGURED",
+                }
+            real_research_provider = CodexResearchProvider(
+                research_config.build_codex_provider_config(pricing_entries=pricing_entries)
+            )
+            # Version/auth preflight happens before opening a DB session, lease,
+            # or budget reservation and consumes no inference call.
+            real_research_provider.preflight()
+        except Exception as exc:
+            try:
+                from .shadow import pause as pause_mod
+
+                with session(db_path) as preflight_conn:
+                    current = pause_mod.current_state(preflight_conn)
+                    if current.state == pause_mod.STATE_ACTIVE:
+                        pause_mod.request_pause(
+                            preflight_conn,
+                            reason=f"Codex preflight failed: {getattr(exc, 'code', 'CODEX_PREFLIGHT_FAILED')}",
+                            source=pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE,
+                            target_state=pause_mod.STATE_PAUSED_PROVIDER_HEALTH,
+                            clock=lambda: datetime.now(_tz.utc),
+                        )
+            except Exception:
+                pass
+            return {
+                "error": "Codex provider preflight failed",
+                "status": "PROVIDER_PREFLIGHT_FAILED",
+                "failure_code": getattr(exc, "code", "CODEX_PREFLIGHT_FAILED"),
+            }
 
     candidate_symbols = tuple(s.upper() for s in symbols) if symbols else (
         ("AAPL", "MSFT", "SHEL") if provider_mode == PROVIDER_MODE_FIXTURE else ()
@@ -1666,7 +1759,7 @@ def run_due_shadow_cycle_cli(
                 api_key=cfg.anthropic_api_key, request_timeout_seconds=research_config.request_timeout_seconds,
                 pricing_entries=pricing_entries,
             ))
-        elif provider_mode == PROVIDER_MODE_REAL and research_config.provider == "claude_code":
+        elif provider_mode == PROVIDER_MODE_REAL and research_config.provider in ("claude_code", "codex"):
             assert real_research_provider is not None
             provider = real_research_provider
         else:
@@ -1708,7 +1801,7 @@ def run_due_shadow_cycle_cli(
         "budget_consumed_usd": result.budget_consumed_usd, "failure_reason": result.failure_reason,
         "reason": result.reason,
         "cost_estimate_basis": (
-            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if research_provider_name == "claude_code"
+            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if research_provider_name in ("claude_code", "codex")
             else "DIRECT_API_ESTIMATE" if research_provider_name == "anthropic" else "NOT_APPLICABLE"
         ),
     }
@@ -1797,6 +1890,39 @@ def shadow_readiness_cli(
                     "failure_code": getattr(exc, "code", "CLAUDE_CODE_PREFLIGHT_FAILED"),
                     "paper_submission_enabled": False, "external_execution_reachable": False,
                 }
+        elif research_config.provider == "codex":
+            from .research.codex_provider import CodexResearchProvider
+            from .research.usage import load_pricing_config
+
+            try:
+                provider = CodexResearchProvider(
+                    research_config.build_codex_provider_config(pricing_entries=load_pricing_config())
+                )
+                preflight = provider.preflight()
+                provider_preflight = {
+                    "provider": "codex", "configured_model": research_config.model,
+                    "binary_available": True, "binary_version": preflight.binary_version,
+                    "minimum_version_satisfied": True,
+                    "authenticated": preflight.authenticated,
+                    "authentication_method": preflight.authentication_method,
+                    "usage_metadata_required": True,
+                    "cost_estimate_basis": "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE",
+                    "paper_submission_enabled": False, "external_execution_reachable": False,
+                }
+            except Exception as exc:
+                environmentally_blocked_reason = (
+                    f"Codex preflight failed: {getattr(exc, 'code', 'CODEX_PREFLIGHT_FAILED')}"
+                )
+                provider_preflight = {
+                    "provider": "codex", "configured_model": research_config.model,
+                    "binary_available": False, "binary_version": None,
+                    "minimum_version_satisfied": False,
+                    "authenticated": False, "authentication_method": None,
+                    "usage_metadata_required": True,
+                    "cost_estimate_basis": "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE",
+                    "failure_code": getattr(exc, "code", "CODEX_PREFLIGHT_FAILED"),
+                    "paper_submission_enabled": False, "external_execution_reachable": False,
+                }
     except Exception:
         pass  # research config errors are reported by other commands; never block readiness reporting itself
 
@@ -1805,24 +1931,29 @@ def shadow_readiness_cli(
         activation = evaluate_activation_readiness(
             conn, now, shadow_config, environmentally_blocked_reason=environmentally_blocked_reason,
         )
-        if provider_preflight is not None and provider_preflight.get("provider") == "claude_code":
+        if provider_preflight is not None and provider_preflight.get("provider") in ("claude_code", "codex"):
+            preflight_provider = provider_preflight["provider"]
             today_calls = conn.execute(
-                "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-                (now.date().isoformat() + "%",),
+                "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+                (preflight_provider, now.date().isoformat() + "%"),
             ).fetchone()[0]
             month_calls = conn.execute(
-                "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-                (now.strftime("%Y-%m") + "%",),
+                "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+                (preflight_provider, now.strftime("%Y-%m") + "%"),
             ).fetchone()[0]
             latest_model = conn.execute(
-                "SELECT resolved_model_name FROM research_attempts WHERE provider = 'claude_code' "
-                "AND resolved_model_name IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+                "SELECT resolved_model_name FROM research_attempts WHERE provider = ? "
+                "AND resolved_model_name IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                (preflight_provider,),
             ).fetchone()
+            calls_per_cycle = getattr(shadow_config.budgets, f"max_{preflight_provider}_calls_per_cycle")
+            calls_per_day = getattr(shadow_config.budgets, f"max_{preflight_provider}_calls_per_day")
+            calls_per_month = getattr(shadow_config.budgets, f"max_{preflight_provider}_calls_per_month")
             provider_preflight.update({
                 "resolved_model": latest_model[0] if latest_model else None,
-                "cycle_call_budget_available": shadow_config.budgets.max_claude_code_calls_per_cycle > 0,
-                "daily_call_budget_available": today_calls < shadow_config.budgets.max_claude_code_calls_per_day,
-                "monthly_call_budget_available": month_calls < shadow_config.budgets.max_claude_code_calls_per_month,
+                "cycle_call_budget_available": calls_per_cycle > 0,
+                "daily_call_budget_available": today_calls < calls_per_day,
+                "monthly_call_budget_available": month_calls < calls_per_month,
             })
 
     return {
@@ -1880,7 +2011,7 @@ def shadow_budget_status_cli(db_path: Path) -> dict:
 
     shadow_config = load_shadow_operations_config()
     research_config = load_research_config()
-    is_claude_code = research_config.provider == "claude_code"
+    is_managed_cli_provider = research_config.provider in ("claude_code", "codex")
     now = datetime.now(_tz.utc)
     today_prefix = now.date().isoformat()
     month_prefix = now.strftime("%Y-%m")
@@ -1889,32 +2020,33 @@ def shadow_budget_status_cli(db_path: Path) -> dict:
         today_usage = list_budget_usage(conn, usage_date_prefix=today_prefix)
         month_usage = list_budget_usage(conn, usage_date_prefix=month_prefix)
         live_reservations = list_budget_reservations(conn, status=budget_mod.RESERVATION_STATUS_RESERVED)
-        claude_calls_today = conn.execute(
-            "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-            (today_prefix + "%",),
+        managed_calls_today = conn.execute(
+            "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+            (research_config.provider, today_prefix + "%"),
         ).fetchone()[0]
-        claude_calls_month = conn.execute(
-            "SELECT COUNT(*) FROM research_attempts WHERE provider = 'claude_code' AND created_at LIKE ?",
-            (month_prefix + "%",),
+        managed_calls_month = conn.execute(
+            "SELECT COUNT(*) FROM research_attempts WHERE provider = ? AND created_at LIKE ?",
+            (research_config.provider, month_prefix + "%"),
         ).fetchone()[0]
 
     spent_today = sum((Decimal(r["actual_cost_usd"]) for r in today_usage), Decimal("0"))
     spent_month = sum((Decimal(r["actual_cost_usd"]) for r in month_usage), Decimal("0"))
     live_reserved = sum((Decimal(r["reserved_estimated_cost_usd"]) for r in live_reservations), Decimal("0"))
+    provider_prefix = research_config.provider if is_managed_cli_provider else None
     daily_cap = Decimal(str(
-        shadow_config.budgets.max_claude_code_api_equivalent_cost_per_day_usd if is_claude_code
+        getattr(shadow_config.budgets, f"max_{provider_prefix}_api_equivalent_cost_per_day_usd") if is_managed_cli_provider
         else shadow_config.budgets.max_actual_cost_per_day_usd
     ))
     monthly_cap = Decimal(str(
-        shadow_config.budgets.max_claude_code_api_equivalent_cost_per_month_usd if is_claude_code
+        getattr(shadow_config.budgets, f"max_{provider_prefix}_api_equivalent_cost_per_month_usd") if is_managed_cli_provider
         else shadow_config.budgets.max_actual_cost_per_month_usd
     ))
 
-    return {
+    result = {
         "as_of": now.isoformat(),
         "provider": research_config.provider,
         "cost_estimate_basis": (
-            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if is_claude_code else "DIRECT_API_ESTIMATE"
+            "SUBSCRIPTION_API_EQUIVALENT_ESTIMATE" if is_managed_cli_provider else "DIRECT_API_ESTIMATE"
         ),
         "daily_cap_usd": str(daily_cap),
         "monthly_cap_usd": str(monthly_cap),
@@ -1922,11 +2054,19 @@ def shadow_budget_status_cli(db_path: Path) -> dict:
         "live_reserved_usd": str(live_reserved), "live_reservation_count": len(live_reservations),
         "remaining_today_usd": str(daily_cap - spent_today - live_reserved),
         "remaining_month_usd": str(monthly_cap - spent_month - live_reserved),
-        "claude_code_calls_today": claude_calls_today,
-        "claude_code_calls_month": claude_calls_month,
-        "claude_code_daily_call_cap": shadow_config.budgets.max_claude_code_calls_per_day,
-        "claude_code_monthly_call_cap": shadow_config.budgets.max_claude_code_calls_per_month,
     }
+    if is_managed_cli_provider:
+        result.update({
+            "claude_code_calls_today": managed_calls_today if provider_prefix == "claude_code" else 0,
+            "claude_code_calls_month": managed_calls_month if provider_prefix == "claude_code" else 0,
+            "claude_code_daily_call_cap": shadow_config.budgets.max_claude_code_calls_per_day,
+            "claude_code_monthly_call_cap": shadow_config.budgets.max_claude_code_calls_per_month,
+            "codex_calls_today": managed_calls_today if provider_prefix == "codex" else 0,
+            "codex_calls_month": managed_calls_month if provider_prefix == "codex" else 0,
+            "codex_daily_call_cap": shadow_config.budgets.max_codex_calls_per_day,
+            "codex_monthly_call_cap": shadow_config.budgets.max_codex_calls_per_month,
+        })
+    return result
 
 
 def shadow_alerts_cli(db_path: Path, *, severity: str | None = None, limit: int = 20) -> dict:
@@ -2371,13 +2511,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run_research = sub.add_parser("run-research", help="Invoke the research committee for a persisted evidence snapshot (Milestone 5)")
     p_run_research.add_argument("--snapshot-id", required=True)
-    p_run_research.add_argument("--provider", choices=("deterministic", "anthropic", "claude_code"), default="deterministic")
+    p_run_research.add_argument("--provider", choices=("deterministic", "anthropic", "claude_code", "codex"), default="deterministic")
 
     p_claude_code_preflight = sub.add_parser(
         "claude-code-provider-preflight",
         help="Check Claude Code version and subscription OAuth status without an inference call",
     )
     p_claude_code_preflight.add_argument("--research-config", type=Path, default=None)
+
+    p_codex_preflight = sub.add_parser(
+        "codex-provider-preflight",
+        help="Check Codex CLI version and cached ChatGPT login status without an inference call",
+    )
+    p_codex_preflight.add_argument("--research-config", type=Path, default=None)
 
     p_replay_research = sub.add_parser("replay-research", help="Deterministically replay a persisted research run — never calls a provider (Milestone 5)")
     p_replay_research.add_argument("--research-run-id", required=True)
@@ -2831,6 +2977,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "claude-code-provider-preflight":
         outcome = claude_code_provider_preflight_cli(args.research_config)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0 if outcome.get("ready") else 2
+
+    if args.command == "codex-provider-preflight":
+        outcome = codex_provider_preflight_cli(args.research_config)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if outcome.get("ready") else 2
 

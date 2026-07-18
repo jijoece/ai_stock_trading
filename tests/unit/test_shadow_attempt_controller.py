@@ -207,4 +207,42 @@ def test_claude_code_missing_usage_activates_provider_health_pause(conn):
     controller.after_attempt(_request(), failed)
     state = pause_mod.current_state(conn)
     assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+def test_codex_cycle_call_cap_counts_allowed_failed_or_successful_calls(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(
+        conn, reservation, pricing, provider="codex", max_calls_per_cycle=1,
+        max_calls_per_day=30, max_calls_per_month=300,
+        max_api_equivalent_cost_per_call_usd=Decimal("0.50"),
+    )
+    assert controller.before_attempt(_request()).allowed is True
+    denied = controller.before_attempt(_request(role="manager"))
+    assert denied.allowed is False
+    assert "cycle call cap" in (denied.reason or "")
+    assert "Codex" in (denied.reason or "")
+
+
+def test_codex_repeated_authentication_failure_activates_provider_health_pause(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = replace(
+        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex"),
+        failure_reason="Codex is not authenticated with ChatGPT",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
+
+
+def test_codex_quota_exhaustion_activates_provider_health_pause(conn):
+    reservation, pricing = _reservation(conn)
+    controller = _controller(conn, reservation, pricing, provider="codex")
+    failed = replace(
+        _attempt(success=False, input_tokens=None, output_tokens=None, latency_ms=150, provider="codex"),
+        failure_reason="Codex quota is exhausted",
+    )
+    controller.after_attempt(_request(), failed)
+    state = pause_mod.current_state(conn)
+    assert state.state == pause_mod.STATE_PAUSED_PROVIDER_HEALTH
     assert state.source == pause_mod.SOURCE_AUTOMATIC_HEALTH_RULE

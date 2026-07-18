@@ -97,6 +97,7 @@ python -m trading_research.cli <command> --help
 | Fetch real or fixture evidence | [Research and evidence CLI](#research-and-evidence) |
 | Operate shadow research | [Shadow operations CLI](#shadow-operations) and the [shadow runbook](docs/runbooks/shadow-operations.md) |
 | Use Claude Code subscription research | [Production provider guide](docs/claude-code-production-provider.md) |
+| Use Codex (ChatGPT) subscription research | [Codex production provider guide](docs/codex-production-provider.md) |
 | Work with isolated local books | [Current local paper books](#current-local-paper-books) |
 | Run a controlled soak | [Paper-book CLI](#current-local-paper-books) and the [soak runbook](docs/runbooks/controlled-paper-soak.md) |
 | Configure recurring local runs | [Recurring local simulation](#recurring-local-simulation) and its [runbook](docs/runbooks/recurring-local-paper-trading.md) |
@@ -623,6 +624,8 @@ Start at [`docs/INDEX.md`](docs/INDEX.md). Key current documents include:
 | `docs/runbooks/shadow-operations.md` | Shadow operator procedure |
 | `docs/runbooks/recurring-local-paper-trading.md` | Recurring local scheduler procedure |
 | `docs/runbooks/alpaca-paper-operations.md` | External Alpaca paper procedure |
+| `docs/claude-code-production-provider.md` | Claude Code subscription research provider |
+| `docs/codex-production-provider.md` | Codex (ChatGPT) subscription research provider |
 | `docs/milestones/milestone11-3-integrity-closure.md` | Latest completed integrity implementation report |
 
 Historical milestone specifications remain useful for rationale and acceptance
