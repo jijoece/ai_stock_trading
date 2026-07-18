@@ -11,12 +11,24 @@ This provider never uses `OPENAI_API_KEY` or any other API credential —
 authentication is exclusively the operating system user's cached `codex
 login` (ChatGPT) session, enforced by both a sanitized/allowlisted child
 environment and strict preflight parsing of `codex login status`.
+
+Reasoning-token accounting policy (Milestone 12.1 Item 4): `gpt-5.1-codex`
+is a reasoning model, and `codex exec --json`'s `turn.completed.usage`
+reports `reasoning_output_tokens` as a breakdown *within*
+`output_tokens` — the same convention OpenAI's Responses API uses for
+`output_tokens_details.reasoning_tokens` (a subset of `output_tokens`, never
+additional to it). This repository therefore applies Policy A
+("REASONING_INCLUDED_IN_OUTPUT"): `reasoning_output_tokens` is persisted
+separately for audit but is never added a second time to any billed/ceiling
+total — `output_tokens` alone is already the effective total. The invariant
+`0 <= reasoning_output_tokens <= output_tokens` is enforced in
+`codex_jsonl_adapter.py::_parse_usage` and fails closed
+(`CODEX_REASONING_TOKENS_INVALID`) if violated.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import stat
 import time
@@ -35,23 +47,26 @@ from .bounded_subprocess import (
     ProcessShutdownError,
     ProcessTimeoutError,
 )
+from .codex_failure_classifier import classify_codex_diagnostic
 from .codex_jsonl_adapter import parse_codex_jsonl
+from .codex_version_policy import (
+    MINIMUM_SUPPORTED_VERSION,
+    CodexVersionParseError,
+    classify_codex_version,
+    parse_codex_version,
+)
 from .errors import (
     MalformedOutputError,
-    ProviderRateLimitError,
     ProviderTimeoutError,
-    ProviderTransientError,
     ProviderUnavailableError,
 )
-from .models import ResearchModelRequest, ResearchModelResponse
+from .models import ResearchModelRequest, ResearchModelResponse, TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT
 from .output_validation import validate_against_schema
 from .usage import PricingEntry, build_usage_record
 
 PROVIDER_NAME = "codex"
-MINIMUM_SUPPORTED_VERSION = (0, 144, 0)
 MINIMAL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 _ENV_ALLOWLIST = ("HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL")
-_VERSION_RE = re.compile(r"^(?:codex-cli\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$")
 
 _STATIC_SYSTEM_PROMPT = (
     "You are a bounded financial-research response generator running inside the Codex CLI. "
@@ -64,18 +79,19 @@ _STATIC_SYSTEM_PROMPT = (
     "after it."
 )
 
-# Centralized, allowlisted stderr/stdout diagnostic classification — never
-# expose raw process output in an exception, log, or persisted record.
-_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "too many requests", "429")
-_QUOTA_MARKERS = ("quota", "usage limit", "plan limit", "insufficient_quota")
-_TRANSIENT_MARKERS = ("network", "temporarily unavailable", "connection reset", "service unavailable", "timed out")
-
 
 def _version_tuple(value: str) -> tuple[int, int, int]:
-    match = _VERSION_RE.fullmatch(value.strip())
-    if match is None:
-        raise ValueError("version is not a supported semantic-version string")
-    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+    """Parses a version string for config validation only (accepts a
+    prerelease/build suffix here purely so `codex.minimum_version` can be
+    compared against `MINIMUM_SUPPORTED_VERSION`'s floor at config-load
+    time) — the authoritative, prerelease-rejecting, range-based check
+    against the *installed* binary happens in `preflight()` via
+    `codex_version_policy.classify_codex_version`."""
+    try:
+        version, _is_prerelease = parse_codex_version(value)
+    except CodexVersionParseError as exc:
+        raise ValueError(str(exc)) from exc
+    return version
 
 
 @dataclass(frozen=True)
@@ -161,6 +177,11 @@ class CodexPreflight:
     authentication_method: str | None
     failure_code: str | None
     checked_at: datetime
+    # Milestone 12.1 Item 2: the tested JSONL-contract adapter version this
+    # installed CLI version was matched to (see codex_version_policy.py) —
+    # `None` unless `ready` is True. Persisted into usage provenance so a
+    # future JSONL contract break can be root-caused to an adapter mismatch.
+    adapter_version: str | None = None
 
 
 class _CodexProcessRunner:
@@ -270,22 +291,19 @@ def _decode_login_status(result: BoundedProcessResult) -> tuple[bool, str | None
 
 
 def _classify_nonzero_exit(result: BoundedProcessResult) -> None:
-    diagnostic = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="ignore").lower()
+    """Milestone 12.1 Item 3: routes through the same centralized
+    `classify_codex_diagnostic` a zero-exit `turn.failed` event uses, so a
+    nonzero-exit authentication failure and a `turn.failed` authentication
+    failure always produce the identical typed code."""
+    diagnostic = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="ignore")
     metadata = {
         "exit_code": result.returncode, "latency_ms": result.latency_ms,
         "stdout_bytes": len(result.stdout), "stderr_bytes": len(result.stderr),
     }
-    if any(term in diagnostic for term in _RATE_LIMIT_MARKERS):
-        raise ProviderRateLimitError("Codex rate limited the request", code="CODEX_RATE_LIMITED", metadata=metadata)
-    if any(term in diagnostic for term in _QUOTA_MARKERS):
-        raise ProviderUnavailableError("Codex quota is exhausted", code="CODEX_QUOTA_EXHAUSTED", metadata=metadata)
-    if any(term in diagnostic for term in ("not authenticated", "not logged in", "authentication required")):
-        raise ProviderUnavailableError("Codex authentication failed", code="CODEX_NOT_AUTHENTICATED", metadata=metadata)
-    if any(term in diagnostic for term in _TRANSIENT_MARKERS):
-        raise ProviderTransientError("Codex encountered a transient service failure", code="CODEX_TRANSIENT_FAILURE", metadata=metadata)
-    if any(term in diagnostic for term in ("json schema", "json-schema", "schema invalid", "invalid schema")):
-        raise ProviderUnavailableError("Codex rejected the JSON Schema", code="CODEX_SCHEMA_REJECTED", metadata=metadata)
-    raise ProviderUnavailableError("Codex process exited unsuccessfully", code="CODEX_PROCESS_EXITED", metadata=metadata)
+    classification = classify_codex_diagnostic(diagnostic)
+    raise classification.error_type(
+        classification.message, code=classification.code, retryable=classification.retryable, metadata=metadata,
+    )
 
 
 class CodexResearchProvider:
@@ -333,17 +351,24 @@ class CodexResearchProvider:
             )
         try:
             version_text = version_result.stdout.decode("utf-8").strip()
-            installed_version = _version_tuple(version_text)
-        except (UnicodeDecodeError, ValueError) as exc:
+            installed_version, is_prerelease = parse_codex_version(version_text)
+        except (UnicodeDecodeError, CodexVersionParseError) as exc:
             raise ProviderUnavailableError(
                 "Codex version could not be parsed", code="CODEX_VERSION_UNPARSABLE", retryable=False,
             ) from exc
-        if installed_version < _version_tuple(self._config.minimum_version):
-            raise ProviderUnavailableError(
-                "Codex version is below the configured minimum", code="CODEX_VERSION_UNSUPPORTED", retryable=False,
-                metadata={"cli_version": ".".join(str(p) for p in installed_version)},
-            )
         normalized_version = ".".join(str(part) for part in installed_version)
+        # Milestone 12.1 Item 2: authoritative decision is the explicit,
+        # closed `SUPPORTED_CODEX_CLI_RANGES` table, not an open-ended
+        # ">= configured minimum" check — an untested future CLI version
+        # (or a prerelease/build-tagged one) fails preflight here, before
+        # any inference subprocess is ever invoked.
+        classification = classify_codex_version(installed_version, is_prerelease=is_prerelease)
+        if not classification.supported:
+            raise ProviderUnavailableError(
+                "Codex version is not in the supported range", code="CODEX_VERSION_UNSUPPORTED", retryable=False,
+                metadata={"cli_version": normalized_version},
+            )
+        adapter_version = classification.adapter_version
 
         try:
             auth_result = self._run([str(self._config.binary_path), "login", "status"])
@@ -360,6 +385,7 @@ class CodexResearchProvider:
         preflight = CodexPreflight(
             ready=True, binary_version=normalized_version, authenticated=True,
             authentication_method=method, failure_code=None, checked_at=checked_at,
+            adapter_version=adapter_version,
         )
         self._preflight = preflight
         self._preflight_monotonic = time.monotonic()
@@ -465,8 +491,14 @@ class CodexResearchProvider:
             maximum_event_count=self._config.maximum_jsonl_events,
         )
         if not turn.succeeded:
-            raise ProviderUnavailableError(
-                "Codex reported a failed turn", code="CODEX_PROCESS_EXITED", retryable=False,
+            # Milestone 12.1 Item 3: a zero-exit `turn.failed` event routes
+            # through the exact same classifier as a nonzero process exit —
+            # an authentication/quota/rate-limit/transient failure reported
+            # this way must produce the identical typed code it would if the
+            # process had instead exited nonzero with the same diagnostic.
+            classification = classify_codex_diagnostic(turn.failure_message or "")
+            raise classification.error_type(
+                classification.message, code=classification.code, retryable=classification.retryable,
                 metadata={"event_count": turn.event_count},
             )
         if turn.usage is None:
@@ -505,7 +537,10 @@ class CodexResearchProvider:
             # outright (never a silent substitution).
             resolved_model_name=None,
             provider_cli_version=preflight.binary_version,
+            provider_adapter_version=preflight.adapter_version,
             pricing_model=self._config.model,
+            reasoning_output_tokens=turn.usage.reasoning_output_tokens,
+            token_accounting_policy=TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT,
         )
         canonical = json.dumps(structured, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return ResearchModelResponse(

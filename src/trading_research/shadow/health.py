@@ -161,6 +161,11 @@ class CycleHealthInputs:
     provider_observed_providers: tuple[str, ...] = ()
     provider_missing_required_providers: tuple[str, ...] = ()
     provider_missing_required_categories: tuple[str, ...] = ()
+    # Milestone 12.1 Item 6: categories whose OWN required-provider requests
+    # failed that category's own success-rate floor — computed independently
+    # per category (never diluted by another provider's success) in
+    # `evidence_providers/health.py::evaluate_required_category_health`.
+    provider_unhealthy_required_categories: tuple[str, ...] = ()
     provider_per_provider_metrics: dict = field(default_factory=dict)
     provider_severe_error_categories: tuple[str, ...] = ()
     provider_policy_version: str = ""
@@ -287,6 +292,74 @@ def provider_health_is_qualified(result: HealthResult) -> bool:
     return provider_health_check(result).status in (
         CHECK_STATUS_PASS, CHECK_STATUS_WARNING, CHECK_STATUS_FAIL,
     )
+
+
+# --- Milestone 12.1 Item 5: dimension-specific hysteresis inputs ------------
+#
+# `evaluate_cycle_health` already produces one independent `HealthCheckResult`
+# per dimension (docs/milestone-7.2.md Part 2). The bug this fixes is
+# entirely downstream, in how the scheduler previously fed persistent
+# hysteresis (`shadow/health_hysteresis.py`): ONE global `qualified` boolean
+# derived only from the evidence-provider check, applied to a SINGLE
+# hysteresis scope covering every dimension's status. An insufficient
+# evidence-provider sample therefore silently suppressed a genuinely FAILing
+# retry-exhaustion or unsupported-claim rate for that entire cycle.
+#
+# These helpers let the scheduler evaluate persistent hysteresis
+# independently per rate-based dimension — reusing the existing per-`scope`
+# hysteresis engine in `health_hysteresis.py` (no schema change needed, that
+# engine already keys state/evaluation history by `scope`) rather than
+# collapsing every dimension into one call.
+DIMENSION_EVIDENCE_PROVIDER_FAILURE = "EVIDENCE_PROVIDER_FAILURE"
+DIMENSION_RETRY_EXHAUSTION = "RETRY_EXHAUSTION"
+DIMENSION_UNSUPPORTED_CLAIMS = "UNSUPPORTED_CLAIMS"
+
+# Rate-based dimensions with their own persistent hysteresis scope. Structural
+# dimensions (reconciliation, duplicate-prevention, budget breach) remain
+# immediate — see `combine_effective_health_decision`'s `structural_flags` —
+# and are deliberately NOT included here.
+HYSTERESIS_DIMENSIONS = (
+    (DIMENSION_EVIDENCE_PROVIDER_FAILURE, CHECK_NAME_PROVIDER_FAILURE_RATE),
+    (DIMENSION_RETRY_EXHAUSTION, CHECK_NAME_RETRY_EXHAUSTION_RATE),
+    (DIMENSION_UNSUPPORTED_CLAIMS, CHECK_NAME_UNSUPPORTED_CLAIM_RATE),
+)
+
+
+def check_by_name(result: HealthResult, check_name: str) -> HealthCheckResult:
+    return next(check for check in result.checks if check.check_name == check_name)
+
+
+def dimension_is_qualified(check: HealthCheckResult) -> bool:
+    """A dimension is qualified for hysteresis counting unless its own check
+    was `INSUFFICIENT_DATA` this cycle — evaluated per-dimension, never
+    inherited from a different dimension's sample size."""
+    return check.status != CHECK_STATUS_INSUFFICIENT_DATA
+
+
+def dimension_cycle_status(check: HealthCheckResult) -> str:
+    """This dimension's own single-cycle status, independent of every other
+    dimension's worst-of-all `HealthResult.status`."""
+    if check.status == CHECK_STATUS_FAIL:
+        return STATUS_PAUSE_REQUIRED
+    if check.status == CHECK_STATUS_WARNING:
+        return STATUS_DEGRADED
+    # PASS or INSUFFICIENT_DATA — the latter is never counted (see
+    # `dimension_is_qualified`), so HEALTHY is a safe, unused-when-unqualified
+    # placeholder rather than a fabricated verdict.
+    return STATUS_HEALTHY
+
+
+def worst_health_status(statuses: "tuple[str, ...]") -> str:
+    """Public, variadic form of the module's own severity ordering — the
+    overall hysteresis status the scheduler feeds into
+    `combine_effective_health_decision` is the worst of every dimension's
+    independently-computed hysteresis decision."""
+    if not statuses:
+        return STATUS_HEALTHY
+    worst = statuses[0]
+    for status in statuses[1:]:
+        worst = _worse(worst, status)
+    return worst
 
 
 def combine_effective_health_decision(
@@ -454,9 +527,20 @@ def evaluate_cycle_health(inputs: CycleHealthInputs, config: HealthPolicyConfig)
             reason="provider telemetry is explicitly not applicable for this fixture-only cycle",
         )
         fail_reason = degraded_reason = None
-    elif inputs.provider_missing_required_providers or inputs.provider_missing_required_categories:
-        missing = tuple(inputs.provider_missing_required_categories) + tuple(inputs.provider_missing_required_providers)
-        fail_reason = "required provider coverage missing: " + ", ".join(missing)
+    elif (
+        inputs.provider_missing_required_providers or inputs.provider_missing_required_categories
+        or inputs.provider_unhealthy_required_categories
+    ):
+        # Milestone 12.1 Item 6: a required category present but failing its
+        # OWN success-rate floor (`provider_unhealthy_required_categories`)
+        # must FAIL exactly like an outright-missing required category —
+        # never diluted by an unrelated required/optional provider's
+        # success in the aggregate `provider_failure_rate` above.
+        missing = (
+            tuple(inputs.provider_missing_required_categories) + tuple(inputs.provider_missing_required_providers)
+            + tuple(inputs.provider_unhealthy_required_categories)
+        )
+        fail_reason = "required provider coverage missing or unhealthy: " + ", ".join(missing)
         degraded_reason = None
         check = HealthCheckResult(
             check_name=CHECK_NAME_PROVIDER_FAILURE_RATE, status=CHECK_STATUS_FAIL,

@@ -20,6 +20,7 @@ from trading_research.research.errors import (
     MalformedOutputError,
     ProviderRateLimitError,
     ProviderTimeoutError,
+    ProviderTransientError,
     ProviderUnavailableError,
     SchemaValidationError,
 )
@@ -111,7 +112,7 @@ def _config(tmp_path: Path, binary: Path, **overrides) -> CodexProviderConfig:
     workdir.mkdir(mode=0o700, exist_ok=True)
     values = {
         "binary_path": binary,
-        "minimum_version": "0.144.0",
+        "minimum_version": "0.144.5",
         "model": "gpt-5.6-sol",
         "request_timeout_seconds": 2,
         "terminate_grace_seconds": 1,
@@ -204,7 +205,15 @@ def test_config_rejects_non_positive_limits(tmp_path):
 
 @pytest.mark.parametrize(
     ("version", "code"),
-    [("0.143.9", "CODEX_VERSION_UNSUPPORTED"), ("not-a-version", "CODEX_VERSION_UNPARSABLE")],
+    [
+        ("0.144.4", "CODEX_VERSION_UNSUPPORTED"),  # below the tested floor
+        ("0.144.5", None),  # exact tested floor — accepted
+        ("0.144.9", None),  # within the declared range — accepted
+        ("0.145.0", "CODEX_VERSION_UNSUPPORTED"),  # ceiling is exclusive
+        ("1.0.0", "CODEX_VERSION_UNSUPPORTED"),  # untested future major version
+        ("not-a-version", "CODEX_VERSION_UNPARSABLE"),  # malformed
+        ("0.144.5-beta", "CODEX_VERSION_UNSUPPORTED"),  # prerelease, never accepted
+    ],
 )
 def test_version_preflight_fails_closed(tmp_path, version, code):
     binary = _fake_binary(tmp_path, f"""
@@ -215,9 +224,35 @@ if args[:1] == ["--version"]:
 else:
     print("Logged in using ChatGPT")
 """)
+    provider = CodexResearchProvider(_config(tmp_path, binary))
+    if code is None:
+        result = provider.preflight()
+        assert result.ready is True
+        assert result.adapter_version == "codex-jsonl/v1"
+    else:
+        with pytest.raises(ProviderUnavailableError) as exc_info:
+            provider.preflight()
+        assert exc_info.value.code == code
+
+
+def test_unsupported_version_fails_before_any_inference_subprocess(tmp_path):
+    """Milestone 12.1 Item 2: an unsupported CLI version must fail preflight
+    before `generate_structured` ever invokes `codex exec` — proven here by
+    a fake binary that raises if invoked with `exec` (only `--version`/
+    `login status` are legitimate preflight calls)."""
+    binary = _fake_binary(tmp_path, """
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("0.145.0")
+elif args[:1] == ["exec"]:
+    sys.exit(99)  # must never be reached
+else:
+    print("Logged in using ChatGPT")
+""")
     with pytest.raises(ProviderUnavailableError) as exc_info:
-        CodexResearchProvider(_config(tmp_path, binary)).preflight()
-    assert exc_info.value.code == code
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert exc_info.value.code == "CODEX_VERSION_UNSUPPORTED"
 
 
 def test_login_status_nonzero_exit_fails_closed(tmp_path):
@@ -317,6 +352,7 @@ def test_hardened_command_stdin_environment_output_and_usage(tmp_path, monkeypat
     assert response.usage.configured_model_alias == "gpt-5.6-sol"
     assert response.usage.resolved_model_name is None  # Codex never reports one — never invented
     assert response.usage.provider_cli_version == "0.144.5"
+    assert response.usage.provider_adapter_version == "codex-jsonl/v1"
     assert response.provider_request_id == "thread-abc"
 
     capture = json.loads(capture_path.read_text())
@@ -648,6 +684,60 @@ else:
     assert exc_info.value.code == "CODEX_USAGE_METADATA_MISSING"
 
 
+def _reasoning_usage_binary(tmp_path, *, input_tokens=11, output_tokens=7, reasoning_output_tokens):
+    reasoning_field = (
+        "" if reasoning_output_tokens is None else f', "reasoning_output_tokens": {reasoning_output_tokens}'
+    )
+    return _fake_binary(tmp_path, f"""
+import json, sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 0.144.5")
+elif args[:2] == ["login", "status"]:
+    print("Logged in using ChatGPT")
+else:
+    item = {{"id": "item_0", "type": "agent_message", "text": json.dumps({{"value": "ok"}})}}
+    print(json.dumps({{"type": "item.completed", "item": item}}))
+    print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": {input_tokens}, "output_tokens": {output_tokens}{reasoning_field}}}}}))
+""")
+
+
+def test_reasoning_tokens_exceeding_output_tokens_rejected(tmp_path):
+    """Milestone 12.1 Item 4, required test #5: reasoning greater than total
+    output fails under the REASONING_INCLUDED_IN_OUTPUT policy."""
+    binary = _reasoning_usage_binary(tmp_path, output_tokens=7, reasoning_output_tokens=8)
+    with pytest.raises(MalformedOutputError) as exc_info:
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert exc_info.value.code == "CODEX_REASONING_TOKENS_INVALID"
+
+
+def test_reasoning_tokens_negative_rejected(tmp_path):
+    binary = _reasoning_usage_binary(tmp_path, reasoning_output_tokens=-1)
+    with pytest.raises(MalformedOutputError) as exc_info:
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert exc_info.value.code == "CODEX_USAGE_METADATA_MISSING"
+
+
+def test_reasoning_tokens_persisted_and_within_output_tokens(tmp_path):
+    """Required test #1: reasoning-token value is persisted. Required test
+    #3: no double-counting — `output_tokens` alone remains the effective
+    total under the inclusion policy."""
+    binary = _reasoning_usage_binary(tmp_path, input_tokens=11, output_tokens=7, reasoning_output_tokens=4)
+    response = CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert response.usage.output_tokens == 7  # unchanged — reasoning is a subset, never added on top
+    assert response.usage.reasoning_output_tokens == 4
+    assert response.usage.token_accounting_policy == "REASONING_INCLUDED_IN_OUTPUT"
+
+
+def test_missing_reasoning_tokens_represented_as_none(tmp_path):
+    """Required test #2: missing reasoning tokens are represented as
+    unavailable (None), never fabricated as zero."""
+    binary = _reasoning_usage_binary(tmp_path, reasoning_output_tokens=None)
+    response = CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert response.usage.reasoning_output_tokens is None
+    assert response.usage.token_accounting_policy == "REASONING_INCLUDED_IN_OUTPUT"
+
+
 def test_event_count_overflow_rejected(tmp_path):
     binary, _ = _normal_fake(tmp_path)
     provider = CodexResearchProvider(_config(tmp_path, binary, maximum_jsonl_events=2))
@@ -798,6 +888,28 @@ else:
 
     with pytest.raises(ProviderTransientError) as exc_info:
         CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    # Milestone 12.1 Item 3: "connection reset" is its own NETWORK category,
+    # distinct from a generic transient service failure.
+    assert exc_info.value.code == "CODEX_NETWORK_FAILURE"
+    assert exc_info.value.retryable is True
+
+
+def test_transient_service_error_maps_to_transient_failure(tmp_path):
+    binary = _fake_binary(tmp_path, """
+import sys
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("codex-cli 0.144.5")
+elif args[:2] == ["login", "status"]:
+    print("Logged in using ChatGPT")
+else:
+    print("service temporarily unavailable", file=sys.stderr)
+    sys.exit(1)
+""")
+    from trading_research.research.errors import ProviderTransientError
+
+    with pytest.raises(ProviderTransientError) as exc_info:
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
     assert exc_info.value.code == "CODEX_TRANSIENT_FAILURE"
     assert exc_info.value.retryable is True
 
@@ -816,6 +928,58 @@ else:
     with pytest.raises(ProviderUnavailableError) as exc_info:
         CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
     assert exc_info.value.code == "CODEX_PROCESS_EXITED"
+
+
+@pytest.mark.parametrize(
+    ("turn_failed_message", "expected_code", "expected_type", "expected_retryable"),
+    [
+        ("Codex authentication failed", "CODEX_NOT_AUTHENTICATED", ProviderUnavailableError, False),
+        ("Your quota is exhausted", "CODEX_QUOTA_EXHAUSTED", ProviderUnavailableError, False),
+        ("Rate limit exceeded", "CODEX_RATE_LIMITED", ProviderRateLimitError, True),
+        ("Service temporarily unavailable", "CODEX_TRANSIENT_FAILURE", ProviderTransientError, True),
+        ("dns lookup failed", "CODEX_NETWORK_FAILURE", ProviderTransientError, True),
+        ("a totally unrecognized safe message", "CODEX_PROCESS_EXITED", ProviderUnavailableError, False),
+    ],
+)
+def test_turn_failed_uses_the_same_typed_taxonomy_as_nonzero_exit(
+    tmp_path, turn_failed_message, expected_code, expected_type, expected_retryable,
+):
+    """Milestone 12.1 Item 3: `turn.failed` (exit code 0) must map to the
+    identical typed code a nonzero exit with the same diagnostic would."""
+    body = f"""
+import json, sys
+args = sys.argv[1:]
+{_PREFLIGHT_STANZA}
+if args[:1] == ["exec"]:
+    print(json.dumps({{"type": "thread.started", "thread_id": "thread-abc"}}))
+    print(json.dumps({{"type": "turn.started"}}))
+    print(json.dumps({{"type": "turn.failed", "error": {{"message": {turn_failed_message!r}}}}}))
+    sys.exit(0)
+sys.exit(1)
+"""
+    binary = _fake_binary(tmp_path, body)
+    with pytest.raises(expected_type) as exc_info:
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.retryable is expected_retryable
+
+
+def test_turn_failed_message_never_appears_in_exception_text(tmp_path):
+    secret_looking_message = "authentication failed: session=sk-ant-should-never-leak"
+    body = f"""
+import json, sys
+args = sys.argv[1:]
+{_PREFLIGHT_STANZA}
+if args[:1] == ["exec"]:
+    print(json.dumps({{"type": "thread.started", "thread_id": "thread-abc"}}))
+    print(json.dumps({{"type": "turn.failed", "error": {{"message": {secret_looking_message!r}}}}}))
+    sys.exit(0)
+sys.exit(1)
+"""
+    binary = _fake_binary(tmp_path, body)
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    assert "sk-ant-should-never-leak" not in str(exc_info.value)
 
 
 def test_raw_stderr_never_appears_in_exception(tmp_path):

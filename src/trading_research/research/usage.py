@@ -22,6 +22,7 @@ from .models import (
     COST_NOT_APPLICABLE,
     COST_PRICING_NOT_CONFIGURED,
     COST_USAGE_NOT_RETURNED,
+    TOKEN_ACCOUNTING_NOT_APPLICABLE,
     UsageRecord,
 )
 
@@ -94,6 +95,9 @@ def build_usage_record(
     resolved_model_name: str | None = None,
     claude_code_version: str | None = None,
     provider_cli_version: str | None = None,
+    provider_adapter_version: str | None = None,
+    reasoning_output_tokens: int | None = None,
+    token_accounting_policy: str = TOKEN_ACCOUNTING_NOT_APPLICABLE,
     pricing_model: str | None = None,
 ) -> UsageRecord:
     provenance = {
@@ -101,6 +105,7 @@ def build_usage_record(
         "resolved_model_name": resolved_model_name,
         "claude_code_version": claude_code_version,
         "provider_cli_version": provider_cli_version,
+        "provider_adapter_version": provider_adapter_version,
     }
     if not success:
         failure_basis = cost_estimate_basis or COST_BASIS_NOT_APPLICABLE
@@ -112,6 +117,7 @@ def build_usage_record(
             pricing_version=None, estimated_cost=None,
             cost_status=(COST_USAGE_NOT_RETURNED if failure_basis == COST_BASIS_USAGE_NOT_RETURNED else COST_NOT_APPLICABLE),
             cost_estimate_basis=failure_basis, **provenance,
+            reasoning_output_tokens=reasoning_output_tokens, token_accounting_policy=token_accounting_policy,
         )
 
     if provider == "deterministic":
@@ -122,6 +128,7 @@ def build_usage_record(
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_NOT_APPLICABLE,
             cost_estimate_basis=COST_BASIS_NOT_APPLICABLE, **provenance,
+            reasoning_output_tokens=reasoning_output_tokens, token_accounting_policy=token_accounting_policy,
         )
 
     if input_tokens is None or output_tokens is None:
@@ -132,6 +139,7 @@ def build_usage_record(
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_USAGE_NOT_RETURNED,
             cost_estimate_basis=COST_BASIS_USAGE_NOT_RETURNED, **provenance,
+            reasoning_output_tokens=reasoning_output_tokens, token_accounting_policy=token_accounting_policy,
         )
 
     pricing = select_pricing(pricing_entries, provider, pricing_model or model_name, as_of_date or "9999-12-31")
@@ -143,6 +151,7 @@ def build_usage_record(
             provider_request_id=provider_request_id, retry_count=retry_count, success=True,
             pricing_version=None, estimated_cost=None, cost_status=COST_PRICING_NOT_CONFIGURED,
             cost_estimate_basis=cost_estimate_basis or COST_BASIS_DIRECT_API_ESTIMATE, **provenance,
+            reasoning_output_tokens=reasoning_output_tokens, token_accounting_policy=token_accounting_policy,
         )
 
     cost = (Decimal(input_tokens) / Decimal(1_000_000)) * pricing.input_price_per_million + (
@@ -155,4 +164,5 @@ def build_usage_record(
         provider_request_id=provider_request_id, retry_count=retry_count, success=True,
         pricing_version=pricing.pricing_version, estimated_cost=cost, cost_status=COST_CALCULATED,
         cost_estimate_basis=cost_estimate_basis or COST_BASIS_DIRECT_API_ESTIMATE, **provenance,
+        reasoning_output_tokens=reasoning_output_tokens, token_accounting_policy=token_accounting_policy,
     )

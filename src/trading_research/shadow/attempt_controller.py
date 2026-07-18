@@ -32,6 +32,31 @@ Clock = Callable[[], datetime]
 # check below instead.
 _MANAGED_CLI_PROVIDERS = ("claude_code", "codex")
 
+# Milestone 12.1 Item 1: explicit allowlist of stable typed failure codes
+# (research/failure_taxonomy.py) that indicate a structural provider problem
+# — authentication, unexpected auth method, unsupported CLI version, or
+# credit/quota exhaustion — none of which will resolve themselves on the
+# next attempt. Deliberately NOT a free-text/substring check: a message that
+# happens to contain a word like "retry" (a transient, retryable failure)
+# must never trigger this pause, only an attempt whose `failure_code` is
+# exactly one of these values.
+IMMEDIATE_PROVIDER_PAUSE_CODES = frozenset(
+    {
+        "CODEX_NOT_AUTHENTICATED",
+        "CODEX_UNEXPECTED_AUTH_METHOD",
+        "CODEX_VERSION_UNSUPPORTED",
+        "CODEX_QUOTA_EXHAUSTED",
+        "CODEX_USAGE_METADATA_MISSING",
+        "CLAUDE_CODE_NOT_AUTHENTICATED",
+        "CLAUDE_CODE_AUTH_STATUS_FAILED",
+        "CLAUDE_CODE_UNEXPECTED_AUTH_METHOD",
+        "CLAUDE_CODE_OAUTH_TOKEN_MISSING",
+        "CLAUDE_CODE_VERSION_UNSUPPORTED",
+        "CLAUDE_CODE_CREDIT_EXHAUSTED",
+        "CLAUDE_CODE_USAGE_METADATA_MISSING",
+    }
+)
+
 
 def _compute_check_id(*, reservation_id: str, research_run_id: str, role: str, attempt_number: int) -> str:
     """Deterministic identity (docs/milestone-7.1.md Step 14: "deterministic/
@@ -170,12 +195,12 @@ class ShadowResearchAttemptController:
     def after_attempt(self, request: AttemptControlRequest, attempt: ResearchAttemptRecord) -> None:
         usage = attempt.usage
         if self.provider in _MANAGED_CLI_PROVIDERS and not attempt.success:
-            safe_reason = (attempt.failure_reason or "").lower()
-            if any(marker in safe_reason for marker in (
-                "usage metadata", "credits are unavailable", "authentication failed",
-                "oauth token is missing", "version is below", "retry",
-                "not authenticated", "quota", "unexpected authentication method",
-            )):
+            # Milestone 12.1 Item 1: act only on the stable typed
+            # `failure_code` taxonomy, never on `failure_reason` free text —
+            # a retryable transient failure (e.g. CODEX_TRANSIENT_FAILURE,
+            # CODEX_PROCESS_TIMEOUT) must never trip this pause just because
+            # its message happens to contain a word like "retry".
+            if attempt.failure_code in IMMEDIATE_PROVIDER_PAUSE_CODES:
                 from . import pause as pause_mod
 
                 provider_label = "Claude Code" if self.provider == "claude_code" else "Codex"

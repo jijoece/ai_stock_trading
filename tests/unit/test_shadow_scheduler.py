@@ -659,7 +659,10 @@ def test_completed_cycle_persists_hysteresis_state(conn):
     state = load_health_hysteresis_state(conn, DEFAULT_SCOPE)
     assert state is not None
     assert state["decision"] in ("HEALTHY", "DEGRADED", "PAUSE_RECOMMENDED", "PAUSE_REQUIRED")
-    assert state["policy_version"] == "persistent_health/v1"
+    # Milestone 12.1 Item 9: hysteresis policy_version now comes from the
+    # strict, frozen `shadow_operations.yaml::health_hysteresis.policy_version`
+    # config, not the module's own hard-coded default.
+    assert state["policy_version"] == "persistent-health/v2"
 
 
 def test_completed_cycle_writes_health_summary_with_real_provider_success_rate(conn):

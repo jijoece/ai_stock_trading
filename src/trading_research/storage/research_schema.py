@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS research_attempts (
     resolved_model_name TEXT,
     claude_code_version TEXT,
     provider_cli_version TEXT,
+    provider_adapter_version TEXT,
+    reasoning_output_tokens INTEGER,
+    token_accounting_policy TEXT NOT NULL DEFAULT 'NOT_APPLICABLE',
+    failure_code TEXT,
+    failure_stage TEXT,
+    failure_retryable INTEGER,
+    failure_metadata_json TEXT,
     created_at TEXT NOT NULL
 );
 
