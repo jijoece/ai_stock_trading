@@ -42,6 +42,8 @@ Milestone 11.3 Part 24 hardening:
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -66,6 +68,45 @@ _CREDENTIAL_PARAM_NAMES = frozenset({
     "apikey", "api_key", "api-key", "token", "access_token", "secret", "secret_key",
     "client_secret", "auth", "authorization", "key",
 })
+
+TRANSPORT_NONE = "NONE"
+TRANSPORT_TIMEOUT = "TIMEOUT"
+TRANSPORT_DNS_FAILURE = "DNS_FAILURE"
+TRANSPORT_CONNECTION_REFUSED = "CONNECTION_REFUSED"
+TRANSPORT_CONNECTION_RESET = "CONNECTION_RESET"
+TRANSPORT_TLS_FAILURE = "TLS_FAILURE"
+TRANSPORT_AUTHENTICATION_FAILURE = "AUTHENTICATION_FAILURE"
+TRANSPORT_RATE_LIMITED = "RATE_LIMITED"
+TRANSPORT_HTTP_CLIENT_ERROR = "HTTP_CLIENT_ERROR"
+TRANSPORT_HTTP_SERVER_ERROR = "HTTP_SERVER_ERROR"
+TRANSPORT_PROTOCOL_ERROR = "PROTOCOL_ERROR"
+TRANSPORT_CONFIGURATION_ERROR = "CONFIGURATION_ERROR"
+TRANSPORT_UNKNOWN_ERROR = "UNKNOWN_TRANSPORT_ERROR"
+
+TRANSPORT_FAILURE_CATEGORIES = (
+    TRANSPORT_NONE, TRANSPORT_TIMEOUT, TRANSPORT_DNS_FAILURE, TRANSPORT_CONNECTION_REFUSED,
+    TRANSPORT_CONNECTION_RESET, TRANSPORT_TLS_FAILURE, TRANSPORT_AUTHENTICATION_FAILURE,
+    TRANSPORT_RATE_LIMITED, TRANSPORT_HTTP_CLIENT_ERROR, TRANSPORT_HTTP_SERVER_ERROR,
+    TRANSPORT_PROTOCOL_ERROR, TRANSPORT_CONFIGURATION_ERROR, TRANSPORT_UNKNOWN_ERROR,
+)
+
+
+def classify_httpx_transport_exception(exc: httpx.HTTPError) -> str:
+    """Map library-specific exceptions once, while their typed cause chain exists."""
+    if isinstance(exc, httpx.TimeoutException):
+        return TRANSPORT_TIMEOUT
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, socket.gaierror):
+            return TRANSPORT_DNS_FAILURE
+        if isinstance(cause, ConnectionRefusedError):
+            return TRANSPORT_CONNECTION_REFUSED
+        if isinstance(cause, ConnectionResetError):
+            return TRANSPORT_CONNECTION_RESET
+        if isinstance(cause, ssl.SSLError):
+            return TRANSPORT_TLS_FAILURE
+        cause = cause.__cause__ or cause.__context__
+    return TRANSPORT_UNKNOWN_ERROR
 
 
 class ResponseTooLargeError(MalformedProviderResponseError):
@@ -194,6 +235,7 @@ class HttpJsonClient:
         self, url: str, *, params: Mapping[str, Any] | None = None, operation: str = "unknown", symbol: str = "",
     ) -> tuple[Any, HttpResponseMeta]:
         last_exc: Exception | None = None
+        last_transport_category = TRANSPORT_NONE
         rate_limited = False
         client = self._get_client()
         for attempt in range(1, self.max_attempts + 1):
@@ -204,12 +246,20 @@ class HttpJsonClient:
                     body = self._read_bounded(response, url)
             except ResponseTooLargeError as exc:
                 last_exc = exc
+                last_transport_category = TRANSPORT_PROTOCOL_ERROR
                 continue
             except httpx.TimeoutException as exc:
-                last_exc = ProviderRequestError(f"request to {redact_credential_query_params(url)} timed out: {exc}", retryable=True)
+                last_exc = ProviderRequestError(
+                    f"request to {redact_credential_query_params(url)} timed out", retryable=True
+                )
+                last_transport_category = TRANSPORT_TIMEOUT
                 continue
             except httpx.HTTPError as exc:
-                last_exc = ProviderRequestError(f"request to {redact_credential_query_params(url)} failed: {exc}", retryable=True)
+                last_transport_category = classify_httpx_transport_exception(exc)
+                last_exc = ProviderRequestError(
+                    f"request to {redact_credential_query_params(url)} failed ({last_transport_category})",
+                    retryable=True,
+                )
                 continue
 
             latency_ms = int((self.clock() - start) * 1000)
@@ -221,11 +271,13 @@ class HttpJsonClient:
 
             if response.status_code == 429:
                 rate_limited = True
+                last_transport_category = TRANSPORT_RATE_LIMITED
                 last_exc = ProviderRateLimitedError(f"{safe_url} rate-limited (429)")
                 if attempt < self.max_attempts:
                     self._apply_retry_pacing(response, attempt)
                 continue
             if response.status_code in _RETRYABLE_STATUS_CODES:
+                last_transport_category = TRANSPORT_HTTP_SERVER_ERROR
                 last_exc = ProviderRequestError(
                     f"{safe_url} returned retryable status {response.status_code}", retryable=True,
                     status_code=response.status_code,
@@ -234,7 +286,14 @@ class HttpJsonClient:
                     self._apply_retry_pacing(response, attempt)
                 continue
             if response.status_code >= 400:
-                self._notify(operation, symbol, meta, success=False, error_code="ProviderRequestError", retryable=False, retry_count=attempt - 1)
+                category = (
+                    TRANSPORT_AUTHENTICATION_FAILURE
+                    if response.status_code in (401, 403) else TRANSPORT_HTTP_CLIENT_ERROR
+                )
+                self._notify(
+                    operation, symbol, meta, success=False, error_code="ProviderRequestError", retryable=False,
+                    retry_count=attempt - 1, transport_failure_category=category,
+                )
                 # Never include raw response body text in a raised/persisted
                 # error message (Part 24) — status code only.
                 raise ProviderRequestError(
@@ -245,20 +304,32 @@ class HttpJsonClient:
             try:
                 parsed = json.loads(body)
             except ValueError as exc:
-                self._notify(operation, symbol, meta, success=False, error_code="MalformedProviderResponseError", retryable=False, retry_count=attempt - 1)
-                raise MalformedProviderResponseError(f"{safe_url} returned non-JSON body: {exc}") from exc
+                self._notify(
+                    operation, symbol, meta, success=False, error_code="MalformedProviderResponseError",
+                    retryable=False, retry_count=attempt - 1,
+                    transport_failure_category=TRANSPORT_PROTOCOL_ERROR,
+                )
+                raise MalformedProviderResponseError(f"{safe_url} returned a non-JSON body") from exc
 
             if _json_depth(parsed) > MAX_JSON_DEPTH:
-                self._notify(operation, symbol, meta, success=False, error_code="MalformedProviderResponseError", retryable=False, retry_count=attempt - 1)
+                self._notify(
+                    operation, symbol, meta, success=False, error_code="MalformedProviderResponseError",
+                    retryable=False, retry_count=attempt - 1,
+                    transport_failure_category=TRANSPORT_PROTOCOL_ERROR,
+                )
                 raise MalformedProviderResponseError(f"{safe_url} returned JSON nested deeper than {MAX_JSON_DEPTH} levels")
 
-            self._notify(operation, symbol, meta, success=True, error_code=None, retryable=None, retry_count=attempt - 1)
+            self._notify(
+                operation, symbol, meta, success=True, error_code=None, retryable=None, retry_count=attempt - 1,
+                transport_failure_category=TRANSPORT_NONE,
+            )
             return parsed, meta
 
         assert last_exc is not None
         self._notify(
             operation, symbol, None, success=False, error_code=type(last_exc).__name__,
             retryable=getattr(last_exc, "retryable", True), retry_count=self.max_attempts - 1,
+            transport_failure_category=last_transport_category,
         )
         raise RetryBoundExceededError(f"{redact_credential_query_params(url)}: exhausted {self.max_attempts} attempt(s): {last_exc}") from last_exc
 
@@ -276,6 +347,7 @@ class HttpJsonClient:
     def _notify(
         self, operation: str, symbol: str, meta: HttpResponseMeta | None, *, success: bool,
         error_code: str | None, retryable: bool | None, retry_count: int,
+        transport_failure_category: str,
     ) -> None:
         if self.on_response is None:
             return
@@ -285,4 +357,5 @@ class HttpJsonClient:
             "cache_status": "MISS", "rate_limited": bool(meta.rate_limited) if meta else True,
             "retry_count": retry_count, "latency_ms": meta.latency_ms if meta else None,
             "success": success, "error_code": error_code, "retryable": retryable,
+            "transport_failure_category": transport_failure_category,
         })

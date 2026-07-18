@@ -233,7 +233,8 @@ def test_full_happy_path_enhanced_shadow_no_execution(conn):
     summaries = list_run_summaries(conn)
     assert len(summaries) == 1
     assert summaries[0]["health_status"] in ("HEALTHY", "DEGRADED", "PAUSE_RECOMMENDED", "PAUSE_REQUIRED")
-    assert summaries[0]["provider_success_rate"] == 1.0
+    assert summaries[0]["provider_success_rate"] is None
+    assert summaries[0]["provider_health_mode"] == "NOT_APPLICABLE"
 
     # --- Alert(s) persisted as appropriate: a fully healthy COMPLETED cycle
     # raises none — asserted as an explicit, checked fact, not an omission.

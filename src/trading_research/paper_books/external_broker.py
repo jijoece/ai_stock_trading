@@ -20,6 +20,7 @@ from typing import Protocol
 from ..shadow import pause as pause_mod
 from ..storage import paper_books_repositories as repo
 from ..storage.database import begin_immediate
+from ..storage.transactions import transaction
 from ..storage.shadow_alerts_repositories import list_alerts
 from . import cash_ledger, positions
 from .config import PaperBooksConfiguration
@@ -470,6 +471,34 @@ class OrderLeaseHandle:
                 "to perform the write"
             )
 
+    @contextlib.contextmanager
+    def fenced_write(self):
+        """Hold SQLite's write lock while verifying generation and mutating.
+
+        The fresh clock read and ownership check happen after BEGIN IMMEDIATE;
+        takeover therefore cannot interleave before the protected caller's
+        writes commit. No runtime/network call belongs inside this context.
+        """
+        begin_immediate(self._conn)
+        try:
+            self.verify_or_raise()
+            yield self._conn
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
+
+
+@contextlib.contextmanager
+def _fenced_or_plain_write(conn: sqlite3.Connection, lease: OrderLeaseHandle | None):
+    if lease is None:
+        with transaction(conn):
+            yield conn
+    else:
+        with lease.fenced_write():
+            yield conn
+
 
 @contextlib.contextmanager
 def _order_lease(
@@ -537,9 +566,11 @@ def preview_external_paper_order(
         # exact book/intent already holds the EXTERNAL_PAPER claim (a
         # retried preview); raises if LOCAL_SIMULATED already claimed it.
         try:
-            repo.claim_execution_namespace(
-                conn, book_id, paper_order_intent_id, repo.EXECUTION_NAMESPACE_EXTERNAL, now, operator,
-            )
+            with lease.fenced_write():
+                repo.claim_execution_namespace(
+                    conn, book_id, paper_order_intent_id, repo.EXECUTION_NAMESPACE_EXTERNAL, now, operator,
+                    commit=False,
+                )
         except repo.ExecutionNamespaceConflictError as exc:
             raise ExternalPaperError("INTENT_NOT_ELIGIBLE_FOR_EXTERNAL", str(exc)) from exc
         account = _account_check(runtime, book_id)
@@ -572,13 +603,13 @@ def preview_external_paper_order(
         # Milestone 11.3.1 Item 4: fence immediately before the protected
         # preview-persistence + event-append write -- ownership may have
         # changed between the read-only checks above and this point.
-        lease.verify_or_raise()
-        repo.save_external_preview(conn, record)
-        _append_event(
-            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-            account_fingerprint=fingerprint, new_state=STATE_PREVIEWED, operator=operator,
-            reason="explicit external paper preview approved", now=now,
-        )
+        with lease.fenced_write():
+            repo.save_external_preview(conn, record, commit=False)
+            _append_event(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+                account_fingerprint=fingerprint, new_state=STATE_PREVIEWED, operator=operator,
+                reason="explicit external paper preview approved", now=now, commit=False,
+            )
         return record
 
 
@@ -767,14 +798,15 @@ def _validate_order_response(
 
 def _record_unknown(
     conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, now,
-    runtime_request_id, error_code, attempt_number,
+    runtime_request_id, error_code, attempt_number, lease: OrderLeaseHandle,
 ) -> dict:
-    return _append_event(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        account_fingerprint=fingerprint, new_state=STATE_UNKNOWN, operator=operator, reason=reason,
-        now=now, runtime_request_id=runtime_request_id, error_code=error_code,
-        attempt_number=attempt_number,
-    )
+    with lease.fenced_write():
+        return _append_event(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            account_fingerprint=fingerprint, new_state=STATE_UNKNOWN, operator=operator, reason=reason,
+            now=now, runtime_request_id=runtime_request_id, error_code=error_code,
+            attempt_number=attempt_number, commit=False,
+        )
 
 
 def _submit_once(
@@ -788,7 +820,6 @@ def _submit_once(
     # takes effect no other connection can mutate the lease table until this
     # transaction ends, so a verify at the top of it is a true point-in-time
     # fencing check for everything the transaction goes on to write.
-    lease.verify_or_raise()
     # Milestone 11.3 Part 36/37: the reservation and the SUBMISSION_REQUESTED
     # event are now one atomic transaction (previously two independently
     # committed writes — reserve_for_order/reserve_shares_for_sell each
@@ -800,8 +831,7 @@ def _submit_once(
     # together or neither does — rollback undoes the reservation insert too,
     # so the manual compensating release this block used to need on a raised
     # exception is no longer necessary (rollback already reverses it).
-    begin_immediate(conn)
-    try:
+    with lease.fenced_write():
         if intent["side"] == "BUY":
             cash_ledger.reserve_for_order(
                 conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
@@ -818,15 +848,6 @@ def _submit_once(
             reason=reason, now=now, runtime_request_id=runtime_request_id, attempt_number=attempt_number,
             commit=False,
         )
-        conn.commit()
-    except BaseException:
-        # BaseException, not Exception: this transaction must never be left
-        # dangling open for some unrelated later commit() elsewhere on this
-        # connection (e.g. the order-scope lease's own release-on-finally
-        # commit) to inadvertently half-commit. Covers genuine interrupts
-        # (KeyboardInterrupt/SystemExit), not just ordinary Exceptions.
-        conn.rollback()
-        raise
     try:
         order = runtime.submit_limit_order(_payload(intent, client_order_id, payload_hash, fingerprint, now))
         _validate_order_response(order, intent, client_order_id, fingerprint, now)
@@ -838,15 +859,19 @@ def _submit_once(
             fingerprint=fingerprint, operator=operator,
             reason="runtime submission outcome is ambiguous; broker lookup required", now=now,
             runtime_request_id=runtime_request_id, error_code=str(code), attempt_number=attempt_number,
+            lease=lease,
         )
         return {"status": STATE_UNKNOWN, "event": event, "error_code": str(code)}
-    event = _append_event(
-        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-        account_fingerprint=fingerprint, new_state=new_state, operator=operator,
-        reason="normalized broker order response", now=now, broker_order_id=order["broker_order_id"],
-        runtime_request_id=runtime_request_id, attempt_number=attempt_number,
-    )
-    repo.update_order_status(conn, intent["book_id"], intent["paper_order_intent_id"], new_state)
+    with lease.fenced_write():
+        event = _append_event(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            account_fingerprint=fingerprint, new_state=new_state, operator=operator,
+            reason="normalized broker order response", now=now, broker_order_id=order["broker_order_id"],
+            runtime_request_id=runtime_request_id, attempt_number=attempt_number, commit=False,
+        )
+        repo.update_order_status(
+            conn, intent["book_id"], intent["paper_order_intent_id"], new_state, commit=False,
+        )
     order_submitted_at = datetime.fromisoformat(str(order["submitted_at"]).replace("Z", "+00:00")).astimezone(timezone.utc)
     # Milestone 11.2 Part 12: the broker event above is already persisted —
     # no fill-related failure past this point may escape without persisted
@@ -860,23 +885,25 @@ def _submit_once(
         fills = apply_external_fills(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, runtime=runtime, now=now, not_before=order_submitted_at,
+            lease=lease,
         )
     except ExternalPaperError as exc:
         _persist_reconciliation(
             conn, book_id=intent["book_id"], intent=intent, client_order_id=client_order_id,
             fingerprint=fingerprint,
             statuses=("MALFORMED_BROKER_FILL" if exc.code in fill_error_codes else "FILL_APPLICATION_FAILED",),
-            details={"stage": "post_submit_fill_sweep"}, now=now, config=config,
+            details={"stage": "post_submit_fill_sweep"}, now=now, config=config, lease=lease,
         )
         raise
     except Exception:
         _persist_reconciliation(
             conn, book_id=intent["book_id"], intent=intent, client_order_id=client_order_id,
             fingerprint=fingerprint, statuses=("FILL_APPLICATION_FAILED",),
-            details={"stage": "post_submit_fill_sweep"}, now=now, config=config,
+            details={"stage": "post_submit_fill_sweep"}, now=now, config=config, lease=lease,
         )
         raise
-    _release_terminal_reservation(conn, intent, new_state, now)
+    with lease.fenced_write():
+        _release_terminal_reservation(conn, intent, new_state, now, commit=False)
     return {"status": new_state, "event": event, "order": order, "new_fills": fills}
 
 
@@ -885,7 +912,9 @@ _RELEASE_EVENT_TYPE_FOR_STATE = {
 }
 
 
-def _release_terminal_reservation(conn, intent: dict, state: str, now: datetime) -> None:
+def _release_terminal_reservation(
+    conn, intent: dict, state: str, now: datetime, *, commit: bool = True,
+) -> None:
     """Release whatever remains reserved once the broker confirms no more fills will arrive.
 
     FILLED is deliberately excluded here: it is only ever released inside
@@ -898,11 +927,13 @@ def _release_terminal_reservation(conn, intent: dict, state: str, now: datetime)
     if intent["side"] == "BUY":
         cash_ledger.release_remaining_buy_reservation(
             conn, intent["book_id"], intent["paper_order_intent_id"], now, release_event_id="terminal-closed",
+            commit=commit,
         )
     else:
         positions.release_remaining_share_reservation(
             conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
             release_event_id="terminal-closed", event_type=_RELEASE_EVENT_TYPE_FOR_STATE[state],
+            commit=commit,
         )
 
 
@@ -953,7 +984,7 @@ def submit_external_paper_order(
 def apply_external_fills(
     conn: sqlite3.Connection, *, intent: dict, client_order_id: str, payload_hash: str,
     fingerprint: str, runtime: ExternalPaperRuntime, now: datetime,
-    not_before: datetime | None = None,
+    not_before: datetime | None = None, lease: OrderLeaseHandle | None = None,
 ) -> list[dict]:
     try:
         fills = runtime.list_order_fills(intent["book_id"], client_order_id)
@@ -1036,39 +1067,37 @@ def apply_external_fills(
             "simulation_rule_version": POLICY_VERSION,
         }
         try:
-            begin_immediate(conn)
-            repo.save_external_broker_fill(conn, record, commit=False)
-            inserted = repo.save_fill(conn, local, commit=False)
-            if inserted:
-                if intent["side"] == "BUY":
-                    positions.apply_buy_fill(
-                        conn, intent["book_id"], intent["symbol"], local_fill_id, quantity, price,
-                        filled_at, commit=False,
-                    )
-                    cash_ledger.settle_buy(
-                        conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
-                        Decimal("0"), filled_at, commit=False,
-                    )
-                    cash_ledger.release_settled_buy_reservation(
-                        conn, intent["book_id"], intent["paper_order_intent_id"], local_fill_id,
-                        quantity * price, filled_at, commit=False,
-                    )
-                else:
-                    positions.apply_sell_fill(
-                        conn, intent["book_id"], intent["symbol"], local_fill_id, quantity, price,
-                        filled_at, commit=False, already_reserved=True,
-                    )
-                    cash_ledger.settle_sell(
-                        conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
-                        Decimal("0"), filled_at, commit=False,
-                    )
-                    positions.consume_share_reservation_for_fill(
-                        conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"],
-                        local_fill_id, quantity, filled_at, commit=False,
-                    )
-            conn.commit()
+            with _fenced_or_plain_write(conn, lease):
+                repo.save_external_broker_fill(conn, record, commit=False)
+                inserted = repo.save_fill(conn, local, commit=False)
+                if inserted:
+                    if intent["side"] == "BUY":
+                        positions.apply_buy_fill(
+                            conn, intent["book_id"], intent["symbol"], local_fill_id, quantity, price,
+                            filled_at, commit=False,
+                        )
+                        cash_ledger.settle_buy(
+                            conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
+                            Decimal("0"), filled_at, commit=False,
+                        )
+                        cash_ledger.release_settled_buy_reservation(
+                            conn, intent["book_id"], intent["paper_order_intent_id"], local_fill_id,
+                            quantity * price, filled_at, commit=False,
+                        )
+                    else:
+                        positions.apply_sell_fill(
+                            conn, intent["book_id"], intent["symbol"], local_fill_id, quantity, price,
+                            filled_at, commit=False, already_reserved=True,
+                        )
+                        cash_ledger.settle_sell(
+                            conn, intent["book_id"], local_fill_id, quantity * price, Decimal("0"),
+                            Decimal("0"), filled_at, commit=False,
+                        )
+                        positions.consume_share_reservation_for_fill(
+                            conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"],
+                            local_fill_id, quantity, filled_at, commit=False,
+                        )
         except Exception:
-            conn.rollback()
             raise
         if inserted:
             existing_total += quantity
@@ -1078,23 +1107,29 @@ def apply_external_fills(
     if existing_total > 0 and current and current["new_state"] not in TERMINAL_STATES:
         state = STATE_FILLED if existing_total == approved else STATE_PARTIALLY_FILLED
         if state != current["new_state"]:
-            _append_event(
-                conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-                account_fingerprint=fingerprint, new_state=state, operator="SYSTEM_RECONCILIATION",
-                reason="authoritative normalized broker fills applied", now=now,
-                broker_order_id=current.get("broker_order_id"), attempt_number=current.get("attempt_number", 0),
-            )
-            repo.update_order_status(conn, intent["book_id"], intent["paper_order_intent_id"], state)
+            with _fenced_or_plain_write(conn, lease):
+                _append_event(
+                    conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+                    account_fingerprint=fingerprint, new_state=state, operator="SYSTEM_RECONCILIATION",
+                    reason="authoritative normalized broker fills applied", now=now,
+                    broker_order_id=current.get("broker_order_id"), attempt_number=current.get("attempt_number", 0),
+                    commit=False,
+                )
+                repo.update_order_status(
+                    conn, intent["book_id"], intent["paper_order_intent_id"], state, commit=False,
+                )
     if existing_total == approved:
-        if intent["side"] == "BUY":
-            cash_ledger.release_remaining_buy_reservation(
-                conn, intent["book_id"], intent["paper_order_intent_id"], now, release_event_id="fully-filled",
-            )
-        else:
-            positions.release_remaining_share_reservation(
-                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
-                release_event_id="fully-filled", event_type="CONSUMED_BY_FILL",
-            )
+        with _fenced_or_plain_write(conn, lease):
+            if intent["side"] == "BUY":
+                cash_ledger.release_remaining_buy_reservation(
+                    conn, intent["book_id"], intent["paper_order_intent_id"], now,
+                    release_event_id="fully-filled", commit=False,
+                )
+            else:
+                positions.release_remaining_share_reservation(
+                    conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
+                    release_event_id="fully-filled", event_type="CONSUMED_BY_FILL", commit=False,
+                )
     return applied
 
 
@@ -1154,8 +1189,10 @@ def retry_external_paper_order(
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
             now=now, attempt_number=retries + 1, lease=lease,
         )
-        lease.verify_or_raise()
-        repo.consume_external_lookup(conn, lookup["lookup_id"], result["event"]["external_order_event_id"])
+        with lease.fenced_write():
+            repo.consume_external_lookup(
+                conn, lookup["lookup_id"], result["event"]["external_order_event_id"], commit=False,
+            )
         if result["status"] != STATE_UNKNOWN:
             result["reconciliation"] = _reconcile_locked(
                 conn, book_id=book_id, client_order_id=client_order_id,
@@ -1295,8 +1332,8 @@ def refresh_retry_preview(
             ),
             "config_hash": config.config_hash, "policy_version": POLICY_VERSION,
         }
-        lease.verify_or_raise()
-        repo.save_external_preview(conn, record)
+        with lease.fenced_write():
+            repo.save_external_preview(conn, record, commit=False)
         return record
 
 
@@ -1322,13 +1359,13 @@ def cancel_external_paper_order(
         if intent is None:
             raise ExternalPaperError("INTENT_NOT_FOUND", "the external order's frozen intent was not found")
         intent["_external_config_hash"] = config.config_hash
-        lease.verify_or_raise()
-        _append_event(
-            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-            account_fingerprint=current["account_fingerprint"], new_state=STATE_CANCEL_REQUESTED,
-            operator=operator, reason=reason, now=now, broker_order_id=current.get("broker_order_id"),
-            attempt_number=current["attempt_number"],
-        )
+        with lease.fenced_write():
+            _append_event(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                account_fingerprint=current["account_fingerprint"], new_state=STATE_CANCEL_REQUESTED,
+                operator=operator, reason=reason, now=now, broker_order_id=current.get("broker_order_id"),
+                attempt_number=current["attempt_number"], commit=False,
+            )
         request_id = f"m11_{uuid.uuid4().hex}"
         lease.heartbeat_or_raise()
         try:
@@ -1345,15 +1382,16 @@ def cancel_external_paper_order(
                 reason="cancellation outcome is ambiguous; reconciliation required", now=now,
                 runtime_request_id=request_id, error_code=getattr(exc, "code", "CANCEL_UNKNOWN"),
                 attempt_number=current["attempt_number"],
+                lease=lease,
             )
             return {"status": STATE_UNKNOWN, "event": event}
-        lease.verify_or_raise()
-        event = _append_event(
-            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-            account_fingerprint=current["account_fingerprint"], new_state=state, operator=operator,
-            reason="explicit cancellation broker response", now=now, broker_order_id=order.get("broker_order_id"),
-            runtime_request_id=request_id, attempt_number=current["attempt_number"],
-        )
+        with lease.fenced_write():
+            event = _append_event(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                account_fingerprint=current["account_fingerprint"], new_state=state, operator=operator,
+                reason="explicit cancellation broker response", now=now, broker_order_id=order.get("broker_order_id"),
+                runtime_request_id=request_id, attempt_number=current["attempt_number"], commit=False,
+            )
         order_submitted_at = datetime.fromisoformat(
             str(order["submitted_at"]).replace("Z", "+00:00")
         ).astimezone(timezone.utc)
@@ -1368,6 +1406,7 @@ def cancel_external_paper_order(
                 conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
                 fingerprint=current["account_fingerprint"], runtime=runtime, now=now,
                 not_before=order_submitted_at,
+                lease=lease,
             )
         except ExternalPaperError as exc:
             fill_error_codes = {
@@ -1378,19 +1417,19 @@ def cancel_external_paper_order(
                 conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
                 fingerprint=current["account_fingerprint"],
                 statuses=("MALFORMED_BROKER_FILL" if exc.code in fill_error_codes else "FILL_APPLICATION_FAILED",),
-                details={"stage": "post_cancel_fill_sweep"}, now=now, config=config,
+                details={"stage": "post_cancel_fill_sweep"}, now=now, config=config, lease=lease,
             )
             raise
         except Exception:
             _persist_reconciliation(
                 conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
                 fingerprint=current["account_fingerprint"], statuses=("FILL_APPLICATION_FAILED",),
-                details={"stage": "post_cancel_fill_sweep"}, now=now, config=config,
+                details={"stage": "post_cancel_fill_sweep"}, now=now, config=config, lease=lease,
             )
             raise
-        lease.verify_or_raise()
-        _release_terminal_reservation(conn, intent, state, now)
-        repo.update_order_status(conn, book_id, intent["paper_order_intent_id"], state)
+        with lease.fenced_write():
+            _release_terminal_reservation(conn, intent, state, now, commit=False)
+            repo.update_order_status(conn, book_id, intent["paper_order_intent_id"], state, commit=False)
         return {"status": state, "event": event, "order": order}
 
 
@@ -1502,11 +1541,13 @@ def _reconcile_locked(
             conn, book_id=book_id, runtime=runtime, config=config, client_order_id=client_order_id, now=now,
             lease=lease,
         )
+    except OrderLeaseLostError:
+        raise
     except Exception as exc:
         try:
             return _persist_reconciliation(
                 conn, book_id=book_id, intent=None, client_order_id=client_order_id, fingerprint=None,
-                statuses=("RECONCILIATION_INTERNAL_ERROR",), details={}, now=now, config=config,
+                statuses=("RECONCILIATION_INTERNAL_ERROR",), details={}, now=now, config=config, lease=lease,
             )
         except Exception as persist_exc:
             raise ExternalPaperError(
@@ -1522,7 +1563,7 @@ def _run_reconciliation(
     if current is None:
         return _persist_reconciliation(
             conn, book_id=book_id, intent=None, client_order_id=client_order_id, fingerprint=None,
-            statuses=("ORDER_MISSING_LOCALLY",), details={}, now=now, config=config,
+            statuses=("ORDER_MISSING_LOCALLY",), details={}, now=now, config=config, lease=lease,
         )
     # Milestone 11.3.1 Item 4: fence before this reconciliation run's own
     # writes (lookup evidence, bridged/transitioned event, reservation
@@ -1536,7 +1577,7 @@ def _run_reconciliation(
         return _persist_reconciliation(
             conn, book_id=book_id, intent=None, client_order_id=client_order_id,
             fingerprint=current["account_fingerprint"], statuses=("ORDER_MISSING_LOCALLY",),
-            details={}, now=now, config=config,
+            details={}, now=now, config=config, lease=lease,
         )
     intent["_external_config_hash"] = config.config_hash
     # Milestone 11.3.1 Item 1: remember the state this reconciliation run
@@ -1554,14 +1595,16 @@ def _run_reconciliation(
             return
         latest = _current_event(conn, book_id, client_order_id)
         if latest is not None and latest["new_state"] == STATE_SUBMISSION_REQUESTED:
-            _append_event(
-                conn, intent=intent, client_order_id=client_order_id,
-                payload_hash=original_event["payload_hash"], account_fingerprint=fingerprint_value,
-                new_state=STATE_UNKNOWN, operator="SYSTEM_RECOVERY",
-                reason="authoritative broker lookup during recovery did not yield a validated definitive "
-                "order state; reservation retained pending operator retry", now=now,
-                runtime_request_id=request_id_value, attempt_number=original_event["attempt_number"],
-            )
+            with lease.fenced_write():
+                _append_event(
+                    conn, intent=intent, client_order_id=client_order_id,
+                    payload_hash=original_event["payload_hash"], account_fingerprint=fingerprint_value,
+                    new_state=STATE_UNKNOWN, operator="SYSTEM_RECOVERY",
+                    reason="authoritative broker lookup during recovery did not yield a validated definitive "
+                    "order state; reservation retained pending operator retry", now=now,
+                    runtime_request_id=request_id_value, attempt_number=original_event["attempt_number"],
+                    commit=False,
+                )
 
     try:
         risk_for_notional = repo.load_risk_decision(conn, intent["risk_decision_id"])
@@ -1570,6 +1613,7 @@ def _run_reconciliation(
         return _persist_reconciliation(
             conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
             fingerprint=current["account_fingerprint"], statuses=(exc.code,), details={}, now=now, config=config,
+            lease=lease,
         )
     account_check = _account_check(runtime, book_id)
     fingerprint = account_check["account_fingerprint"]
@@ -1595,18 +1639,19 @@ def _run_reconciliation(
         _bridge_stranded_submission_requested(fingerprint, request_id)
         current = _current_event(conn, book_id, client_order_id) or current
     lookup_result = "FOUND" if order else "NOT_FOUND"
-    repo.save_external_lookup(conn, {
-        "lookup_id": _digest(
-            "peol_", [client_order_id, current["external_order_event_id"], lookup_result, request_id], 40,
-        ),
-        "book_id": book_id, "paper_order_intent_id": intent["paper_order_intent_id"],
-        "client_order_id": client_order_id, "account_fingerprint": fingerprint,
-        "result": lookup_result, "authoritative": int(order is None and "UNKNOWN" not in statuses),
-        "runtime_request_id": request_id, "created_at": now.isoformat(),
-        "attempt_number": current["attempt_number"], "ambiguous_event_id": current["external_order_event_id"],
-        "payload_hash": current["payload_hash"], "lookup_started_at": now.isoformat(),
-        "lookup_completed_at": now.isoformat(),
-    })
+    with lease.fenced_write():
+        repo.save_external_lookup(conn, {
+            "lookup_id": _digest(
+                "peol_", [client_order_id, current["external_order_event_id"], lookup_result, request_id], 40,
+            ),
+            "book_id": book_id, "paper_order_intent_id": intent["paper_order_intent_id"],
+            "client_order_id": client_order_id, "account_fingerprint": fingerprint,
+            "result": lookup_result, "authoritative": int(order is None and "UNKNOWN" not in statuses),
+            "runtime_request_id": request_id, "created_at": now.isoformat(),
+            "attempt_number": current["attempt_number"], "ambiguous_event_id": current["external_order_event_id"],
+            "payload_hash": current["payload_hash"], "lookup_started_at": now.isoformat(),
+            "lookup_completed_at": now.isoformat(),
+        }, commit=False)
     if order is None:
         if "UNKNOWN" not in statuses:
             statuses.append("ORDER_MISSING_AT_BROKER")
@@ -1615,6 +1660,7 @@ def _run_reconciliation(
         return _persist_reconciliation(
             conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
             fingerprint=fingerprint, statuses=tuple(dict.fromkeys(statuses)), details={}, now=now, config=config,
+            lease=lease,
         )
     order_valid = True
     try:
@@ -1630,13 +1676,14 @@ def _run_reconciliation(
     if order_valid and broker_state is not None and broker_state != current["new_state"] and broker_state in _TRANSITIONS.get(
         current["new_state"], set()
     ):
-        _append_event(
-            conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-            account_fingerprint=fingerprint, new_state=broker_state, operator="SYSTEM_RECONCILIATION",
-            reason="broker lookup synchronized external order state", now=now,
-            broker_order_id=order.get("broker_order_id"), runtime_request_id=request_id,
-            attempt_number=current["attempt_number"],
-        )
+        with lease.fenced_write():
+            _append_event(
+                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                account_fingerprint=fingerprint, new_state=broker_state, operator="SYSTEM_RECONCILIATION",
+                reason="broker lookup synchronized external order state", now=now,
+                broker_order_id=order.get("broker_order_id"), runtime_request_id=request_id,
+                attempt_number=current["attempt_number"], commit=False,
+            )
         current = _current_event(conn, book_id, client_order_id)
     if order_valid:
         fill_error_codes = {
@@ -1650,13 +1697,17 @@ def _run_reconciliation(
             apply_external_fills(
                 conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
                 fingerprint=fingerprint, runtime=runtime, now=now, not_before=order_submitted_at,
+                lease=lease,
             )
         except ExternalPaperError as exc:
             statuses.append("MALFORMED_BROKER_FILL" if exc.code in fill_error_codes else "FILL_APPLICATION_FAILED")
         except Exception:
             statuses.append("FILL_APPLICATION_FAILED")
         else:
-            _release_terminal_reservation(conn, intent, broker_state or current["new_state"], now)
+            with lease.fenced_write():
+                _release_terminal_reservation(
+                    conn, intent, broker_state or current["new_state"], now, commit=False,
+                )
             reservation_status = "RESERVATION_MISMATCH" if intent["side"] == "BUY" else "SHARE_RESERVATION_MISMATCH"
             remaining = (
                 cash_ledger.remaining_buy_reservation(conn, book_id, intent["paper_order_intent_id"])
@@ -1740,12 +1791,13 @@ def _run_reconciliation(
             "local_fill_quantity": str(local_fill_qty), "broker_filled_quantity": str(broker_filled),
             **duplicate_details,
         },
-        now=now, config=config,
+        now=now, config=config, lease=lease,
     )
 
 
 def _persist_reconciliation(
     conn, *, book_id, intent, client_order_id, fingerprint, statuses, details, now, config,
+    lease: OrderLeaseHandle | None = None,
 ) -> dict:
     statuses = tuple(statuses) or ("UNKNOWN",)
     critical = any(status in CRITICAL_RECONCILIATION_STATUSES for status in statuses)
@@ -1759,5 +1811,6 @@ def _persist_reconciliation(
         "status": statuses[0], "statuses": statuses, "details": details, "critical": int(critical),
         "created_at": now.isoformat(), "policy_version": POLICY_VERSION, "config_hash": config.config_hash,
     }
-    repo.save_external_reconciliation(conn, record)
+    with _fenced_or_plain_write(conn, lease):
+        repo.save_external_reconciliation(conn, record, commit=False)
     return record

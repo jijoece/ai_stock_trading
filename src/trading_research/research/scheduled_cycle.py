@@ -38,6 +38,12 @@ from ..evidence_providers.fundamentals import normalize_fundamentals
 from ..evidence_providers.market_data_provider import AlpacaMarketDataClient
 from ..evidence_providers.normalization import BLOCKING_OUTCOMES, classify_snapshot_outcome
 from ..evidence_providers.portfolio_context import LedgerPortfolioContextProvider
+from ..evidence_providers.persistence import (
+    CORRELATION_RESEARCH_CYCLE,
+    CORRELATION_SCHEDULED,
+    current_provider_request_context,
+    provider_request_context,
+)
 from ..evidence_providers.sec_provider import SecEdgarClient
 from ..execution.config import ExecutionConfig
 from ..models.trading_models import (
@@ -363,15 +369,24 @@ def run_scheduled_research_cycle(
             continue
 
         try:
-            result = _run_symbol(
-                symbol, as_of, cycle_id=cycle_id, configuration=configuration, conn=conn, universe=universe,
-                screening_config=screening_config, scoring_config=scoring_config, evidence_providers=evidence_providers,
-                research_provider=research_provider, research_provider_name=research_provider_name,
-                research_model_name=research_model_name, research_configuration=research_configuration,
-                research_repository=research_repository, prompt_registry=prompt_registry, portfolio=portfolio,
-                paper_submitter=paper_submitter, clock=clock, git_sha=git_sha,
-                attempt_controller=attempt_controller_factory(symbol) if attempt_controller_factory is not None else None,
+            parent_request_context = current_provider_request_context()
+            correlation_mode = (
+                CORRELATION_SCHEDULED if parent_request_context.scheduler_run_id else CORRELATION_RESEARCH_CYCLE
             )
+            with provider_request_context(
+                correlation_mode=correlation_mode, research_cycle_id=cycle_id,
+                symbol_attempt_id=f"{cycle_id}:{symbol}",
+                provider_request_group_id=f"{cycle_id}:{symbol}:evidence",
+            ):
+                result = _run_symbol(
+                    symbol, as_of, cycle_id=cycle_id, configuration=configuration, conn=conn, universe=universe,
+                    screening_config=screening_config, scoring_config=scoring_config, evidence_providers=evidence_providers,
+                    research_provider=research_provider, research_provider_name=research_provider_name,
+                    research_model_name=research_model_name, research_configuration=research_configuration,
+                    research_repository=research_repository, prompt_registry=prompt_registry, portfolio=portfolio,
+                    paper_submitter=paper_submitter, clock=clock, git_sha=git_sha,
+                    attempt_controller=attempt_controller_factory(symbol) if attempt_controller_factory is not None else None,
+                )
         except Exception as exc:  # per-symbol failure isolation — never loses the whole cycle
             result = SymbolCycleResult(symbol=symbol, status=SYMBOL_STATUS_FAILED, failure_reason=str(exc))
             if not configuration.continue_on_symbol_failure:

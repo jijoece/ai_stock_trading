@@ -119,18 +119,31 @@ def list_failed_deliveries_for_alert(conn: sqlite3.Connection, alert_id: str) ->
 
 
 def save_run_summary(conn: sqlite3.Connection, summary: dict) -> None:
+    summary = dict(summary)
+    for key in (
+        "single_cycle_status", "hysteresis_status", "effective_status", "provider_health_mode",
+        "provider_request_count", "provider_minimum_sample_size", "provider_health_qualified",
+        "provider_policy_hash", "provider_coverage_json", "provider_severe_categories_json",
+    ):
+        summary.setdefault(key, None)
     conn.execute(
         "INSERT OR REPLACE INTO shadow_run_summaries "
         "(scheduler_run_id, intended_schedule_id, policy_version, health_status, health_reasons_json, "
         "provider_success_rate, evidence_completeness_rate, claude_role_success_rate, retry_rate, "
         "retry_exhaustion_rate, unsupported_claim_rate, output_truncation_rate, latency_seconds, "
         "input_tokens, output_tokens, cost_usd, paper_reconciliation_mismatch, "
-        "duplicate_prevention_violation, cycle_duration_seconds, created_at) "
+        "duplicate_prevention_violation, cycle_duration_seconds, created_at, single_cycle_status, "
+        "hysteresis_status, effective_status, provider_health_mode, provider_request_count, "
+        "provider_minimum_sample_size, provider_health_qualified, provider_policy_hash, "
+        "provider_coverage_json, provider_severe_categories_json) "
         "VALUES (:scheduler_run_id, :intended_schedule_id, :policy_version, :health_status, :health_reasons_json, "
         ":provider_success_rate, :evidence_completeness_rate, :claude_role_success_rate, :retry_rate, "
         ":retry_exhaustion_rate, :unsupported_claim_rate, :output_truncation_rate, :latency_seconds, "
         ":input_tokens, :output_tokens, :cost_usd, :paper_reconciliation_mismatch, "
-        ":duplicate_prevention_violation, :cycle_duration_seconds, :created_at)",
+        ":duplicate_prevention_violation, :cycle_duration_seconds, :created_at, :single_cycle_status, "
+        ":hysteresis_status, :effective_status, :provider_health_mode, :provider_request_count, "
+        ":provider_minimum_sample_size, :provider_health_qualified, :provider_policy_hash, "
+        ":provider_coverage_json, :provider_severe_categories_json)",
         summary,
     )
     conn.commit()
@@ -207,7 +220,7 @@ def load_health_hysteresis_state(conn: sqlite3.Connection, scope: str) -> dict |
     return dict(row) if row else None
 
 
-def save_health_hysteresis_state(conn: sqlite3.Connection, state: dict) -> None:
+def save_health_hysteresis_state(conn: sqlite3.Connection, state: dict, *, commit: bool = True) -> None:
     """Upsert — exactly one row per `scope`. Callers always write the full
     freshly-computed state (never a partial patch), so there is no risk of
     a stale field surviving an update."""
@@ -230,4 +243,58 @@ def save_health_hysteresis_state(conn: sqlite3.Connection, state: dict) -> None:
         "per_provider_metrics_json = excluded.per_provider_metrics_json",
         state,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def insert_health_hysteresis_evaluation(conn: sqlite3.Connection, evaluation: dict) -> bool:
+    cursor = conn.execute(
+        "INSERT INTO shadow_health_hysteresis_evaluations "
+        "(evaluation_id, scope, cycle_id, policy_version, policy_hash, single_cycle_status, "
+        "previous_hysteresis_status, new_hysteresis_status, effective_status, qualified, sample_size, "
+        "minimum_sample_size, aggregate_success_rate, required_categories_json, required_providers_json, "
+        "observed_providers_json, missing_required_providers_json, missing_required_categories_json, "
+        "per_provider_metrics_json, severe_error_categories_json, consecutive_failures_before, "
+        "consecutive_failures_after, consecutive_recoveries_before, consecutive_recoveries_after, "
+        "reasons_json, evaluated_at) VALUES "
+        "(:evaluation_id, :scope, :cycle_id, :policy_version, :policy_hash, :single_cycle_status, "
+        ":previous_hysteresis_status, :new_hysteresis_status, :effective_status, :qualified, :sample_size, "
+        ":minimum_sample_size, :aggregate_success_rate, :required_categories_json, :required_providers_json, "
+        ":observed_providers_json, :missing_required_providers_json, :missing_required_categories_json, "
+        ":per_provider_metrics_json, :severe_error_categories_json, :consecutive_failures_before, "
+        ":consecutive_failures_after, :consecutive_recoveries_before, :consecutive_recoveries_after, "
+        ":reasons_json, :evaluated_at) ON CONFLICT(scope, cycle_id, policy_hash) DO NOTHING",
+        evaluation,
+    )
+    return cursor.rowcount > 0
+
+
+def load_health_hysteresis_evaluation(
+    conn: sqlite3.Connection, *, scope: str, cycle_id: str, policy_hash: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_health_hysteresis_evaluations "
+        "WHERE scope = ? AND cycle_id = ? AND policy_hash = ?",
+        (scope, cycle_id, policy_hash),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def load_latest_health_hysteresis_evaluation(conn: sqlite3.Connection, scope: str = "default") -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_health_hysteresis_evaluations WHERE scope = ? "
+        "ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
+        (scope,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def load_latest_health_hysteresis_evaluation_for_cycle(
+    conn: sqlite3.Connection, cycle_id: str,
+) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM shadow_health_hysteresis_evaluations WHERE cycle_id = ? "
+        "ORDER BY evaluated_at DESC, rowid DESC LIMIT 1",
+        (cycle_id,),
+    ).fetchone()
+    return dict(row) if row else None

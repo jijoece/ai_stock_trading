@@ -53,7 +53,7 @@ from zoneinfo import ZoneInfo
 from ..evidence_providers import health as provider_health_mod
 from ..evidence_providers import persistence as provider_persistence_mod
 from ..research import usage as usage_mod
-from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration
+from ..research.scheduled_cycle import ResearchCycleResult, ScheduledResearchConfiguration, derive_cycle_id
 from ..storage.research_repositories import compute_cycle_telemetry
 from ..storage.shadow_alerts_repositories import save_health_check, save_run_summary
 from ..storage.shadow_operations_repositories import (
@@ -254,6 +254,8 @@ def _build_health_inputs_from_cycle_result(
     cycle_duration_seconds: float, budget_breached: bool = False,
     bounded_symbols: tuple[str, ...] = (), window_start: datetime | None = None,
     window_end: datetime | None = None,
+    provider_coverage_policy: provider_health_mod.ProviderCoveragePolicy | None = None,
+    expected_cycle_id: str | None = None,
 ) -> health_mod.CycleHealthInputs:
     """Computes real aggregate rates from `ResearchCycleResult.symbol_results`
     plus, since docs/milestone-7.1.md Step 18, a real `ResearchCycleTelemetry`
@@ -286,6 +288,43 @@ def _build_health_inputs_from_cycle_result(
     here rather than recomputed, so this function stays a pure mapper from
     already-computed inputs to `CycleHealthInputs`.
     """
+    del bounded_symbols, window_start, window_end  # timestamps/symbols never establish request ownership
+    provider_policy = provider_coverage_policy or provider_health_mod.ProviderCoveragePolicy()
+    provider_cycle_id = cycle_result.cycle_id if cycle_result is not None else expected_cycle_id
+    provider_rows = (
+        provider_persistence_mod.list_provider_requests_for_cycle(conn, provider_cycle_id)
+        if provider_cycle_id is not None else []
+    )
+    provider_telemetry = provider_health_mod.compute_cycle_provider_telemetry(
+        provider_rows, coverage_policy=provider_policy,
+    )
+    provider_metrics = {
+        provider: {
+            "request_count": summary.total_requests,
+            "success_count": sum(1 for row in provider_rows if provider_health_mod.normalize_provider_name(row["provider"]) == provider and row["success"]),
+            "failure_count": sum(1 for row in provider_rows if provider_health_mod.normalize_provider_name(row["provider"]) == provider and not row["success"]),
+            "success_rate": summary.success_rate,
+            "status": summary.status,
+        }
+        for provider, summary in provider_telemetry.per_provider.items()
+    }
+    provider_fields = {
+        "provider_request_count": provider_telemetry.total_requests,
+        "provider_severe_error": provider_telemetry.severe_error,
+        "provider_health_mode": (
+            health_mod.CHECK_STATUS_NOT_APPLICABLE if not provider_telemetry.telemetry_expected else "PRODUCTION"
+        ),
+        "provider_required_categories": provider_telemetry.required_categories,
+        "provider_required_providers": provider_telemetry.resolved_required_providers,
+        "provider_observed_providers": provider_telemetry.observed_providers,
+        "provider_missing_required_providers": provider_telemetry.required_providers_missing,
+        "provider_missing_required_categories": provider_telemetry.missing_required_categories,
+        "provider_per_provider_metrics": provider_metrics,
+        "provider_severe_error_categories": provider_telemetry.severe_error_categories,
+        "provider_policy_version": provider_telemetry.policy_version,
+        "provider_policy_hash": provider_telemetry.policy_hash,
+    }
+
     if cycle_result is None or symbols_attempted == 0:
         return health_mod.CycleHealthInputs(
             provider_success_rate=None, evidence_completeness_rate=None, claude_role_success_rate=None,
@@ -293,33 +332,10 @@ def _build_health_inputs_from_cycle_result(
             latency_seconds=None, input_tokens=None, output_tokens=None, cost_usd=None, pricing_configured=True,
             paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
             cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
+            **provider_fields,
         )
 
-    completed = sum(1 for r in cycle_result.symbol_results if r.status == "COMPLETED")
-
-    # Milestone 11.3.1 Item 8 Part A: derive provider health from the real,
-    # persisted `evidence_provider_requests` telemetry for this cycle's own
-    # symbols and wall-clock window -- one symbol can produce zero, one, or
-    # many provider requests/retries, so `symbols_attempted` was never the
-    # right denominator. Falls back to the pre-11.3.1 symbol-level proxy
-    # only when no real request rows exist for this window (e.g. an offline/
-    # deterministic test cycle that never calls a real evidence provider) --
-    # never silently reinterprets a genuine zero-request cycle as healthy.
-    provider_telemetry = None
-    if bounded_symbols and window_start is not None and window_end is not None:
-        provider_rows = provider_persistence_mod.list_provider_requests_in_window(
-            conn, symbols=bounded_symbols, window_start_iso=window_start.isoformat(),
-            window_end_iso=window_end.isoformat(),
-        )
-        provider_telemetry = provider_health_mod.compute_cycle_provider_telemetry(provider_rows)
-    if provider_telemetry is not None and provider_telemetry.total_requests > 0:
-        provider_success_rate = provider_telemetry.aggregate_success_rate
-        provider_request_count = provider_telemetry.total_requests
-        provider_severe_error = provider_telemetry.severe_error
-    else:
-        provider_success_rate = completed / symbols_attempted if symbols_attempted > 0 else None
-        provider_request_count = symbols_attempted
-        provider_severe_error = False
+    provider_success_rate = provider_telemetry.aggregate_success_rate
 
     outcomes = [r.evidence_outcome for r in cycle_result.symbol_results if r.evidence_outcome is not None]
     if outcomes:
@@ -369,12 +385,14 @@ def _build_health_inputs_from_cycle_result(
         cost_usd=telemetry.priced_usage_cost_usd, pricing_configured=pricing_configured,
         paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
         cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
-        provider_request_count=provider_request_count, provider_severe_error=provider_severe_error,
+        **provider_fields,
     )
 
 
 def _save_health_summary(
-    conn: sqlite3.Connection, *, scheduler_run_id: str, intended_schedule_id: str, health_result: health_mod.HealthResult,
+    conn: sqlite3.Connection, *, scheduler_run_id: str, intended_schedule_id: str,
+    single_cycle_result: health_mod.HealthResult, effective_decision: health_mod.EffectiveHealthDecision,
+    hysteresis_status: str, provider_qualified: bool, minimum_sample_size: int,
     inputs: health_mod.CycleHealthInputs, clock: Clock,
 ) -> None:
     now = clock()
@@ -382,8 +400,8 @@ def _save_health_summary(
         conn,
         {
             "scheduler_run_id": scheduler_run_id, "intended_schedule_id": intended_schedule_id,
-            "policy_version": health_result.policy_version, "health_status": health_result.status,
-            "health_reasons_json": json.dumps(list(health_result.reasons)),
+            "policy_version": single_cycle_result.policy_version, "health_status": effective_decision.effective_status,
+            "health_reasons_json": json.dumps(list(effective_decision.reasons)),
             "provider_success_rate": inputs.provider_success_rate,
             "evidence_completeness_rate": inputs.evidence_completeness_rate,
             "claude_role_success_rate": inputs.claude_role_success_rate, "retry_rate": inputs.retry_rate,
@@ -395,6 +413,23 @@ def _save_health_summary(
             "paper_reconciliation_mismatch": int(inputs.paper_reconciliation_mismatch),
             "duplicate_prevention_violation": int(inputs.duplicate_prevention_violation),
             "cycle_duration_seconds": inputs.cycle_duration_seconds, "created_at": now.isoformat(),
+            "single_cycle_status": single_cycle_result.status, "hysteresis_status": hysteresis_status,
+            "effective_status": effective_decision.effective_status,
+            "provider_health_mode": inputs.provider_health_mode,
+            "provider_request_count": inputs.provider_request_count or 0,
+            "provider_minimum_sample_size": minimum_sample_size,
+            "provider_health_qualified": int(provider_qualified),
+            "provider_policy_hash": inputs.provider_policy_hash,
+            "provider_coverage_json": json.dumps({
+                "policy_version": inputs.provider_policy_version,
+                "required_categories": list(inputs.provider_required_categories),
+                "required_providers": list(inputs.provider_required_providers),
+                "observed_providers": list(inputs.provider_observed_providers),
+                "missing_required_providers": list(inputs.provider_missing_required_providers),
+                "missing_required_categories": list(inputs.provider_missing_required_categories),
+                "per_provider_metrics": inputs.provider_per_provider_metrics,
+            }, sort_keys=True),
+            "provider_severe_categories_json": json.dumps(list(inputs.provider_severe_error_categories)),
         },
     )
 
@@ -508,6 +543,7 @@ def run_due_shadow_cycle(
     deployment_source: str = DEPLOYMENT_SOURCE_MANUAL,
     paper_book_integrator: Callable[[ResearchCycleResult, datetime], Any] | None = None,
     paper_book_lifecycle_hook: Callable[[datetime], Any] | None = None,
+    provider_coverage_policy: provider_health_mod.ProviderCoveragePolicy | None = None,
 ) -> ShadowCycleRunResult:
     """Single-invocation orchestrator wrapping `run_scheduled_research_cycle`
     (injected as `run_cycle` so this module never imports it directly,
@@ -869,11 +905,21 @@ def run_due_shadow_cycle(
         cycle_result: ResearchCycleResult | None = None
         failure_reason: str | None = None
         try:
-            cycle_kwargs = cycle_kwargs_builder(bounded_symbols, intended_schedule_time)
-            cycle_result = run_cycle(
-                as_of=intended_schedule_time, symbols=bounded_symbols, configuration=cycle_configuration, conn=conn,
-                clock=clock, attempt_controller_factory=attempt_controller_factory, **cycle_kwargs,
-            )
+            if provider_coverage_policy is not None and provider_coverage_policy.unavailable_required_categories:
+                raise SchedulerError(
+                    "required provider categories are disabled or unavailable: "
+                    + ", ".join(provider_coverage_policy.unavailable_required_categories)
+                )
+            else:
+                cycle_kwargs = cycle_kwargs_builder(bounded_symbols, intended_schedule_time)
+                with provider_persistence_mod.provider_request_context(
+                    correlation_mode=provider_persistence_mod.CORRELATION_SCHEDULED,
+                    scheduler_run_id=scheduler_run_id,
+                ):
+                    cycle_result = run_cycle(
+                        as_of=intended_schedule_time, symbols=bounded_symbols, configuration=cycle_configuration, conn=conn,
+                        clock=clock, attempt_controller_factory=attempt_controller_factory, **cycle_kwargs,
+                    )
         except Exception as exc:  # cycle-level crash — visible as a partial/failed run, never silently lost
             failure_reason = str(exc)
 
@@ -974,10 +1020,19 @@ def run_due_shadow_cycle(
             cycle_duration_seconds=(finish_time - start_time).total_seconds(),
             budget_breached=emergency_margin_report.breached,
             bounded_symbols=tuple(bounded_symbols), window_start=start_time, window_end=finish_time,
+            provider_coverage_policy=(
+                provider_coverage_policy if provider_coverage_policy is not None else
+                provider_health_mod.ProviderCoveragePolicy(
+                    telemetry_expected=cycle_configuration.provider_mode != "fixture",
+                    configuration_hash=cycle_configuration.config_hash,
+                )
+            ),
+            expected_cycle_id=derive_cycle_id(
+                cycle_configuration.universe_id, intended_schedule_time, cycle_configuration.config_hash,
+            ),
         )
         health_config = health_mod.HealthPolicyConfig.from_shadow_config(shadow_config)
         health_result = health_mod.evaluate_cycle_health(health_inputs, health_config)
-        new_pause_state = health_mod.apply_health_result(conn, health_result, health_config, clock)
         # Milestone 11.3.1 Item 8 Part C: fold this cycle's single-cycle
         # verdict into the persistent, multi-cycle hysteresis state. This is
         # purely observational (never calls request_pause/resume itself —
@@ -988,11 +1043,31 @@ def run_due_shadow_cycle(
         # this cycle -- never fabricated from a zero-request cycle.
         hysteresis_decision = health_hysteresis_mod.evaluate_and_persist_hysteresis(
             conn, cycle_id=cycle_id or scheduler_run_id, cycle_status=health_result.status,
-            qualified=bool(health_inputs.provider_request_count),
+            qualified=health_mod.provider_health_is_qualified(health_result),
             severe_error=health_inputs.provider_severe_error,
             config=health_hysteresis_mod.PersistentHealthPolicyConfig(), clock=clock,
+            evidence=health_hysteresis_mod.HysteresisEvaluationEvidence(
+                sample_size=health_inputs.provider_request_count or 0,
+                minimum_sample_size=health_config.minimum_requests_for_failure_rate,
+                aggregate_success_rate=health_inputs.provider_success_rate,
+                required_categories=health_inputs.provider_required_categories,
+                required_providers=health_inputs.provider_required_providers,
+                observed_providers=health_inputs.provider_observed_providers,
+                missing_required_providers=health_inputs.provider_missing_required_providers,
+                missing_required_categories=health_inputs.provider_missing_required_categories,
+                per_provider_metrics=health_inputs.provider_per_provider_metrics,
+                severe_error_categories=health_inputs.provider_severe_error_categories,
+                provider_policy_hash=health_inputs.provider_policy_hash,
+            ),
+            immediate_pause=health_mod.immediate_pause_required(
+                health_result, provider_severe_categories=health_inputs.provider_severe_error_categories,
+            ),
         )
-        del hysteresis_decision  # persisted as a side effect; not otherwise consumed in this cycle's control flow
+        effective_decision = health_mod.combine_effective_health_decision(
+            health_result, hysteresis_decision.decision,
+            provider_severe_categories=health_inputs.provider_severe_error_categories,
+        )
+        new_pause_state = health_mod.apply_health_result(conn, effective_decision, health_config, clock)
         # docs/milestone-7.2.md Part 11 fix: previously an automatic
         # health-triggered pause produced NO alert at all — an operator
         # watching `shadow-alerts` would see nothing explaining a sudden
@@ -1006,7 +1081,7 @@ def run_due_shadow_cycle(
         # `HEALTHY`/`DEGRADED` ("DEGRADED -> no automatic pause" and no
         # alert either, since it is this module's own "approaching the
         # line" interpretation, not a configured policy breach).
-        if health_result.status in (health_mod.STATUS_PAUSE_RECOMMENDED, health_mod.STATUS_PAUSE_REQUIRED):
+        if effective_decision.effective_status in (health_mod.STATUS_PAUSE_RECOMMENDED, health_mod.STATUS_PAUSE_REQUIRED):
             paused = new_pause_state is not None
             _raise(
                 conn, severity=alerts_mod.SEVERITY_CRITICAL if paused else alerts_mod.SEVERITY_WARNING,
@@ -1018,7 +1093,7 @@ def run_due_shadow_cycle(
                         if paused else
                         f"shadow operations health check recommended a pause after scheduler run "
                         f"{scheduler_run_id} (no automatic action taken): "
-                    ) + "; ".join(health_result.reasons)
+                    ) + "; ".join(effective_decision.reasons)
                 ),
                 context={
                     # `scheduler_run_id` deliberately excluded from context —
@@ -1028,14 +1103,21 @@ def run_due_shadow_cycle(
                     # same underlying event across different scheduler
                     # runs). It remains in the human-readable `message` above.
                     "pause_state": new_pause_state.state if paused else None,
-                    "health_status": health_result.status, "triggering_flags": list(health_result.triggering_flags),
-                    "health_reasons": list(health_result.reasons),
+                    "health_status": effective_decision.effective_status,
+                    "single_cycle_status": effective_decision.single_cycle_status,
+                    "hysteresis_status": effective_decision.hysteresis_status,
+                    "triggering_flags": list(effective_decision.triggering_flags),
+                    "health_reasons": list(effective_decision.reasons),
                 },
                 clock=clock,
             )
         _save_health_summary(
             conn, scheduler_run_id=scheduler_run_id, intended_schedule_id=intended_schedule_id,
-            health_result=health_result, inputs=health_inputs, clock=clock,
+            single_cycle_result=health_result, effective_decision=effective_decision,
+            hysteresis_status=hysteresis_decision.decision,
+            provider_qualified=health_mod.provider_health_is_qualified(health_result),
+            minimum_sample_size=health_config.minimum_requests_for_failure_rate,
+            inputs=health_inputs, clock=clock,
         )
         _save_health_checks(conn, scheduler_run_id=scheduler_run_id, cycle_id=cycle_id, health_result=health_result, clock=clock)
 
