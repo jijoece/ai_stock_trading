@@ -29,6 +29,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Callable
 
+from .transactions import transaction
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,12 +58,51 @@ def _migration_1_baseline(conn: sqlite3.Connection) -> None:
     del conn
 
 
+def _migration_2_backfill_execution_namespace_claims(conn: sqlite3.Connection) -> None:
+    """Milestone 11.3.1 Item 6: `paper_order_execution_claims` did not exist
+    before this migration, so every pre-existing `paper_book_orders` row has
+    no claim row. Backfill one claim per legacy intent, inferring the
+    namespace from the same evidence `has_external_execution_evidence` uses
+    (any external preview/event/fill/queue row) -- otherwise LOCAL_SIMULATED,
+    since every intent through Milestone 11.3 defaulted to the local
+    simulator unless it had external evidence. Idempotent: `INSERT ... WHERE
+    NOT EXISTS` skips any row a previous run (or the ordinary claim path)
+    already created."""
+    intent_ids = conn.execute("SELECT book_id, paper_order_intent_id FROM paper_book_orders").fetchall()
+    now = datetime.now(timezone.utc).isoformat()
+    for book_id, paper_order_intent_id in intent_ids:
+        external_evidence = False
+        for table in (
+            "paper_external_order_previews", "paper_external_order_events",
+            "paper_external_broker_fills", "paper_external_submission_queue",
+        ):
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE book_id = ? AND paper_order_intent_id = ? LIMIT 1",
+                (book_id, paper_order_intent_id),
+            ).fetchone()
+            if row is not None:
+                external_evidence = True
+                break
+        namespace = "EXTERNAL_PAPER" if external_evidence else "LOCAL_SIMULATED"
+        conn.execute(
+            "INSERT INTO paper_order_execution_claims "
+            "(book_id, paper_order_intent_id, execution_namespace, claim_generation, claimed_at, claimed_by) "
+            "SELECT ?, ?, ?, 1, ?, 'schema_migration_2_backfill' "
+            "WHERE NOT EXISTS (SELECT 1 FROM paper_order_execution_claims WHERE book_id = ? AND paper_order_intent_id = ?)",
+            (book_id, paper_order_intent_id, namespace, now, book_id, paper_order_intent_id),
+        )
+
+
 # Ordered, idempotent migrations. Each callable must be safe to invoke more
 # than once (defense in depth on top of the version gate, which normally
 # prevents re-invocation) and must not raise on a database that already has
 # the effect it describes.
 _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     1: ("baseline: schema_version tracking introduced (Milestone 11.3 Part 34)", _migration_1_baseline),
+    2: (
+        "backfill paper_order_execution_claims for pre-existing intents (Milestone 11.3.1 Item 6)",
+        _migration_2_backfill_execution_namespace_claims,
+    ),
 }
 
 CURRENT_SCHEMA_VERSION = max(_MIGRATIONS)
@@ -96,19 +137,18 @@ def apply_pending_schema_migrations(conn: sqlite3.Connection) -> int:
     pending = sorted(v for v in _MIGRATIONS if v > (stored or 0))
     for version in pending:
         description, migration_fn = _MIGRATIONS[version]
-        if conn.in_transaction:
-            conn.rollback()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+        # Milestone 11.3.1 Item 2: use the shared transaction-ownership
+        # context manager instead of a bare `BEGIN IMMEDIATE` guarded by an
+        # unconditional `conn.rollback()` — this connection is opened with
+        # `isolation_level=None` (database.py::connect()), so an already-open
+        # transaction here would be a real caller-owned one, never a stray
+        # implicit one safe to discard.
+        with transaction(conn):
             migration_fn(conn)
             conn.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, datetime.now(timezone.utc).isoformat()),
             )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
         # Log only the version number and static migration description —
         # never row contents, credentials, or any other persisted data.
         logger.info("schema_version migration applied: version=%s description=%s", version, description)

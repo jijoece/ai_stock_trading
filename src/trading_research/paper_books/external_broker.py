@@ -263,6 +263,17 @@ def _intent(conn: sqlite3.Connection, cfg: PaperBooksConfiguration, book_id: str
             f"paper intent {intent_id!r} has terminal local status {intent['status']!r} — a terminal intent "
             "can never be (re)submitted, previewed, or retried externally",
         )
+    # Milestone 11.3.1 Item 6 Part B: the durable execution-namespace claim
+    # is the authoritative local/external exclusivity check -- it catches a
+    # concurrent local claim+reservation even while the shared order status
+    # column is still non-terminal (e.g. reserved but not yet filled), which
+    # the terminal-status check above cannot see.
+    claim = repo.load_execution_namespace_claim(conn, book_id, intent_id)
+    if claim is not None and claim["execution_namespace"] != repo.EXECUTION_NAMESPACE_EXTERNAL:
+        raise ExternalPaperError(
+            "INTENT_NOT_ELIGIBLE_FOR_EXTERNAL",
+            f"paper intent {intent_id!r} is already claimed by {claim['execution_namespace']} execution",
+        )
     book = repo.load_book(conn, book_id)
     if book is None or book.status != BOOK_STATUS_ACTIVE:
         raise ExternalPaperError("BOOK_INACTIVE", f"paper book {book_id} is not ACTIVE")
@@ -391,49 +402,79 @@ def _verify_fingerprint_history(conn: sqlite3.Connection, book_id: str, fingerpr
 
 
 # Fallback defaults when no config is supplied (kept for callers/tests that
-# still invoke `_order_lease` without a `config=` — matches the pre-Part-10
-# fixed 30s TTL exactly, so unmigrated call sites are unaffected).
-_DEFAULT_ORDER_LEASE_TTL_SECONDS = 30
+# still invoke `_order_lease` without a `config=`). Milestone 11.3.1 Item 4:
+# no longer 30s -- a TTL sitting exactly at the isolated runtime client's own
+# default 30s single-request timeout could expire mid-request. Matches
+# `paper_books/config.py::ExternalBrokerSection`'s own validated default.
+_DEFAULT_ORDER_LEASE_TTL_SECONDS = 45
 _DEFAULT_ORDER_LEASE_HEARTBEAT_SECONDS = 10
 
 
+class OrderLeaseLostError(ExternalPaperError):
+    def __init__(self, message: str) -> None:
+        super().__init__("ORDER_LEASE_LOST", message)
+
+
 class OrderLeaseHandle:
-    """Milestone 11.2 Part 10: a renewable, fenced order-scope lease.
+    """Milestone 11.2 Part 10 / Milestone 11.3.1 Item 4: a renewable, fenced
+    order-scope lease.
 
-    `heartbeat()` extends `expires_at` without releasing, so an operation
-    whose runtime calls collectively exceed the original TTL can keep
-    ownership as long as it heartbeats. `verify()` is a read-only fencing
-    check a caller can perform immediately before a write it wants to gate
-    on still holding the lease. Both fail closed (return False) once the
-    lease has been reclaimed by another owner (its `generation` no longer
-    matches) — a stale owner can never renew or gate a write past a
-    takeover."""
+    `heartbeat()`/`verify()` always read a *fresh* clock value on every call
+    (never the operation's original `now`) -- a heartbeat or fencing check
+    performed against a stale timestamp could wrongly believe the lease is
+    still comfortably within its TTL. Both fail closed (return False) once
+    the lease has been reclaimed by another owner (its `generation` no
+    longer matches) — a stale owner can never renew or gate a write past a
+    takeover. `heartbeat_or_raise()`/`verify_or_raise()` are the versions
+    every call site in this module actually uses: a failed heartbeat or a
+    failed fencing check must immediately stop the operation, not be
+    silently ignored."""
 
-    def __init__(self, conn: sqlite3.Connection, lease_key: str, owner_id: str, generation: int, ttl_seconds: int):
+    def __init__(
+        self, conn: sqlite3.Connection, lease_key: str, owner_id: str, generation: int, ttl_seconds: int, clock,
+    ):
         self._conn = conn
         self.lease_key = lease_key
         self.owner_id = owner_id
         self.generation = generation
         self._ttl_seconds = ttl_seconds
+        self._clock = clock
 
-    def heartbeat(self, now: datetime) -> bool:
+    def heartbeat(self) -> bool:
+        now = _now(self._clock)
         expires_at = (now + timedelta(seconds=self._ttl_seconds)).isoformat()
         return repo.heartbeat_external_order_lease(
             self._conn, lease_key=self.lease_key, owner_id=self.owner_id, generation=self.generation,
             now=now.isoformat(), expires_at=expires_at,
         )
 
-    def verify(self, now: datetime) -> bool:
+    def heartbeat_or_raise(self) -> None:
+        if not self.heartbeat():
+            raise OrderLeaseLostError(
+                f"order-scope lease heartbeat failed for {self.lease_key!r} — ownership was lost "
+                "(expired or reclaimed by another owner); the operation must stop immediately"
+            )
+
+    def verify(self) -> bool:
+        now = _now(self._clock)
         return repo.verify_external_order_lease(
             self._conn, lease_key=self.lease_key, owner_id=self.owner_id, generation=self.generation,
             now=now.isoformat(),
         )
 
+    def verify_or_raise(self) -> None:
+        if not self.verify():
+            raise OrderLeaseLostError(
+                f"order-scope lease fencing check failed for {self.lease_key!r} immediately before a "
+                "protected write — ownership was lost (expired or reclaimed by another owner); refusing "
+                "to perform the write"
+            )
+
 
 @contextlib.contextmanager
 def _order_lease(
     conn: sqlite3.Connection, book_id: str, client_order_id: str, *, operation: str, now: datetime,
-    config: PaperBooksConfiguration | None = None,
+    config: PaperBooksConfiguration | None = None, clock=None,
 ):
     """Atomic order-scope claim keyed by (book_id, client_order_id).
 
@@ -442,10 +483,12 @@ def _order_lease(
     single conditional SQL write (`acquire_external_order_lease`), a stale
     lease (past `expires_at`) is recoverable by a new owner, and failure to
     acquire raises immediately rather than waiting. Released in `finally` so
-    a raised exception never leaves the lease held. Yields an
-    `OrderLeaseHandle` the caller may heartbeat around individual runtime
+    a raised exception never leaves the lease held (using a fresh clock
+    read, not the original acquisition-time `now`). Yields an
+    `OrderLeaseHandle` the caller must heartbeat around individual runtime
     calls when a single operation's total runtime-call time can approach or
-    exceed the TTL.
+    exceed the TTL, and must fence (`verify_or_raise`) immediately before
+    every protected write.
     """
     ttl_seconds = _DEFAULT_ORDER_LEASE_TTL_SECONDS
     if config is not None:
@@ -461,12 +504,13 @@ def _order_lease(
         raise ExternalPaperError(
             "ORDER_LEASE_HELD", f"another operation holds the order-scope lease for {client_order_id!r}",
         )
-    handle = OrderLeaseHandle(conn, lease_key, owner_id, generation, ttl_seconds)
+    handle = OrderLeaseHandle(conn, lease_key, owner_id, generation, ttl_seconds, clock)
     try:
         yield handle
     finally:
+        release_now = _now(clock)
         repo.release_external_order_lease(
-            conn, lease_key=lease_key, owner_id=owner_id, now=now.isoformat(), generation=generation,
+            conn, lease_key=lease_key, owner_id=owner_id, now=release_now.isoformat(), generation=generation,
         )
 
 
@@ -479,14 +523,29 @@ def preview_external_paper_order(
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     _safety_checks(conn, book_id)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    with _order_lease(conn, book_id, client_order_id, operation="PREVIEW", now=now, config=config) as lease:
+    with _order_lease(
+        conn, book_id, client_order_id, operation="PREVIEW", now=now, config=config, clock=clock,
+    ) as lease:
         current = _current_event(conn, book_id, client_order_id)
         if current and current["new_state"] not in (STATE_PREVIEWED,):
             raise ExternalPaperError("ORDER_ALREADY_EXTERNAL", f"external order is already {current['new_state']}")
+        # Milestone 11.3.1 Item 6 Part B: claim the EXTERNAL_PAPER namespace
+        # before ever calling the runtime -- the simpler fail-closed policy
+        # (docs/milestone-11.3.1.md Item 6 Part B): a preview alone
+        # permanently claims the namespace, with no explicit
+        # preview-abandonment/release workflow. Idempotent no-op if this
+        # exact book/intent already holds the EXTERNAL_PAPER claim (a
+        # retried preview); raises if LOCAL_SIMULATED already claimed it.
+        try:
+            repo.claim_execution_namespace(
+                conn, book_id, paper_order_intent_id, repo.EXECUTION_NAMESPACE_EXTERNAL, now, operator,
+            )
+        except repo.ExecutionNamespaceConflictError as exc:
+            raise ExternalPaperError("INTENT_NOT_ELIGIBLE_FOR_EXTERNAL", str(exc)) from exc
         account = _account_check(runtime, book_id)
         fingerprint = account["account_fingerprint"]
         _verify_fingerprint_history(conn, book_id, fingerprint)
-        lease.heartbeat(now)
+        lease.heartbeat_or_raise()
         runtime_result = runtime.preview_limit_order(
             _payload(intent, client_order_id, payload_hash, fingerprint, now)
         )
@@ -510,6 +569,10 @@ def preview_external_paper_order(
             "operator": operator, "result": "APPROVED", "reasons": (), "config_hash": config.config_hash,
             "policy_version": POLICY_VERSION,
         }
+        # Milestone 11.3.1 Item 4: fence immediately before the protected
+        # preview-persistence + event-append write -- ownership may have
+        # changed between the read-only checks above and this point.
+        lease.verify_or_raise()
         repo.save_external_preview(conn, record)
         _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
@@ -716,9 +779,16 @@ def _record_unknown(
 
 def _submit_once(
     conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, runtime,
-    config, now, attempt_number,
+    config, now, attempt_number, lease: "OrderLeaseHandle",
 ) -> dict:
     runtime_request_id = f"m11_{uuid.uuid4().hex}"
+    # Milestone 11.3.1 Item 4: fence immediately before the protected
+    # reservation + SUBMISSION_REQUESTED checkpoint write, inside the same
+    # transaction the write itself runs in -- once BEGIN IMMEDIATE below
+    # takes effect no other connection can mutate the lease table until this
+    # transaction ends, so a verify at the top of it is a true point-in-time
+    # fencing check for everything the transaction goes on to write.
+    lease.verify_or_raise()
     # Milestone 11.3 Part 36/37: the reservation and the SUBMISSION_REQUESTED
     # event are now one atomic transaction (previously two independently
     # committed writes — reserve_for_order/reserve_shares_for_sell each
@@ -846,7 +916,9 @@ def submit_external_paper_order(
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     _safety_checks(conn, book_id)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    with _order_lease(conn, book_id, client_order_id, operation="SUBMIT", now=now, config=config) as lease:
+    with _order_lease(
+        conn, book_id, client_order_id, operation="SUBMIT", now=now, config=config, clock=clock,
+    ) as lease:
         account = _account_check(runtime, book_id)
         fingerprint = account["account_fingerprint"]
         _verify_fingerprint_history(conn, book_id, fingerprint)
@@ -858,22 +930,22 @@ def submit_external_paper_order(
         if current and current["new_state"] == STATE_UNKNOWN:
             raise ExternalPaperError("AMBIGUOUS_SUBMISSION", "broker lookup is required before any retry")
         if current and current["new_state"] not in (STATE_PREVIEWED,):
-            lease.heartbeat(now)
+            lease.heartbeat_or_raise()
             order = runtime.get_order_by_client_order_id(book_id, client_order_id)
             if order is None:
                 raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
             return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
-        lease.heartbeat(now)
+        lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
-            config=config, now=now, attempt_number=0,
+            config=config, now=now, attempt_number=0, lease=lease,
         )
         if result["status"] != STATE_UNKNOWN:
-            lease.heartbeat(now)
+            lease.heartbeat_or_raise()
             result["reconciliation"] = _reconcile_locked(
                 conn, book_id=book_id, client_order_id=client_order_id,
-                runtime=runtime, config=config, now=now,
+                runtime=runtime, config=config, now=now, lease=lease,
             )
         return result
 
@@ -1035,7 +1107,9 @@ def retry_external_paper_order(
     _require_external_config(config, book_id, submission=True)
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    with _order_lease(conn, book_id, client_order_id, operation="RETRY", now=now, config=config):
+    with _order_lease(
+        conn, book_id, client_order_id, operation="RETRY", now=now, config=config, clock=clock,
+    ) as lease:
         current = _current_event(conn, book_id, client_order_id)
         if current is None or current["new_state"] != STATE_UNKNOWN:
             raise ExternalPaperError("RETRY_NOT_ALLOWED", "retry requires an ambiguous submission state")
@@ -1074,18 +1148,84 @@ def retry_external_paper_order(
             conn, preview_id=preview["preview_id"], intent=intent, client_order_id=client_order_id,
             payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
         )
+        lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
-            now=now, attempt_number=retries + 1,
+            now=now, attempt_number=retries + 1, lease=lease,
         )
+        lease.verify_or_raise()
         repo.consume_external_lookup(conn, lookup["lookup_id"], result["event"]["external_order_event_id"])
         if result["status"] != STATE_UNKNOWN:
             result["reconciliation"] = _reconcile_locked(
                 conn, book_id=book_id, client_order_id=client_order_id,
-                runtime=runtime, config=config, now=now,
+                runtime=runtime, config=config, now=now, lease=lease,
             )
         return result
+
+
+def recover_stranded_submission(
+    conn: sqlite3.Connection, *, book_id: str, paper_order_intent_id: str,
+    runtime: ExternalPaperRuntime, config: PaperBooksConfiguration, clock=None,
+) -> dict:
+    """Milestone 11.3.1 Item 1: explicit, crash-safe recovery for an order
+    whose local event chain is stranded at SUBMISSION_REQUESTED.
+
+    `_submit_once` durably commits the reservation + SUBMISSION_REQUESTED
+    checkpoint *before* ever calling `runtime.submit_limit_order` -- correct
+    for avoiding a blind resubmission, but a hard crash between that commit
+    and a broker response leaves the broker outcome genuinely unknown, and
+    the ordinary submit path cannot safely retry it.
+
+    This function never calls `submit_limit_order`/`preview_limit_order` --
+    only the read-only authoritative `get_order_by_client_order_id` lookup
+    (delegated to the existing reconciliation machinery, `_reconcile_locked`
+    / `_run_reconciliation`). Safe to call repeatedly (idempotent: a second
+    call sees the chain already moved off SUBMISSION_REQUESTED and only adds
+    a fresh, harmless lookup/reconciliation record) and safe to call from a
+    freshly opened database connection after a process restart -- it takes
+    no in-memory state, only `book_id`/`paper_order_intent_id`.
+
+    On authoritative broker FOUND, normalizes and applies broker state/fills
+    exactly like ordinary reconciliation and retains or releases reservations
+    according to the durable fill/terminal state. On NOT_FOUND, a lookup
+    timeout, or a malformed broker response, transitions the local chain to
+    UNKNOWN_REQUIRES_RECONCILIATION (retaining the reservation) so the
+    existing, already-tested `retry_external_paper_order` gate -- fresh
+    attempt-bound authoritative NOT_FOUND evidence + explicit operator retry
+    + retry limit + a valid (or freshly refreshed) preview -- becomes
+    reachable. A broker NOT_FOUND here is never treated as proof the original
+    submission was never attempted; it only ever unblocks the existing,
+    fully-gated retry path.
+    """
+    now = _now(clock)
+    _require_external_config(config, book_id)
+    intent_row = repo.load_order_intent(conn, book_id, paper_order_intent_id)
+    if intent_row is None:
+        raise ExternalPaperError(
+            "INTENT_NOT_FOUND", f"paper intent {paper_order_intent_id!r} was not found in book {book_id}",
+        )
+    intent_row["_external_config_hash"] = config.config_hash
+    client_order_id, _ = derive_external_order_identity(intent_row)
+    current = _current_event(conn, book_id, client_order_id)
+    if current is None or current["new_state"] != STATE_SUBMISSION_REQUESTED:
+        raise ExternalPaperError(
+            "RECOVERY_NOT_APPLICABLE",
+            "recovery only applies to an order chain currently stranded at SUBMISSION_REQUESTED — "
+            f"current state is {current['new_state'] if current else None!r}",
+        )
+    with _order_lease(
+        conn, book_id, client_order_id, operation="RECOVER", now=now, config=config, clock=clock,
+    ) as lease:
+        # Re-read inside the lease: a concurrent recovery/reconciliation call
+        # may already have advanced the chain while this call waited for it.
+        current = _current_event(conn, book_id, client_order_id)
+        if current is None or current["new_state"] != STATE_SUBMISSION_REQUESTED:
+            return {"status": current["new_state"] if current else None, "already_recovered": True}
+        return _reconcile_locked(
+            conn, book_id=book_id, runtime=runtime, config=config, client_order_id=client_order_id, now=now,
+            lease=lease,
+        )
 
 
 def refresh_retry_preview(
@@ -1110,7 +1250,9 @@ def refresh_retry_preview(
     _require_external_config(config, book_id, submission=True)
     intent = _intent(conn, config, book_id, paper_order_intent_id, now)
     client_order_id, payload_hash = derive_external_order_identity(intent)
-    with _order_lease(conn, book_id, client_order_id, operation="REFRESH_RETRY_PREVIEW", now=now, config=config):
+    with _order_lease(
+        conn, book_id, client_order_id, operation="REFRESH_RETRY_PREVIEW", now=now, config=config, clock=clock,
+    ) as lease:
         current = _current_event(conn, book_id, client_order_id)
         # Refresh is only for an order still ambiguous; once a broker order
         # has actually been found (reconciliation moves the chain off
@@ -1153,6 +1295,7 @@ def refresh_retry_preview(
             ),
             "config_hash": config.config_hash, "policy_version": POLICY_VERSION,
         }
+        lease.verify_or_raise()
         repo.save_external_preview(conn, record)
         return record
 
@@ -1167,7 +1310,9 @@ def cancel_external_paper_order(
     # create exposure. Keep it available after new submission is disabled and
     # while a reconciliation/safety incident is active.
     _require_external_config(config, book_id)
-    with _order_lease(conn, book_id, client_order_id, operation="CANCEL", now=now, config=config):
+    with _order_lease(
+        conn, book_id, client_order_id, operation="CANCEL", now=now, config=config, clock=clock,
+    ) as lease:
         current = _current_event(conn, book_id, client_order_id)
         if current is None:
             raise ExternalPaperError("ORDER_NOT_FOUND", "no local external order exists")
@@ -1177,6 +1322,7 @@ def cancel_external_paper_order(
         if intent is None:
             raise ExternalPaperError("INTENT_NOT_FOUND", "the external order's frozen intent was not found")
         intent["_external_config_hash"] = config.config_hash
+        lease.verify_or_raise()
         _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
             account_fingerprint=current["account_fingerprint"], new_state=STATE_CANCEL_REQUESTED,
@@ -1184,6 +1330,7 @@ def cancel_external_paper_order(
             attempt_number=current["attempt_number"],
         )
         request_id = f"m11_{uuid.uuid4().hex}"
+        lease.heartbeat_or_raise()
         try:
             order = runtime.cancel_external_order(
                 book_id, client_order_id, current["account_fingerprint"],
@@ -1191,6 +1338,7 @@ def cancel_external_paper_order(
             _validate_order_response(order, intent, client_order_id, current["account_fingerprint"], now)
             state = _state_from_order(order)
         except Exception as exc:
+            lease.verify_or_raise()
             event = _record_unknown(
                 conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
                 fingerprint=current["account_fingerprint"], operator=operator,
@@ -1199,6 +1347,7 @@ def cancel_external_paper_order(
                 attempt_number=current["attempt_number"],
             )
             return {"status": STATE_UNKNOWN, "event": event}
+        lease.verify_or_raise()
         event = _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
             account_fingerprint=current["account_fingerprint"], new_state=state, operator=operator,
@@ -1239,6 +1388,7 @@ def cancel_external_paper_order(
                 details={"stage": "post_cancel_fill_sweep"}, now=now, config=config,
             )
             raise
+        lease.verify_or_raise()
         _release_terminal_reservation(conn, intent, state, now)
         repo.update_order_status(conn, book_id, intent["paper_order_intent_id"], state)
         return {"status": state, "event": event, "order": order}
@@ -1327,16 +1477,18 @@ def reconcile_external_paper_order(
                 statuses=("ORDER_MISSING_LOCALLY",), details={}, now=now, config=config,
             )
         resolved_client_order_id = row["client_order_id"]
-    with _order_lease(conn, book_id, resolved_client_order_id, operation="RECONCILE", now=now, config=config):
+    with _order_lease(
+        conn, book_id, resolved_client_order_id, operation="RECONCILE", now=now, config=config, clock=clock,
+    ) as lease:
         return _reconcile_locked(
             conn, book_id=book_id, runtime=runtime, config=config,
-            client_order_id=resolved_client_order_id, now=now,
+            client_order_id=resolved_client_order_id, now=now, lease=lease,
         )
 
 
 def _reconcile_locked(
     conn: sqlite3.Connection, *, book_id: str, runtime: ExternalPaperRuntime,
-    config: PaperBooksConfiguration, client_order_id: str, now: datetime,
+    config: PaperBooksConfiguration, client_order_id: str, now: datetime, lease: "OrderLeaseHandle",
 ) -> dict:
     """Fail-safe wrapper: reconciliation must never exit on an unexpected
     exception without persisting critical evidence first (Part 8). Known,
@@ -1348,6 +1500,7 @@ def _reconcile_locked(
     try:
         return _run_reconciliation(
             conn, book_id=book_id, runtime=runtime, config=config, client_order_id=client_order_id, now=now,
+            lease=lease,
         )
     except Exception as exc:
         try:
@@ -1363,7 +1516,7 @@ def _reconcile_locked(
 
 def _run_reconciliation(
     conn: sqlite3.Connection, *, book_id: str, runtime: ExternalPaperRuntime,
-    config: PaperBooksConfiguration, client_order_id: str, now: datetime,
+    config: PaperBooksConfiguration, client_order_id: str, now: datetime, lease: "OrderLeaseHandle",
 ) -> dict:
     current = _current_event(conn, book_id, client_order_id)
     if current is None:
@@ -1371,6 +1524,13 @@ def _run_reconciliation(
             conn, book_id=book_id, intent=None, client_order_id=client_order_id, fingerprint=None,
             statuses=("ORDER_MISSING_LOCALLY",), details={}, now=now, config=config,
         )
+    # Milestone 11.3.1 Item 4: fence before this reconciliation run's own
+    # writes (lookup evidence, bridged/transitioned event, reservation
+    # release). The runtime lookup/positions/account calls below can take
+    # real wall-clock time, so ownership must be reconfirmed here rather
+    # than trusting whatever was true when the caller first acquired the
+    # lease.
+    lease.verify_or_raise()
     intent = repo.load_order_intent(conn, book_id, current["paper_order_intent_id"])
     if intent is None:
         return _persist_reconciliation(
@@ -1379,6 +1539,30 @@ def _run_reconciliation(
             details={}, now=now, config=config,
         )
     intent["_external_config_hash"] = config.config_hash
+    # Milestone 11.3.1 Item 1: remember the state this reconciliation run
+    # *started* from. A hard crash right after the reservation +
+    # SUBMISSION_REQUESTED checkpoint (_submit_once) but before any broker
+    # response leaves the chain stranded at SUBMISSION_REQUESTED forever --
+    # the existing retry gate requires STATE_UNKNOWN, which nothing below
+    # would otherwise ever produce for that exact case. See the bridging
+    # block at the end of this function.
+    stranded_at_submission_requested = current["new_state"] == STATE_SUBMISSION_REQUESTED
+    original_event = current
+
+    def _bridge_stranded_submission_requested(fingerprint_value: str, request_id_value: str) -> None:
+        if not stranded_at_submission_requested:
+            return
+        latest = _current_event(conn, book_id, client_order_id)
+        if latest is not None and latest["new_state"] == STATE_SUBMISSION_REQUESTED:
+            _append_event(
+                conn, intent=intent, client_order_id=client_order_id,
+                payload_hash=original_event["payload_hash"], account_fingerprint=fingerprint_value,
+                new_state=STATE_UNKNOWN, operator="SYSTEM_RECOVERY",
+                reason="authoritative broker lookup during recovery did not yield a validated definitive "
+                "order state; reservation retained pending operator retry", now=now,
+                runtime_request_id=request_id_value, attempt_number=original_event["attempt_number"],
+            )
+
     try:
         risk_for_notional = repo.load_risk_decision(conn, intent["risk_decision_id"])
         _validate_frozen_notional(intent, config, risk_for_notional)
@@ -1398,6 +1582,18 @@ def _run_reconciliation(
     except Exception:
         order = None
         statuses.append("UNKNOWN")
+    # Milestone 11.3.1 Item 1: bridge *before* saving the lookup evidence
+    # below when the outcome is already known to be ambiguous (broker
+    # NOT_FOUND or the lookup itself raised) -- the lookup's
+    # `ambiguous_event_id`/`attempt_number` must reference the event that
+    # will actually be `current` once this call returns (the freshly
+    # appended UNKNOWN event), not the stale SUBMISSION_REQUESTED event that
+    # preceded it. `retry_external_paper_order` matches on exactly that
+    # event ID, so getting the order wrong here would leave a fresh,
+    # authoritative NOT_FOUND lookup that retry could never recognize.
+    if order is None:
+        _bridge_stranded_submission_requested(fingerprint, request_id)
+        current = _current_event(conn, book_id, client_order_id) or current
     lookup_result = "FOUND" if order else "NOT_FOUND"
     repo.save_external_lookup(conn, {
         "lookup_id": _digest(
@@ -1526,6 +1722,17 @@ def _run_reconciliation(
         statuses.append("UNKNOWN")
     if not statuses:
         statuses.append("MATCHED")
+    # Milestone 11.3.1 Item 1: bridge a stranded SUBMISSION_REQUESTED order
+    # into the existing UNKNOWN_REQUIRES_RECONCILIATION machinery -- see
+    # `_bridge_stranded_submission_requested` above. Without this, an order
+    # that crashed after the reservation+checkpoint commit but before (or
+    # during) the original broker call would sit at SUBMISSION_REQUESTED
+    # forever: reconciliation would keep recording lookup/reconciliation
+    # evidence, but `retry_external_paper_order` requires
+    # `current["new_state"] == STATE_UNKNOWN` and would keep raising
+    # RETRY_NOT_ALLOWED. Idempotent: on a second call the chain is already
+    # UNKNOWN, so the helper's own re-check is a no-op.
+    _bridge_stranded_submission_requested(fingerprint, request_id)
     return _persist_reconciliation(
         conn, book_id=book_id, intent=intent, client_order_id=client_order_id,
         fingerprint=fingerprint, statuses=tuple(dict.fromkeys(statuses)),

@@ -19,14 +19,19 @@ from tests.support.runtime_client_fixtures import (
     capabilities_payload,
     fake_transport_factory,
     health_payload,
+    sequential_fake_transport_factory,
     start_ready_client,
 )
 
 
 def _client(fake: FakeTransport) -> RuntimeClient:
+    return _client_with_factory(fake_transport_factory(fake))
+
+
+def _client_with_factory(transport_factory) -> RuntimeClient:
     return RuntimeClient(
         command=["python3", "-m", "trading_paper_runtime"],
-        transport_factory=fake_transport_factory(fake),
+        transport_factory=transport_factory,
         startup_timeout_seconds=1.0,
         request_timeout_seconds=1.0,
     )
@@ -196,58 +201,95 @@ def test_safe_shutdown_terminates_transport():
     assert fake.terminated is True
 
 
-def test_timeout_alone_does_not_block_the_documented_recovery_lookup():
-    """Milestone 11.2 Part 19: a timeout on a mutating call must not itself
-    disable the client — the explicitly-allowlisted read-only follow-up
-    lookup (e.g. get_order after submit_order times out) is the documented
-    recovery path and must still be able to run cleanly on the same
-    transport when no actual desync occurred."""
+def test_timeout_immediately_marks_transport_unhealthy_and_tears_it_down():
+    """Milestone 11.3.1 Item 5: any request timeout -- not only a later
+    detected response mismatch -- makes the transport that timed out
+    unusable immediately: it is torn down right there, before any other
+    request is even attempted."""
     fake = FakeTransport()
     client = _client(fake)
     start_ready_client(client, fake)
     fake.queue_timeout()
     with pytest.raises(RuntimeRequestTimeoutError):
         client.submit_order({"intent_id": "i1"})
-    fake.queue_success({"intent_id": "i1", "status": "ACCEPTED"})
+    assert fake.terminated is True
+
+
+def test_mutating_operation_is_never_automatically_retried_after_timeout():
+    """A timed-out mutating operation must not be retried at all -- the
+    caller must explicitly call `start()` before attempting it again."""
+    fake = FakeTransport()
+    client = _client(fake)
+    start_ready_client(client, fake)
+    fake.queue_timeout()
+    with pytest.raises(RuntimeRequestTimeoutError):
+        client.submit_order({"intent_id": "i1"})
+    lines_before = len(fake.written_lines)
+    with pytest.raises(RuntimeUnavailableError, match="unhealthy"):
+        client.submit_order({"intent_id": "i1"})
+    # The second attempt never even reaches the wire -- it fails closed
+    # before writing anything, exactly like a genuinely unusable transport.
+    assert len(fake.written_lines) == lines_before
+
+
+def test_readonly_recovery_lookup_transparently_restarts_onto_a_clean_process():
+    """Milestone 11.3.1 Item 5: after a timeout, the documented read-only
+    recovery follow-up (e.g. `get_order` after `submit_order` times out)
+    must never reuse the unhealthy child -- it transparently restarts onto a
+    brand-new transport (a fresh `start()`, re-verifying health/
+    capabilities) and only then runs the lookup."""
+    fake1 = FakeTransport()
+    fake2 = FakeTransport()
+    client = _client_with_factory(sequential_fake_transport_factory([fake1, fake2]))
+    start_ready_client(client, fake1)
+
+    fake1.queue_timeout()
+    with pytest.raises(RuntimeRequestTimeoutError):
+        client.submit_order({"intent_id": "i1"})
+    assert fake1.terminated is True
+
+    # The recovery lookup restarts onto fake2 (fresh health+capabilities),
+    # never touching fake1's now-dead transport again.
+    fake2.queue_success(health_payload(), operation="health")
+    fake2.queue_success(capabilities_payload(), operation="capabilities")
+    fake2.queue_success({"intent_id": "i1", "status": "ACCEPTED"})
     result = client.get_order("i1")
     assert result["status"] == "ACCEPTED"
+    assert fake1.written_lines[-1] != "" and len(fake2.written_lines) == 3  # health, capabilities, get_order
 
 
-def test_late_stale_response_after_timeout_poisons_the_next_call_and_client_is_marked_unhealthy():
-    """Milestone 11.2 Part 19/36: request A times out; its late response
-    (still carrying A's own request_id/operation) is the next thing on the
-    wire when request B is sent. B must detect the mismatch (never silently
-    treat A's response as its own), and the client must then refuse any
-    further request until an explicit restart — no request C may be sent on
-    this now-desynced transport."""
-    fake = FakeTransport()
-    client = _client(fake)
-    start_ready_client(client, fake)
+def test_late_stale_response_never_reaches_a_later_call_after_restart():
+    """Request A times out and is torn down; its late, stale response
+    (still carrying A's own request_id/operation) sitting in the dead
+    transport's queue must never be read by anything again -- the
+    subsequent read-only recovery call restarts onto a brand-new transport
+    instead of ever touching fake1 again."""
+    fake1 = FakeTransport()
+    fake2 = FakeTransport()
+    client = _client_with_factory(sequential_fake_transport_factory([fake1, fake2]))
+    start_ready_client(client, fake1)
 
-    fake.queue_timeout()
+    fake1.queue_timeout()
     with pytest.raises(RuntimeRequestTimeoutError):
         client.submit_order({"intent_id": "i1"})
-    stale_request_line = fake.written_lines[-1]
+    stale_request_line = fake1.written_lines[-1]
     import json as _json
 
     stale = _json.loads(stale_request_line)
-
-    # Request B (a different, later call) receives A's late response.
-    fake.queue_raw_line(_json.dumps({
+    # A's late response arrives after the timeout -- queued on fake1, which
+    # is now dead and must never be consulted again.
+    fake1.queue_raw_line(_json.dumps({
         "protocol_version": stale["protocol_version"], "request_id": stale["request_id"],
         "operation": stale["operation"], "runtime_version": "fake-runtime-1",
         "success": True, "retryable": False, "error": None,
         "payload": {"intent_id": "i1", "status": "ACCEPTED"},
     }))
-    with pytest.raises(ProtocolViolationError):
-        client.get_order("i2")  # B: a different, unrelated request
 
-    # Request C must never reach the wire on this transport.
-    lines_before = len(fake.written_lines)
-    with pytest.raises(RuntimeUnavailableError, match="unhealthy"):
-        client.get_order("i3")
-    assert len(fake.written_lines) == lines_before  # C was never even written
-    assert fake.terminated is True  # transport was torn down
+    fake2.queue_success(health_payload(), operation="health")
+    fake2.queue_success(capabilities_payload(), operation="capabilities")
+    fake2.queue_success({"intent_id": "i2", "status": "REJECTED"})
+    result = client.get_order("i2")
+    assert result["status"] == "REJECTED"  # fake2's response, never fake1's stale one
 
 
 def test_repeated_start_shutdown_cycles_join_pump_threads_without_leaking():

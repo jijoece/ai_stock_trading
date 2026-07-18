@@ -26,7 +26,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from ..storage import paper_books_repositories as repo
-from ..storage.database import begin_immediate
+from ..storage.database import begin_immediate, transaction
+from ..storage.paper_books_repositories import (
+    EXECUTION_NAMESPACE_LOCAL, ExecutionNamespaceConflictError,
+)
 from . import cash_ledger, positions
 from .models import (
     INTENT_STATUS_FILLED,
@@ -97,15 +100,72 @@ def submit_and_simulate(conn, intent: PaperBookOrderIntent, market: MarketSimula
     """Submits the order intent (book-aware idempotency: a duplicate
     `(book_id, paper_order_intent_id)` submission is a no-op), reserves cash
     for BUY orders, simulates a fill, and applies it (positions + cash
-    settlement) exactly once. Never applies the same fill twice."""
-    if repo.has_external_execution_evidence(conn, intent.book_id, intent.paper_order_intent_id):
-        raise FillSimulationError(
-            "intent is externally scoped and cannot receive a local simulated fill"
-        )
-    inserted = repo.save_order_intent(conn, intent)
+    settlement) exactly once. Never applies the same fill twice.
 
-    if inserted and intent.side == ORDER_SIDE_BUY:
-        cash_ledger.reserve_for_order(conn, intent.book_id, intent.paper_order_intent_id, intent.notional_usd, now)
+    Milestone 11.3.1 Item 6 Part A: for a brand-new intent, the
+    LOCAL_SIMULATED namespace claim + intent insert + BUY reservation are
+    one atomic transaction -- a crash between them used to be able to leave
+    an intent with no reservation, and a later replay would skip creating
+    one because the intent was no longer new. Item 6 Part B: the durable
+    execution-namespace claim (not just `has_external_execution_evidence`'s
+    after-the-fact scan of external-side tables) is now the source of truth
+    for local/external exclusivity -- an intent claimed EXTERNAL_PAPER can
+    never receive a local fill, even if no external evidence rows exist yet
+    (e.g. a concurrent external path that claimed but has not yet written
+    its preview).
+    """
+    existing = repo.load_order_intent(conn, intent.book_id, intent.paper_order_intent_id)
+    if existing is None:
+        with transaction(conn):
+            try:
+                repo.claim_execution_namespace(
+                    conn, intent.book_id, intent.paper_order_intent_id, EXECUTION_NAMESPACE_LOCAL,
+                    now, "local_simulator", commit=False,
+                )
+            except ExecutionNamespaceConflictError as exc:
+                raise FillSimulationError(
+                    "intent is externally scoped and cannot receive a local simulated fill"
+                ) from exc
+            inserted = repo.save_order_intent(conn, intent, commit=False)
+            if inserted and intent.side == ORDER_SIDE_BUY:
+                cash_ledger.reserve_for_order(
+                    conn, intent.book_id, intent.paper_order_intent_id, intent.notional_usd, now, commit=False,
+                )
+    else:
+        # Existing pending intent: the namespace claim and (for BUY) the
+        # reservation must already be consistent -- fail closed rather than
+        # fabricate either one for a replay.
+        claim = repo.load_execution_namespace_claim(conn, intent.book_id, intent.paper_order_intent_id)
+        if claim is None:
+            # Legacy row from before Item 6 (or an intent a caller inserted
+            # directly, bypassing this function's own claim step): lazily
+            # claim it now rather than fail closed -- but only once
+            # confirmed no external evidence exists, mirroring the
+            # pre-Item-6 `has_external_execution_evidence` bootstrap check
+            # this replaces as the ongoing source of truth.
+            if repo.has_external_execution_evidence(conn, intent.book_id, intent.paper_order_intent_id):
+                raise FillSimulationError(
+                    "intent is externally scoped and cannot receive a local simulated fill"
+                )
+            repo.claim_execution_namespace(
+                conn, intent.book_id, intent.paper_order_intent_id, EXECUTION_NAMESPACE_LOCAL,
+                now, "local_simulator",
+            )
+        elif claim["execution_namespace"] != EXECUTION_NAMESPACE_LOCAL:
+            raise FillSimulationError(
+                "intent is externally scoped and cannot receive a local simulated fill"
+            )
+        if (
+            existing["side"] == ORDER_SIDE_BUY
+            and existing["status"] == INTENT_STATUS_PENDING_SUBMISSION
+            and cash_ledger.remaining_buy_reservation(
+                conn, intent.book_id, intent.paper_order_intent_id
+            ) != intent.notional_usd
+        ):
+            raise FillSimulationError(
+                "existing reservation does not match the frozen intent notional -- refusing to proceed "
+                "rather than fabricate a release or adjustment"
+            )
 
     if intent.side == ORDER_SIDE_SELL:
         available = repo.load_position(conn, intent.book_id, intent.symbol)

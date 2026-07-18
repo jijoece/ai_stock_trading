@@ -30,6 +30,17 @@ class ShadowOperationsConfigError(RuntimeError):
     pass
 
 
+def _strict_bool(value: object, field_name: str) -> bool:
+    """Accept only real YAML booleans (mirrors `paper_books/config.py::_strict_bool`
+    and `research/scheduled_research_config.py::_strict_bool`). `bool(...)` on a raw
+    YAML scalar is not sufficient — `bool("false")` and `bool("no")` are both `True`,
+    so a permissive coercion here could silently enable a shadow-operations capability
+    from a config value the operator wrote as disabled."""
+    if type(value) is not bool:
+        raise ShadowOperationsConfigError(f"{field_name} must be a boolean — got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class ShadowOperationsSection:
     enabled: bool
@@ -200,22 +211,32 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
 
     try:
         shadow_operations_section = ShadowOperationsSection(
-            enabled=bool(so["enabled"]), mode=str(so["mode"]),
-            allow_baseline_paper_submission=bool(so["allow_baseline_paper_submission"]),
-            allow_enhanced_submission=bool(so["allow_enhanced_submission"]),
-            require_market_open_day=bool(so["require_market_open_day"]),
+            enabled=_strict_bool(so["enabled"], "shadow_operations.enabled"), mode=str(so["mode"]),
+            allow_baseline_paper_submission=_strict_bool(
+                so["allow_baseline_paper_submission"], "shadow_operations.allow_baseline_paper_submission"
+            ),
+            allow_enhanced_submission=_strict_bool(
+                so["allow_enhanced_submission"], "shadow_operations.allow_enhanced_submission"
+            ),
+            require_market_open_day=_strict_bool(
+                so["require_market_open_day"], "shadow_operations.require_market_open_day"
+            ),
             run_window_timezone=str(so["run_window_timezone"]), run_window_start=str(so["run_window_start"]),
             run_window_end=str(so["run_window_end"]), max_catch_up_cycles=int(so["max_catch_up_cycles"]),
             lease_ttl_seconds=int(so["lease_ttl_seconds"]),
             stale_run_timeout_seconds=int(so["stale_run_timeout_seconds"]),
-            continue_on_symbol_failure=bool(so["continue_on_symbol_failure"]),
+            continue_on_symbol_failure=_strict_bool(
+                so["continue_on_symbol_failure"], "shadow_operations.continue_on_symbol_failure"
+            ),
         )
         schedule_section = ScheduleSection(
-            enabled=bool(sched["enabled"]), cadence=str(sched["cadence"]),
+            enabled=_strict_bool(sched["enabled"], "schedule.enabled"), cadence=str(sched["cadence"]),
             intended_local_time=str(sched["intended_local_time"]),
         )
         budgets_section = BudgetsSection(
-            require_pricing_for_real_claude=bool(budgets["require_pricing_for_real_claude"]),
+            require_pricing_for_real_claude=_strict_bool(
+                budgets["require_pricing_for_real_claude"], "budgets.require_pricing_for_real_claude"
+            ),
             max_symbols_per_cycle=int(budgets["max_symbols_per_cycle"]),
             max_roles_per_symbol=int(budgets["max_roles_per_symbol"]),
             max_attempts_per_role=int(budgets["max_attempts_per_role"]),
@@ -231,8 +252,10 @@ def load_shadow_operations_config(path: str | Path | None = None) -> ShadowOpera
             pause_on_provider_failure_rate=float(safety["pause_on_provider_failure_rate"]),
             pause_on_retry_exhaustion_rate=float(safety["pause_on_retry_exhaustion_rate"]),
             pause_on_unsupported_claim_rate=float(safety["pause_on_unsupported_claim_rate"]),
-            pause_on_reconciliation_mismatch=bool(safety["pause_on_reconciliation_mismatch"]),
-            pause_on_budget_breach=bool(safety["pause_on_budget_breach"]),
+            pause_on_reconciliation_mismatch=_strict_bool(
+                safety["pause_on_reconciliation_mismatch"], "safety.pause_on_reconciliation_mismatch"
+            ),
+            pause_on_budget_breach=_strict_bool(safety["pause_on_budget_breach"], "safety.pause_on_budget_breach"),
             minimum_requests_for_failure_rate=int(safety.get("minimum_requests_for_failure_rate", 1)),
         )
     except ShadowOperationsConfigError:

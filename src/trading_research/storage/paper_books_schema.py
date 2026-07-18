@@ -729,6 +729,21 @@ CREATE TABLE IF NOT EXISTS paper_external_order_leases (
     status TEXT NOT NULL,
     generation INTEGER NOT NULL DEFAULT 1
 );
+
+-- Milestone 11.3.1 Item 6: durable per-intent execution-namespace claim.
+-- Absence of a row means UNCLAIMED. A claim is immutable once the owning
+-- execution path has created economically meaningful evidence (a reservation
+-- or a broker preview) -- there is no release/abandonment path by design
+-- (the simpler fail-closed policy: docs/milestone-11.3.1.md Item 6 Part B).
+CREATE TABLE IF NOT EXISTS paper_order_execution_claims (
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    paper_order_intent_id TEXT NOT NULL,
+    execution_namespace TEXT NOT NULL CHECK (execution_namespace IN ('LOCAL_SIMULATED', 'EXTERNAL_PAPER')),
+    claim_generation INTEGER NOT NULL DEFAULT 1,
+    claimed_at TEXT NOT NULL,
+    claimed_by TEXT NOT NULL,
+    PRIMARY KEY (book_id, paper_order_intent_id)
+);
 """
 
 PAPER_BOOKS_INDEXES = """

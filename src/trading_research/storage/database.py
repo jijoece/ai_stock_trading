@@ -17,40 +17,40 @@ from .schema_version import apply_pending_schema_migrations, check_schema_not_fo
 from .shadow_alerts_schema import apply_shadow_alerts_schema
 from .shadow_operations_schema import apply_shadow_operations_schema
 from .trading_schema import apply_trading_schema
+from .transactions import TransactionAlreadyActiveError, begin_immediate, transaction
+
+__all__ = [
+    "SQLITE_BUSY_TIMEOUT_MS", "TransactionAlreadyActiveError", "begin_immediate", "transaction",
+    "connect", "session",
+]
 
 SQLITE_BUSY_TIMEOUT_MS = 5_000
-
-
-def begin_immediate(conn: sqlite3.Connection) -> None:
-    """Start a `BEGIN IMMEDIATE` transaction, first clearing any pending
-    implicit transaction left open on this connection by a prior unguarded
-    write (Milestone 11.2 Part 4/5). Python's default (legacy) sqlite3
-    isolation mode auto-starts an implicit transaction before any DML
-    statement; if one is left open when a manual `BEGIN IMMEDIATE` helper is
-    entered, `BEGIN IMMEDIATE` itself raises `OperationalError: cannot start
-    a transaction within a transaction`, and — because that failure happens
-    before any `try` block guarding the helper's own transaction — the
-    connection is left in an ambiguous, still-open transaction state for the
-    *caller* to clean up (or not). Rolling back any pre-existing implicit
-    transaction here first guarantees `BEGIN IMMEDIATE` always starts clean
-    and the connection is always left usable, even when the caller reuses a
-    connection object that was left mid-transaction by unrelated code."""
-    if conn.in_transaction:
-        conn.rollback()
-    conn.execute("BEGIN IMMEDIATE")
 
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
+    # Milestone 11.3.1 Item 2: explicit transaction control only. True SQLite
+    # autocommit — no statement outside an explicit BEGIN/BEGIN IMMEDIATE
+    # ever silently opens an implicit transaction — so `begin_immediate`
+    # (storage/transactions.py) can trust `conn.in_transaction` as "a
+    # caller-owned transaction is genuinely still open" and never has to
+    # guess whether it is safe to discard.
+    conn.isolation_level = None
     conn.row_factory = sqlite3.Row
+    # busy_timeout must be set before any pragma/statement that can contend
+    # for the database's write lock (journal_mode included) -- another
+    # connection can legitimately be mid-BEGIN-IMMEDIATE against this same
+    # file while this one is still connecting, and without a timeout in
+    # place yet that contention raises "database is locked" immediately
+    # instead of waiting.
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys = ON")
     # WAL permits readers during a campaign date write. NORMAL is the
     # conservative SQLite-recommended WAL tradeoff: atomic/consistent after
     # application or OS crashes, without FULL's fsync cost on every commit.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     check_schema_not_forward_versioned(conn)
     apply_schema(conn)
     apply_trading_schema(conn)

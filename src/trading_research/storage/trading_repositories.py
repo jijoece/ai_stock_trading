@@ -15,6 +15,7 @@ import sqlite3
 
 from ..analysis.scorer import CompositeScore
 from ..recommendations.builder import FrozenRecommendation
+from .transactions import transaction
 
 
 def save_screening_run(
@@ -59,12 +60,20 @@ def save_frozen_recommendation(conn: sqlite3.Connection, rec: FrozenRecommendati
     (an idempotent no-op — retried creation never conflicts, never
     duplicates). On any failure partway through, the transaction is rolled
     back so no partial recommendation is ever left behind.
+
+    Milestone 11.3.1 Item 2: uses the shared `transaction()` context manager
+    rather than a bare try/`conn.commit()`/except `conn.rollback()`. Under
+    this repository's explicit-transaction-control connections
+    (`isolation_level=None`), each `conn.execute()` autocommits immediately
+    unless it runs inside an explicit `BEGIN IMMEDIATE` — so both inserts
+    below must share one real transaction for a later factor-row failure to
+    roll back the already-inserted recommendations row too.
     """
     p = rec.payload
     if recommendation_exists(conn, p["rec_id"]):
         return False
 
-    try:
+    with transaction(conn):
         conn.execute(
             "INSERT INTO recommendations "
             "(rec_id, run_id, symbol, side, ts, price_at_rec, score, confidence, status, acted, "
@@ -85,11 +94,7 @@ def save_frozen_recommendation(conn: sqlite3.Connection, rec: FrozenRecommendati
                     factor.get("weight"), factor.get("contribution"),
                 ),
             )
-        conn.commit()
-        return True
-    except sqlite3.Error:
-        conn.rollback()
-        raise
+    return True
 
 
 def load_recommendation(conn: sqlite3.Connection, rec_id: str) -> dict | None:

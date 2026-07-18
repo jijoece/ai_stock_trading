@@ -25,6 +25,13 @@ from .errors import (
 )
 from .protocol import build_request_line, parse_response_line
 
+# Milestone 11.3.1 Item 4: the default single-request timeout, exposed as a
+# named constant so callers that must size a *different* timeout relative to
+# it (e.g. `paper_books/config.py`'s external-order lease TTL, which must
+# exceed the longest single runtime request plus heartbeat margin) don't have
+# to duplicate the literal `30.0`.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 30.0
+
 # Operations for which a request timeout is safe to treat as retryable by
 # the caller — never true for submit_order (docs/milestone-4.md Step 6/8:
 # "avoid blind retries for order submission").
@@ -152,7 +159,7 @@ class RuntimeClient:
         *,
         transport_factory=SubprocessTransport,
         startup_timeout_seconds: float = 15.0,
-        request_timeout_seconds: float = 30.0,
+        request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
@@ -217,12 +224,15 @@ class RuntimeClient:
             self._transport.terminate(timeout)
 
     def _mark_unhealthy_after_timeout(self) -> None:
-        """Milestone 11.2 Part 19: never reuse this transport once a
-        response mismatch proves its stdout stream is desynced (a stale,
-        late response from a prior timed-out request was just consumed by
-        a different request). Terminates the child and joins its pump
-        threads (Part 20) immediately rather than waiting for an explicit
-        `shutdown()` that may never come."""
+        """Milestone 11.3.1 Item 5: any request timeout — not only a later
+        detected response mismatch — makes this transport permanently
+        unusable. A sequential JSON-lines child that timed out can still
+        emit its original response after this call returns; reusing the
+        same child for a follow-up request risks that later request
+        consuming the stale response and desyncing the protocol forever.
+        Terminates the child and joins its pump threads (Part 20)
+        immediately rather than waiting for an explicit `shutdown()` that
+        may never come."""
         self._unhealthy = True
         if self._transport is not None:
             try:
@@ -247,10 +257,20 @@ class RuntimeClient:
         if self._transport is None:
             raise RuntimeUnavailableError("runtime client has not been started")
         if self._unhealthy:
-            raise RuntimeUnavailableError(
-                "runtime transport is unhealthy after a prior request timeout — "
-                "a clean restart (start()) is required before any further request"
-            )
+            # Milestone 11.3.1 Item 5: a mutating operation is never
+            # automatically retried after a timeout — the caller must
+            # explicitly call `start()` before attempting it again. A
+            # bounded, allowlisted read-only follow-up (`_RETRYABLE_ON_
+            # TIMEOUT`, e.g. `get_order` after a timed-out `submit_order`)
+            # is the documented recovery path for resolving an ambiguous
+            # outcome, so it transparently restarts onto a *clean* runtime
+            # process first — it never reuses the unhealthy child.
+            if operation not in _RETRYABLE_ON_TIMEOUT:
+                raise RuntimeUnavailableError(
+                    "runtime transport is unhealthy after a prior request timeout — "
+                    "a clean restart (start()) is required before any further request"
+                )
+            self.start()
         timeout = timeout if timeout is not None else self._request_timeout_seconds
         request_id, line = build_request_line(operation, payload)
         if not self._transport.is_alive():
@@ -262,15 +282,15 @@ class RuntimeClient:
         try:
             raw = self._transport.read_line(timeout)
         except queue.Empty as exc:
-            # Deliberately does NOT mark the transport unhealthy here: a
-            # bounded, explicitly-allowlisted read-only follow-up lookup
-            # (`_RETRYABLE_ON_TIMEOUT`, e.g. `get_order` after a timed-out
-            # `submit_order`) is the documented, tested recovery path for
-            # resolving an ambiguous outcome — it must keep working. If the
-            # timed-out call's late response is still queued when that
-            # follow-up reads, `parse_response_line`'s request_id/operation
-            # check below catches the mismatch and marks unhealthy there,
-            # exactly when desync is actually detected.
+            # Milestone 11.3.1 Item 5: any request timeout — mutating or
+            # read-only — makes the current transport unusable immediately.
+            # A late response can still arrive on this child's stdout after
+            # we stop waiting for it; leaving the transport "healthy" would
+            # let a later request consume that stale response and desync
+            # the protocol forever. The next request (if the operation is
+            # retryable) restarts onto a clean process above; a mutating
+            # operation must never be retried automatically at all.
+            self._mark_unhealthy_after_timeout()
             retryable = operation in _RETRYABLE_ON_TIMEOUT
             raise RuntimeRequestTimeoutError(
                 f"no response to {operation!r} (request_id={request_id}) within {timeout}s", retryable=retryable,
