@@ -341,6 +341,7 @@ def _build_health_inputs_from_cycle_result(
         cost_usd=telemetry.priced_usage_cost_usd, pricing_configured=pricing_configured,
         paper_reconciliation_mismatch=False, duplicate_prevention_violation=False,
         cycle_duration_seconds=cycle_duration_seconds, budget_breached=budget_breached,
+        provider_request_count=symbols_attempted,
     )
 
 

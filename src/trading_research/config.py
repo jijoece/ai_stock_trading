@@ -134,7 +134,8 @@ def load_config(env_file: str | Path | None = None, *, require_anthropic: bool =
     ):
         raise ConfigError("REDDIT_MCP_URL must use HTTPS")
 
-    cfg.research_data_dir.mkdir(parents=True, exist_ok=True)
-    cfg.research_database_path.parent.mkdir(parents=True, exist_ok=True)
-
+    # Milestone 11.3 Part 28: no filesystem mutation on config load — the
+    # database directory is created at first use by
+    # `storage/database.py::connect()`, and `research_data_dir` has no
+    # current write consumer that needs pre-creation.
     return cfg

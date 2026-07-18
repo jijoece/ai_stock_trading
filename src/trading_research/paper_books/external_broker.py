@@ -193,7 +193,7 @@ def _append_event(
     conn: sqlite3.Connection, *, intent: dict, client_order_id: str, payload_hash: str,
     account_fingerprint: str, new_state: str, operator: str, reason: str, now: datetime,
     broker_order_id: str | None = None, runtime_request_id: str | None = None,
-    error_code: str | None = None, attempt_number: int = 0,
+    error_code: str | None = None, attempt_number: int = 0, commit: bool = True,
 ) -> dict:
     current = _current_event(conn, intent["book_id"], client_order_id)
     previous = current["new_state"] if current else STATE_NOT_SUBMITTED
@@ -215,7 +215,7 @@ def _append_event(
         "config_hash": intent["_external_config_hash"], "attempt_number": attempt_number,
         "scope_sequence": next_sequence,
     }
-    inserted = repo.save_external_order_event(conn, event)
+    inserted = repo.save_external_order_event(conn, event, commit=commit)
     if not inserted:
         raise ExternalPaperError(
             "EVENT_CHAIN_CONFLICT",
@@ -719,34 +719,43 @@ def _submit_once(
     config, now, attempt_number,
 ) -> dict:
     runtime_request_id = f"m11_{uuid.uuid4().hex}"
-    reservation_inserted = False
-    share_reservation_inserted = False
-    if intent["side"] == "BUY":
-        reservation_inserted = cash_ledger.reserve_for_order(
-            conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
-        )
-    else:
-        share_reservation_inserted = positions.reserve_shares_for_sell(
-            conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], client_order_id,
-            Decimal(intent["quantity"]), now,
-        )
+    # Milestone 11.3 Part 36/37: the reservation and the SUBMISSION_REQUESTED
+    # event are now one atomic transaction (previously two independently
+    # committed writes — reserve_for_order/reserve_shares_for_sell each
+    # defaulted to commit=True, then _append_event committed separately). A
+    # process crash between those two commits used to leave a reservation
+    # with no explaining event: still no blind broker call would have
+    # happened (this whole block runs before runtime.submit_limit_order
+    # below), but the local state was ambiguous. Now either both commit
+    # together or neither does — rollback undoes the reservation insert too,
+    # so the manual compensating release this block used to need on a raised
+    # exception is no longer necessary (rollback already reverses it).
+    begin_immediate(conn)
     try:
+        if intent["side"] == "BUY":
+            cash_ledger.reserve_for_order(
+                conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
+                commit=False,
+            )
+        else:
+            positions.reserve_shares_for_sell(
+                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], client_order_id,
+                Decimal(intent["quantity"]), now, commit=False,
+            )
         _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             account_fingerprint=fingerprint, new_state=STATE_SUBMISSION_REQUESTED, operator=operator,
             reason=reason, now=now, runtime_request_id=runtime_request_id, attempt_number=attempt_number,
+            commit=False,
         )
-    except Exception:
-        if reservation_inserted:
-            cash_ledger.release_reservation(
-                conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]),
-                now, reason="submission-event-failed",
-            )
-        if share_reservation_inserted:
-            positions.release_remaining_share_reservation(
-                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], now,
-                release_event_id="submission-event-failed", event_type="RELEASED_CANCELLED",
-            )
+        conn.commit()
+    except BaseException:
+        # BaseException, not Exception: this transaction must never be left
+        # dangling open for some unrelated later commit() elsewhere on this
+        # connection (e.g. the order-scope lease's own release-on-finally
+        # commit) to inadvertently half-commit. Covers genuine interrupts
+        # (KeyboardInterrupt/SystemExit), not just ordinary Exceptions.
+        conn.rollback()
         raise
     try:
         order = runtime.submit_limit_order(_payload(intent, client_order_id, payload_hash, fingerprint, now))

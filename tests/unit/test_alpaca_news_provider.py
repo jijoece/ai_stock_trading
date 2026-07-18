@@ -48,6 +48,7 @@ BASE_NEWS_BODY = {
 def _client(handler, *, cache=None) -> AlpacaNewsClient:
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=MinIntervalRateLimiter(0.0), transport=transport, provider="alpaca-news",
     )
@@ -57,7 +58,7 @@ def _client(handler, *, cache=None) -> AlpacaNewsClient:
 # -- authentication presence ------------------------------------------------
 
 def test_requires_credentials():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     with pytest.raises(ProviderConfigurationError):
         AlpacaNewsClient(api_key=None, api_secret="s", http_client=http)
     with pytest.raises(ProviderConfigurationError):
@@ -238,6 +239,7 @@ def test_server_error_retried_then_raises():
 
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=MinIntervalRateLimiter(0.0), transport=transport, provider="alpaca-news", max_attempts=2,
     )
@@ -254,6 +256,7 @@ def test_rate_limited_response_raises_after_retries():
 
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=MinIntervalRateLimiter(0.0), transport=transport, provider="alpaca-news", max_attempts=2,
     )
@@ -280,6 +283,7 @@ def test_rate_limiter_enforces_minimum_interval():
 
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=limiter, transport=transport, provider="alpaca-news",
     )
@@ -306,7 +310,7 @@ def test_retention_and_trust_classification_present_on_every_article():
 # -- explicit environment-pending behavior when credentials absent --------------
 
 def test_environment_pending_when_credentials_absent():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     with pytest.raises(ProviderConfigurationError, match="ALPACA_MARKET_DATA_API_KEY"):
         AlpacaNewsClient(api_key=None, api_secret=None, http_client=http)
 

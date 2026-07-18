@@ -22,6 +22,7 @@ from decimal import Decimal
 from ..hashing import hash_config
 from ..storage import paper_books_repositories as repo
 from ..utc import TimestampError, canonical_utc
+from .cash_ledger import SETTLEMENT_POLICY_VERSION
 from .models import (
     VALUATION_COMPLETE,
     VALUATION_PARTIAL_MISSING_PRICE,
@@ -213,7 +214,10 @@ def build_portfolio_snapshot(
     unrealized = unrealized_pnl if gross_mv is not None else None
 
     snapshot_id = compute_snapshot_id(book_id, as_of, position_inputs)
-    source_hash = hash_config({"book_id": book_id, "as_of": as_of.isoformat(), "positions": position_inputs})
+    source_hash = hash_config({
+        "book_id": book_id, "as_of": as_of.isoformat(), "positions": position_inputs,
+        "settlement_policy_version": SETTLEMENT_POLICY_VERSION,
+    })
 
     snapshot = PaperPortfolioSnapshot(
         snapshot_id=snapshot_id, book_id=book_id, as_of=as_of, cash_available_usd=cash_available,

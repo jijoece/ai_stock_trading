@@ -47,3 +47,8 @@ safety:
   pause_on_unsupported_claim_rate: 0.25
   pause_on_reconciliation_mismatch: true
   pause_on_budget_breach: true
+  # Milestone 11.3 Part 23: below this many provider requests in a cycle,
+  # provider_failure_rate is INSUFFICIENT_DATA, not a computed pass/fail —
+  # a single failed request in a 1-request cycle is not distinguishable
+  # from noise.
+  minimum_requests_for_failure_rate: 5

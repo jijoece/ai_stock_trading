@@ -23,9 +23,17 @@ stdlib only. Python 3.9+.
 from __future__ import annotations
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+
+class MarketDataShapeError(ValueError):
+    """A `series[sym]` entry did not conform to one of the two accepted
+    shapes (`[close, ...]` or `[{"close": x}, ...]`) — raised with a bounded,
+    specific message instead of letting a raw `KeyError`/`TypeError` escape
+    from the middle of a partially-completed conversion."""
 
 
 # --------------------------------------------------------------------------
@@ -135,19 +143,49 @@ BASE_WEIGHTS = {
 }
 
 
+def extract_closes(series: dict, sym: str) -> Optional[list[float]]:
+    """Validates the *complete* sequence before any conversion — a
+    single-element shape check (only the first item) previously let a
+    heterogeneous list (some plain floats, some `{"close": x}` dicts) raise
+    a raw `KeyError`/`TypeError` partway through, or silently misparse
+    depending on element order. Milestone 11.3 Part 30. Accepts
+    `[close, ...]` or `[{"close": x}, ...]`; empty/absent history returns
+    `None` (a legitimate "no data" case for the caller to mark unavailable,
+    not a shape-validation failure)."""
+    v = series.get(sym)
+    if not v:
+        return None
+    if not isinstance(v, list):
+        raise MarketDataShapeError(f"{sym}: series must be a list, got {type(v).__name__}")
+    shapes = {"dict" if isinstance(x, dict) else type(x).__name__ for x in v}
+    if shapes - {"dict", "int", "float"}:
+        raise MarketDataShapeError(f"{sym}: unsupported element type(s) {sorted(shapes)} — expected float or dict")
+    if "dict" in shapes and shapes != {"dict"}:
+        raise MarketDataShapeError(f"{sym}: mixed float and mapping entries are not supported")
+    out: list[float] = []
+    for i, x in enumerate(v):
+        if isinstance(x, dict):
+            if "close" not in x:
+                raise MarketDataShapeError(f"{sym}[{i}]: mapping entry missing required 'close' key")
+            raw = x["close"]
+        else:
+            raw = x
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise MarketDataShapeError(f"{sym}[{i}]: close value must be a number, got {type(raw).__name__}")
+        value = float(raw)
+        if not math.isfinite(value):
+            raise MarketDataShapeError(f"{sym}[{i}]: close value must be finite, got {value!r}")
+        out.append(value)
+    return out
+
+
 def score_macro(data: dict, fast: int = 50, slow: int = 200,
                 slope_win: int = 20, corr_win: int = 40) -> MacroResult:
     series = data.get("series", {})
     notes: list[str] = []
 
     def closes(sym: str) -> Optional[list[float]]:
-        v = series.get(sym)
-        if not v:
-            return None
-        # Accepts [close,...] or [{"close":x},...]
-        if isinstance(v[0], dict):
-            return [float(x["close"]) for x in v]
-        return [float(x) for x in v]
+        return extract_closes(series, sym)
 
     comps: dict[str, Component] = {}
 

@@ -26,6 +26,17 @@ class ScheduledResearchYamlConfigError(RuntimeError):
     pass
 
 
+def _strict_bool(value: object, field_name: str) -> bool:
+    """Reject YAML-permissive-but-dangerous shapes for a boolean execution/
+    promotion gate: `"false"`/`"true"` (truthy string), `0`/`1` (truthy
+    int), and `None` all previously coerced silently via `bool(...)` —
+    `bool("false")` is `True`. Only an actual YAML boolean is accepted
+    (mirrors `paper_books/config.py::_strict_bool`)."""
+    if type(value) is not bool:
+        raise ScheduledResearchYamlConfigError(f"{field_name} must be a boolean — got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class ScheduledResearchYamlConfiguration:
     version: int
@@ -102,14 +113,17 @@ def load_scheduled_research_config(path: str | Path | None = None) -> ScheduledR
         max_retry_rate=float(promo["max_retry_rate"]),
         min_reproducibility_rate=float(promo["min_reproducibility_rate"]),
         preferred_excess_return_margin=float(promo["preferred_excess_return_margin"]),
-        allow_live_promotion=bool(promo["allow_live_promotion"]),
+        allow_live_promotion=_strict_bool(promo["allow_live_promotion"], "promotion.allow_live_promotion"),
     )
 
     return ScheduledResearchYamlConfiguration(
-        version=raw.get("version", 1), enabled=bool(sr["enabled"]), universe_id=str(sr["universe_id"]),
+        version=raw.get("version", 1), enabled=_strict_bool(sr["enabled"], "scheduled_research.enabled"),
+        universe_id=str(sr["universe_id"]),
         max_candidates_per_cycle=int(sr["max_candidates_per_cycle"]), experiment_policy=str(sr["experiment_policy"]),
-        submit_paper_orders=bool(sr["submit_paper_orders"]), require_complete_evidence=bool(sr["require_complete_evidence"]),
-        require_point_in_time_safe=bool(sr["require_point_in_time_safe"]),
-        continue_on_symbol_failure=bool(sr["continue_on_symbol_failure"]), promotion_enabled=bool(promo["enabled"]),
+        submit_paper_orders=_strict_bool(sr["submit_paper_orders"], "scheduled_research.submit_paper_orders"),
+        require_complete_evidence=_strict_bool(sr["require_complete_evidence"], "scheduled_research.require_complete_evidence"),
+        require_point_in_time_safe=_strict_bool(sr["require_point_in_time_safe"], "scheduled_research.require_point_in_time_safe"),
+        continue_on_symbol_failure=_strict_bool(sr["continue_on_symbol_failure"], "scheduled_research.continue_on_symbol_failure"),
+        promotion_enabled=_strict_bool(promo["enabled"], "promotion.enabled"),
         promotion=promotion_config, config_hash=config_hash, raw=raw,
     )

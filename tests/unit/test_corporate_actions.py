@@ -56,6 +56,7 @@ DIVIDEND_BODY = {
 def _client(handler, *, cache=None) -> AlpacaCorporateActionsClient:
     transport = httpx.MockTransport(handler)
     http = HttpJsonClient(
+        backoff_sleep_fn=lambda s: None,
         base_headers={"APCA-API-KEY-ID": "k", "APCA-API-SECRET-KEY": "s"},
         rate_limiter=MinIntervalRateLimiter(0.0), transport=transport, provider="alpaca-corporate-actions",
     )
@@ -63,7 +64,7 @@ def _client(handler, *, cache=None) -> AlpacaCorporateActionsClient:
 
 
 def test_requires_credentials():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     with pytest.raises(ProviderConfigurationError):
         AlpacaCorporateActionsClient(api_key=None, api_secret="s", http_client=http)
     with pytest.raises(ProviderConfigurationError):
@@ -193,10 +194,10 @@ def test_never_infers_action_from_price_data():
 # -- unknown/deferred action types --------------------------------------------
 
 def test_deferred_action_type_rejected():
-    http = HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
+    http = HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0))
     client = AlpacaCorporateActionsClient(
         api_key="k", api_secret="s",
-        http_client=HttpJsonClient(base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0), transport=httpx.MockTransport(lambda r: httpx.Response(200, json=FORWARD_SPLIT_BODY))),
+        http_client=HttpJsonClient(backoff_sleep_fn=lambda s: None, base_headers={}, rate_limiter=MinIntervalRateLimiter(0.0), transport=httpx.MockTransport(lambda r: httpx.Response(200, json=FORWARD_SPLIT_BODY))),
     )
     with pytest.raises(ProviderConfigurationError):
         client.list_corporate_actions("AAPL", as_of=AS_OF, types=("cash_merger",))
