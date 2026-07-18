@@ -93,7 +93,7 @@ def load_config(env_file: str | Path | None = None, *, require_anthropic: bool =
     if dotenv_path.exists():
         load_dotenv(dotenv_path, override=False)
 
-    data_dir = Path(os.environ.get("RESEARCH_DATA_DIR", str(REPO_ROOT / "data")))
+    data_dir = Path(os.environ.get("RESEARCH_DATA_DIR") or str(REPO_ROOT / "data"))
     db_path = Path(
         os.environ.get("RESEARCH_DATABASE_PATH", str(data_dir / "research.sqlite3"))
     )

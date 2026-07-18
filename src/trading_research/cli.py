@@ -1,13 +1,15 @@
 """CLI for the research pipeline proof of concept.
 
 Commands:
-  analyze <TICKER>   End-to-end single-ticker analysis on MOCKED data:
-                     universe check → reddit mention aggregation → risk plan →
-                     schema-validated frozen recommendation JSON (printed).
+  analyze <TICKER>   End-to-end single-ticker analysis with mocked market data
+                     and credential-free Reddit RSS by default: universe check
+                     → reddit mention aggregation → risk plan → schema-validated
+                     frozen recommendation JSON (printed).
   paper-status       Show the paper ledger's cash, positions, and last snapshot.
 
-Everything runs offline on deterministic fixtures. No broker call, no order,
-no network. Output is research only — never an instruction to trade.
+No broker call or order is possible. Use `analyze --provider-mode fixture` for
+a fully offline deterministic run. Output is research only — never an
+instruction to trade.
 """
 from __future__ import annotations
 
@@ -21,10 +23,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 from jsonschema import Draft7Validator
 
-from .analysis.sentiment import KeywordClassifier, aggregate
+from .analysis.sentiment import KeywordClassifier, RedditRecord, aggregate
 from .analysis.ticker_extractor import extract_mentions
 from .config import REPO_ROOT, load_config
 from .mcp.mock_adapters import MockRedditAdapter, MockRobinhoodAdapter
@@ -73,7 +76,14 @@ def _git_sha() -> str:
     return "unknown"
 
 
-def analyze(symbol: str) -> dict:
+def analyze(
+    symbol: str,
+    *,
+    reddit_records: Sequence[RedditRecord] | None = None,
+    reddit_net_sentiment: float | None = None,
+    reddit_missing_data_reasons: tuple[str, ...] = (),
+    reddit_source_label: str = "reddit(mock)",
+) -> dict:
     symbol = symbol.upper()
     universe = default_universe()
     now = time.time()
@@ -112,7 +122,8 @@ def analyze(symbol: str) -> dict:
         return rec
 
     robinhood = MockRobinhoodAdapter(now_epoch=now)
-    reddit = MockRedditAdapter(now_epoch=now)
+    use_mock_reddit = reddit_records is None
+    reddit = MockRedditAdapter(now_epoch=now) if use_mock_reddit else None
 
     # Market data (mocked)
     try:
@@ -135,7 +146,7 @@ def analyze(symbol: str) -> dict:
         fundamentals = None
 
     # Reddit mention aggregation (deterministic; records are fixtures)
-    records = reddit.fetch_records(symbol)
+    records = reddit.fetch_records(symbol) if reddit is not None else list(reddit_records)
     day = 86_400.0
     agg = aggregate(records, symbol, now - day, now, KeywordClassifier())
     mention_confirmed = any(
@@ -143,14 +154,18 @@ def analyze(symbol: str) -> dict:
     )
     if records and not mention_confirmed:
         rec["warnings"].append("reddit records present but no counted mention survived extraction rules")
-    rec["reddit_component"] = {
-        "weight": REDDIT_WEIGHT,
-        "net_sentiment": round(agg.net_sentiment, 3),
-        "total_mentions": agg.total_mentions,
-        "unique_authors": agg.unique_authors,
-        "note": "sentiment, not fact; untrusted source; capped at 10% of score",
-    }
-    rec["data_timestamps"]["reddit(mock)"] = ts
+    sentiment_value = agg.net_sentiment if use_mock_reddit else reddit_net_sentiment
+    if sentiment_value is None:
+        rec["missing_data_reasons"].extend(reddit_missing_data_reasons or ("Reddit sentiment unavailable",))
+    else:
+        rec["reddit_component"] = {
+            "weight": REDDIT_WEIGHT,
+            "net_sentiment": round(sentiment_value, 3),
+            "total_mentions": agg.total_mentions,
+            "unique_authors": agg.unique_authors,
+            "note": "sentiment, not fact; untrusted source; capped at 10% of score",
+        }
+        rec["data_timestamps"][reddit_source_label] = ts
 
     # Toy composite score for the PoC: fundamentals gate + reddit cap only.
     base_score = 50.0
@@ -163,10 +178,10 @@ def analyze(symbol: str) -> dict:
              "weight": 0.35, "contribution": round(35 * growth_norm, 2)}
         )
         base_score += 35 * growth_norm * 0.5
-    reddit_contrib = 10 * agg.net_sentiment
+    reddit_contrib = 10 * sentiment_value if sentiment_value is not None else 0.0
     factors.append(
-        {"factor": "reddit_net_sentiment", "raw_value": agg.net_sentiment,
-         "normalized": agg.net_sentiment, "weight": REDDIT_WEIGHT,
+        {"factor": "reddit_net_sentiment", "raw_value": sentiment_value,
+         "normalized": sentiment_value, "weight": REDDIT_WEIGHT if sentiment_value is not None else 0.0,
          "contribution": round(reddit_contrib, 2)}
     )
     base_score += reddit_contrib * 0.5
@@ -218,9 +233,12 @@ def analyze(symbol: str) -> dict:
     rec["rationale_text"] = (
         f"Deterministic PoC analysis of {symbol}: score {rec['score']} from "
         f"{len(factors)} stored factors; reddit net sentiment "
-        f"{agg.net_sentiment:+.2f} over {agg.total_mentions} mentions "
+        f"{sentiment_value:+.2f} over {agg.total_mentions} mentions "
         f"({agg.unique_authors} unique authors), capped at 10% weight. "
         f"All numbers computed by Python, none by an LLM."
+    ) if sentiment_value is not None else (
+        f"Deterministic PoC analysis of {symbol}: score {rec['score']} from {len(factors)} stored factors; "
+        "Reddit sentiment was unavailable and contributed zero points. All numbers computed by Python, none by an LLM."
     )
     return rec
 
@@ -1019,8 +1037,31 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
         )
         return registry, ()
 
+    if provider_mode == "reddit_free":
+        provider_config = load_evidence_provider_config()
+        from .evidence_providers.reddit_free import PROVIDER_NAME as REDDIT_FREE_PROVIDER_NAME
+        from .evidence_providers.reddit_free import RedditFreeProvider
+
+        reddit_free = RedditFreeProvider(
+            provider_config.reddit_free,
+            conn=conn,
+            data_dir=cfg.research_data_dir,
+        )
+        registry = EvidenceProviderRegistry(
+            fundamentals=None,
+            market=None,
+            filings=None,
+            news=None,
+            sentiment=RealSentimentEvidenceProvider(reddit_free),
+            portfolio_context=None,
+            market_data_client=None,
+            sec_client=None,
+            corporate_status=None,
+        )
+        return registry, (REDDIT_FREE_PROVIDER_NAME,)
+
     if provider_mode != PROVIDER_MODE_REAL:
-        raise ValueError(f"unknown provider-mode {provider_mode!r} — must be 'fixture' or 'real'")
+        raise ValueError(f"unknown provider-mode {provider_mode!r} — must be 'fixture', 'real', or 'reddit_free'")
 
     provider_config = load_evidence_provider_config()
     used_providers: list[str] = []
@@ -1130,7 +1171,7 @@ def provider_health_cli(db_path: Path) -> dict:
     }
 
 
-def fetch_evidence_cli(symbol: str, as_of_str: str, db_path: Path, provider_mode: str) -> dict:
+def fetch_evidence_cli(symbol: str, as_of_str: str | None, db_path: Path, provider_mode: str) -> dict:
     """`fetch-evidence` CLI command (Milestone 6). Builds and persists a real
     (or fixture) point-in-time evidence snapshot — never calls Claude."""
     from .research.configuration import load_research_config
@@ -1139,7 +1180,11 @@ def fetch_evidence_cli(symbol: str, as_of_str: str, db_path: Path, provider_mode
 
     symbol = symbol.upper()
     try:
-        as_of = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+        as_of = (
+            datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+            if as_of_str
+            else datetime.now(timezone.utc)
+        )
     except ValueError as exc:
         return {"error": f"invalid --as-of: {exc}"}
     if as_of.tzinfo is None:
@@ -2039,8 +2084,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trading-research", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_analyze = sub.add_parser("analyze", help="Analyze one ticker on mocked data")
+    p_analyze = sub.add_parser("analyze", help="Analyze one ticker with mocked market data and selected Reddit evidence")
     p_analyze.add_argument("ticker")
+    p_analyze.add_argument("--provider-mode", choices=("fixture", "reddit_free"), default="reddit_free")
 
     # Milestone 11.3 Part 33: the legacy `paper/ledger.py` subsystem (Milestone
     # 3/4, predates the isolated `paper_books` subsystem hardened through
@@ -2143,8 +2189,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p_fetch_evidence = sub.add_parser("fetch-evidence", help="Build and persist a real (or fixture) point-in-time evidence snapshot (Milestone 6)")
     p_fetch_evidence.add_argument("--symbol", required=True)
-    p_fetch_evidence.add_argument("--as-of", required=True, help="ISO-8601 timezone-aware timestamp, e.g. 2026-07-01T20:00:00Z")
-    p_fetch_evidence.add_argument("--provider-mode", choices=("fixture", "real"), default="fixture")
+    p_fetch_evidence.add_argument("--as-of", help="ISO-8601 timezone-aware timestamp; defaults to the current UTC time")
+    p_fetch_evidence.add_argument("--provider-mode", choices=("fixture", "real", "reddit_free"), default="fixture")
 
     p_run_cycle = sub.add_parser("run-research-cycle", help="Run one scheduled research cycle over a bounded candidate set (Milestone 6)")
     p_run_cycle.add_argument("--as-of", required=True, help="ISO-8601 timezone-aware timestamp, e.g. 2026-07-01T20:00:00Z")
@@ -2453,7 +2499,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "analyze":
-        rec = analyze(args.ticker)
+        if args.provider_mode == "reddit_free" and default_universe().is_valid(args.ticker.upper()):
+            from .evidence_providers.config import load_evidence_provider_config
+            from .evidence_providers.reddit_free import RedditFreeProvider
+
+            cfg = load_config()
+            provider_config = load_evidence_provider_config().reddit_free
+            with session(cfg.research_database_path) as conn:
+                with RedditFreeProvider(provider_config, conn=conn, data_dir=cfg.research_data_dir) as provider:
+                    reddit_result = provider.fetch(args.ticker, datetime.now(timezone.utc))
+            rec = analyze(
+                args.ticker,
+                reddit_records=reddit_result.records,
+                reddit_net_sentiment=reddit_result.net_sentiment,
+                reddit_missing_data_reasons=reddit_result.missing_data_reasons,
+                reddit_source_label="reddit-free-rss",
+            )
+        else:
+            rec = analyze(args.ticker)
         validator = _load_schema()
         errors = sorted(validator.iter_errors(rec), key=lambda e: e.json_path)
         if errors:
