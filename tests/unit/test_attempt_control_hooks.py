@@ -9,6 +9,8 @@ import ast
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from trading_research.research.configuration import ResearchConfiguration
 from trading_research.research.deterministic_provider import ScriptedResearchProvider, ScriptedStep
 from trading_research.research.fixtures import build_fixture_snapshot
@@ -167,6 +169,7 @@ def test_denied_attempt_never_calls_provider():
     assert controller.after_calls == []
     failure_codes = {f.code for f in result.failures}
     assert "BUDGET_EXHAUSTED" in failure_codes
+    assert "RETRY_EXHAUSTED" not in failure_codes
     # Denial is distinct from a provider-failure code.
     assert "PROVIDER_UNAVAILABLE" not in failure_codes
 
@@ -251,6 +254,8 @@ def test_non_retryable_malformed_output_produces_exactly_one_provider_call():
     assert len(fundamental_before) == 1
     failure_codes = {f.code for f in result.failures}
     assert "CODEX_USAGE_METADATA_MISSING" in failure_codes
+    assert "RETRY_EXHAUSTED" not in failure_codes
+    assert "MISSING_REQUIRED_ROLE" in failure_codes
 
 
 def test_retryable_timeout_can_retry():
@@ -291,6 +296,79 @@ def test_authentication_failure_never_retries():
     )
     assert result.status == "ANALYSIS_INCOMPLETE"
     assert len(provider.calls) == 1
+    assert "RETRY_EXHAUSTED" not in {f.code for f in result.failures}
+
+
+@pytest.mark.parametrize("code", ["CODEX_NOT_AUTHENTICATED", "CODEX_QUOTA_EXHAUSTED"])
+def test_authentication_and_quota_failures_do_not_emit_retry_exhaustion(code):
+    from trading_research.research.errors import ProviderUnavailableError
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    class _UnavailableProvider:
+        def __init__(self):
+            self.call_count = 0
+
+        def generate_structured(self, request):
+            self.call_count += 1
+            raise ProviderUnavailableError("provider access blocked", code=code, retryable=False)
+
+    provider = _UnavailableProvider()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=3),
+        clock=lambda: NOW, run_mode="scripted", require_decision=False,
+    )
+    failure_codes = [failure.code for failure in result.failures]
+    assert provider.call_count == 1
+    assert code in failure_codes
+    assert "RETRY_EXHAUSTED" not in failure_codes
+    assert failure_codes.count("MISSING_REQUIRED_ROLE") == 1
+
+
+@pytest.mark.parametrize("gate_code", ["PAUSED", "KILLED", "BUDGET_GATED", "ROLE_GATED"])
+def test_control_gates_do_not_emit_retry_exhaustion(gate_code):
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    class _GateController:
+        def before_attempt(self, request):
+            return AttemptControlDecision(allowed=False, code=gate_code, reason="test gate")
+
+        def after_attempt(self, request, attempt):
+            raise AssertionError("a gated attempt must not invoke after_attempt")
+
+    provider = ScriptedResearchProvider({})
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=3),
+        clock=lambda: NOW, run_mode="scripted", attempt_controller=_GateController(), require_decision=False,
+    )
+    failure_codes = [failure.code for failure in result.failures]
+    assert provider.calls == []
+    assert "BUDGET_EXHAUSTED" in failure_codes
+    assert "RETRY_EXHAUSTED" not in failure_codes
+    assert failure_codes.count("MISSING_REQUIRED_ROLE") == 1
+
+
+def test_retryable_failures_at_limit_emit_one_exhaustion_for_actual_provider_calls():
+    from trading_research.research.prompt_registry import PromptRegistry
+
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="malformed", raw_text="bad"),
+        ("fundamental", 2): ScriptedStep(kind="malformed", raw_text="still bad"),
+    })
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=None,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=2),
+        clock=lambda: NOW, run_mode="scripted", require_decision=False,
+    )
+    exhaustion_failures = [failure for failure in result.failures if failure.code == "RETRY_EXHAUSTED"]
+    assert len(provider.calls) == 2
+    assert len(exhaustion_failures) == 1
+    assert exhaustion_failures[0].metadata["attempts_made"] == 2
+    assert [failure.code for failure in result.failures].count("MISSING_REQUIRED_ROLE") == 1
 
 
 def test_persisted_failure_retryable_matches_actual_behavior():

@@ -102,6 +102,7 @@ criteria, or the rationale not captured in an ADR.
 | 10 | [`milestones/milestone10-controlled-recurring-local-paper.md`](milestones/milestone10-controlled-recurring-local-paper.md) | Current scheduler behavior remains defined by code and its runbook |
 | 11 | [`milestones/milestone-11-alpaca-paper-boundary.md`](milestones/milestone-11-alpaca-paper-boundary.md) | [`milestone11-3-2-operational-integrity.md`](milestone11-3-2-operational-integrity.md), [`milestone11-3-1-safety-closure.md`](milestone11-3-1-safety-closure.md), [`milestones/milestone11-isolated-alpaca-paper-broker.md`](milestones/milestone11-isolated-alpaca-paper-broker.md), [`milestones/milestone11-1-external-paper-safety-closure.md`](milestones/milestone11-1-external-paper-safety-closure.md), [`milestones/milestone11-2-full-integrity-closure.md`](milestones/milestone11-2-full-integrity-closure.md), [`milestones/milestone11-3-integrity-closure.md`](milestones/milestone11-3-integrity-closure.md), [`milestones/milestone11-3-remaining-integrity-closure.md`](milestones/milestone11-3-remaining-integrity-closure.md) |
 | 12.1.2 | [`milestones/milestone12.1.2-fixes.md`](milestones/milestone12.1.2-fixes.md) | [`milestone12-1-2-model-provider-ownership.md`](milestone12-1-2-model-provider-ownership.md) |
+| 12.1.3 | Fix scheduled telemetry and retry-attribution issues from PR #23 | [`milestone12-1-3-telemetry-retry-closure.md`](milestone12-1-3-telemetry-retry-closure.md) |
 
 ## Superseded, duplicate, and pending notes
 
