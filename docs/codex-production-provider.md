@@ -187,15 +187,130 @@ scans arbitrary nested JSON for a plausible answer or token count.
 
 ## Schema handling
 
-The research JSON Schema is written verbatim (canonicalized) to a private
-temporary file under `working_directory/.codex-schemas/`: directory mode
-`0700`, file mode `0600`, exclusive creation with an unpredictable
-(`secrets.token_hex`) name, never overwritten, and removed in a `finally`
-block after success, failure, timeout, or cancellation. Oversize or
-structurally invalid schemas are rejected locally (`Draft7Validator.check_schema`)
-before any subprocess starts. A bounded-age sweep
-(`cleanup_abandoned_schema_files`) removes any `codex-schema-*` file older
-than the configured threshold left behind by an interrupted process.
+### Canonical schema versus transport schema
+
+`output_validation.py`'s canonical role/decision JSON Schemas are valid
+Draft-07, but Codex's structured-output validator accepts a stricter subset
+than Draft-07 — in particular it rejects numeric/string/array bound
+keywords (`minLength`, `maxLength`, `minItems`, `maxItems`, `minimum`,
+`maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `pattern`)
+and any object node whose `required` list does not name every key in
+`properties`. `codex_schema_transport.py::build_codex_transport_schema`
+rewrites the canonical schema into a Codex-compatible **transport schema**
+that Codex is asked to emit against. This mirrors the pattern
+`anthropic_provider.py::_strict_compatible_schema` already established for
+Claude's strict tool-use schema compiler.
+
+The transport schema is only ever used to *shape* what Codex is asked to
+produce — it is never a second source of truth. The canonical schema is
+unchanged, is still the only schema `generate_structured` locally validates
+before any subprocess runs, and is still the only schema the parsed
+response is checked against after Codex returns.
+
+### Supported normalization behavior
+
+- Deep-copies the input; never mutates the canonical schema.
+- Strips the unsupported bound keywords listed above (canonical
+  post-response validation still enforces every one of them).
+- Drops pure-metadata keywords (`$schema`, `title`, `description`,
+  `default`, `examples`) that do not affect validation.
+- Sets `required` to every key in `properties` on each object node (so an
+  optional-but-nullable canonical field, e.g. `numeric_value`, becomes
+  transport-required-but-nullable) and forces `additionalProperties: false`
+  wherever `properties` is declared.
+- Inlines local `$defs`/`definitions` references (`#/$defs/...`,
+  `#/definitions/...`) that are acyclic.
+- Preserves enums, array `items` schemas, and object shape wherever the
+  Codex-accepted subset allows.
+- Output is deterministic: repeated calls on the same canonical schema
+  produce byte-identical transport schemas once serialized with
+  `sort_keys=True`.
+
+### Fail-closed unsupported constructs
+
+`build_codex_transport_schema` raises `ProviderUnavailableError` with code
+`CODEX_TRANSPORT_SCHEMA_UNSUPPORTED` — never a silent, potentially-unsafe
+transformation — for: recursive or remote `$ref`s, `oneOf`/`anyOf`/`allOf`/
+`not`/`if`/`then`/`else`, `patternProperties`, a schema-valued
+`additionalProperties`, `unevaluatedProperties`, `dependentSchemas`/
+`dependentRequired`, `contains`/`minContains`/`maxContains`,
+`propertyNames`, `format`, non-string enum members, excessive nesting
+depth, and an invalid (non-mapping) input schema. None of these constructs
+appear in the current canonical role/decision schemas — the checks exist so
+a future canonical-schema change that introduces one fails loudly at
+transport-build time instead of being silently mistranslated.
+
+### Two-stage validation
+
+```text
+canonical schema
+  -> validate canonical schema locally (Draft7Validator.check_schema)
+  -> build Codex transport schema (build_codex_transport_schema)
+  -> validate transport schema locally (Draft7Validator.check_schema)
+  -> enforce the configured byte limit on the *normalized* transport schema
+  -> pass transport schema to Codex (--output-schema)
+  -> parse terminal Codex JSONL response
+  -> decode response JSON
+  -> validate response against the canonical schema (validate_against_schema)
+  -> accept and persist only if canonical validation succeeds
+```
+
+The response is never validated only against the transport schema. A
+response that satisfies the broader transport schema but violates a
+canonical-only bound (e.g. a `summary` string canonical caps at 4000
+characters, which the transport schema no longer bounds) is rejected by
+canonical validation and never persisted as a successful role report.
+
+### Diagnostic failure codes
+
+| Code | Meaning |
+| --- | --- |
+| `CODEX_TRANSPORT_SCHEMA_UNSUPPORTED` | The canonical schema could not be safely rewritten into a Codex-accepted transport schema, or the normalized transport schema is invalid Draft-07 or exceeds the configured byte limit. |
+| `CODEX_SCHEMA_REJECTED` | The canonical schema itself is unserializable/invalid, or Codex's own CLI rejected the transport schema at runtime (see `codex_failure_classifier.py`'s `_SCHEMA_MARKERS`), or the schema file could not be written. |
+| `CODEX_FINAL_OUTPUT_MALFORMED` / `CODEX_FINAL_OUTPUT_MISSING` | Codex's terminal response was not valid JSON, or no final `agent_message` was present. |
+| (generic `CODE_SCHEMA_*` codes, stage `STRUCTURED_SCHEMA`) | The decoded response failed canonical post-response validation (`output_validation.classify_schema_error`) — this is provider-agnostic and identical to how Claude Code/Anthropic canonical failures are classified. |
+
+These codes are never collapsed into one generic bucket — `CODEX_TRANSPORT_SCHEMA_UNSUPPORTED`
+is raised before any subprocess starts, `CODEX_SCHEMA_REJECTED` covers both
+pre-send local invalidity and a live CLI-side rejection, and a canonical
+post-response failure always surfaces its specific `CODE_SCHEMA_*` code.
+
+### Known limitations
+
+- The normalizer currently only inlines `$ref`s local to the document
+  (`#/$defs/...`, `#/definitions/...`); remote and recursive references are
+  rejected outright rather than partially resolved.
+- Because required-but-nullable transport fields may cause Codex to emit an
+  explicit `null` for a canonical-optional field, the canonical schema must
+  keep accepting `null` for any field this normalizer makes
+  transport-required — already true for every current role/decision field
+  (`numeric_value`, `unit`) but a constraint on any future optional field.
+- The transport schema is deliberately broader, never narrower, than the
+  canonical schema — it cannot be used as a stand-in for canonical
+  validation, and this repository's tests specifically guard against that
+  substitution (`test_codex_schema_transport.py`,
+  `test_codex_provider.py::test_response_passing_transport_schema_but_failing_canonical_is_rejected`).
+
+### Temporary schema file handling
+
+The Codex **transport** schema (not the canonical schema) is what gets
+written to a private temporary file under `working_directory/.codex-schemas/`:
+directory mode `0700`, file mode `0600`, exclusive creation with an
+unpredictable (`secrets.token_hex`) name, never overwritten, and removed in
+a `finally` block after success, failure, timeout, or cancellation. A
+bounded-age sweep (`cleanup_abandoned_schema_files`) removes any
+`codex-schema-*` file older than the configured threshold left behind by an
+interrupted process.
+
+### Single-role smoke-test procedure
+
+Before any live Codex call: confirm focused tests and fixture tests pass,
+run one supervised role only (`fundamental`, symbol `AAPL`), print — but
+never log the full schema or raw response — the provider, model, role,
+symbol, canonical/transport schema hashes, transport schema byte size,
+timeout, and maximum attempts. Scheduler execution, paper books, and
+external Alpaca paper must remain disabled for this and every other Codex
+research invocation.
 
 ## Usage and cost semantics
 
