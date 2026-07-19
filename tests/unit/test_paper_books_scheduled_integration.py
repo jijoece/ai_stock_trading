@@ -96,7 +96,7 @@ def _config(
         scheduled_integration=ScheduledIntegrationSection(enabled=scheduled_integration_enabled),
         external_broker=ExternalBrokerSection(
             bool(external_book_ids), "alpaca_paper", bool(external_book_ids), tuple(external_book_ids), True, 300,
-            Decimal("100000.00"), ("limit",), ("day",), 1,
+            Decimal("100000.00"), Decimal("100000.00"), ("limit",), ("day",), 1,
         ),
         config_hash="test-config-hash", raw={},
     )

@@ -303,41 +303,52 @@ def _sanitized_cli_error(exc: Exception) -> dict:
     return {"code": "EXTERNAL_RUNTIME_ERROR", "message": "an unexpected internal error occurred"}
 
 
-def _external_paper_cli(db_path: Path, operation) -> dict:
-    from .paper_books.config import load_paper_books_config
+def _external_paper_cli(db_path: Path, operation, *, config_path: str | Path | None = None) -> dict:
+    from .paper_books.cli_support import _load_config_or_error
+
+    paper_books_config, error = _load_config_or_error(config_path)
+    if error:
+        return {"error": error}
 
     client, _runtime_config = _build_runtime_client()
     try:
         client.start()
         with session(db_path) as conn:
-            return operation(conn, client, load_paper_books_config())
+            return operation(conn, client, paper_books_config)
     except Exception as exc:
         return {"error": _sanitized_cli_error(exc)}
     finally:
         client.shutdown()
 
 
-def external_paper_account_check_cli(db_path: Path, *, book_id: str) -> dict:
+def external_paper_account_check_cli(
+    db_path: Path, *, book_id: str, config_path: str | Path | None = None,
+) -> dict:
     from .paper_books.external_broker import check_external_paper_account
     return _external_paper_cli(
         db_path, lambda conn, runtime, config: check_external_paper_account(
             conn, book_id=book_id, runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
-def external_paper_preview_cli(db_path: Path, *, book_id: str, intent_id: str, operator: str) -> dict:
+def external_paper_preview_cli(
+    db_path: Path, *, book_id: str, intent_id: str, operator: str, config_path: str | Path | None = None,
+) -> dict:
     from .paper_books.external_broker import preview_external_paper_order
     return _external_paper_cli(
         db_path, lambda conn, runtime, config: preview_external_paper_order(
             conn, book_id=book_id, paper_order_intent_id=intent_id, operator=operator,
             runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
 def external_paper_submit_cli(
     db_path: Path, *, book_id: str, intent_id: str, preview_id: str, operator: str, reason: str,
+    config_path: str | Path | None = None,
 ) -> dict:
     from .paper_books.external_broker import submit_external_paper_order
     return _external_paper_cli(
@@ -345,20 +356,25 @@ def external_paper_submit_cli(
             conn, book_id=book_id, paper_order_intent_id=intent_id, preview_id=preview_id,
             operator=operator, reason=reason, runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
-def external_paper_reconcile_cli(db_path: Path, *, book_id: str, client_order_id: str | None) -> dict:
+def external_paper_reconcile_cli(
+    db_path: Path, *, book_id: str, client_order_id: str | None, config_path: str | Path | None = None,
+) -> dict:
     from .paper_books.external_broker import reconcile_external_paper_order
     return _external_paper_cli(
         db_path, lambda conn, runtime, config: reconcile_external_paper_order(
             conn, book_id=book_id, client_order_id=client_order_id, runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
 def external_paper_cancel_cli(
     db_path: Path, *, book_id: str, client_order_id: str, operator: str, reason: str,
+    config_path: str | Path | None = None,
 ) -> dict:
     from .paper_books.external_broker import cancel_external_paper_order
     return _external_paper_cli(
@@ -366,11 +382,13 @@ def external_paper_cancel_cli(
             conn, book_id=book_id, client_order_id=client_order_id, operator=operator,
             reason=reason, runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
 def external_paper_retry_cli(
     db_path: Path, *, book_id: str, intent_id: str, operator: str, reason: str,
+    config_path: str | Path | None = None,
 ) -> dict:
     from .paper_books.external_broker import retry_external_paper_order
     return _external_paper_cli(
@@ -378,6 +396,7 @@ def external_paper_retry_cli(
             conn, book_id=book_id, paper_order_intent_id=intent_id, operator=operator,
             reason=reason, runtime=runtime, config=config,
         ),
+        config_path=config_path,
     )
 
 
@@ -2737,10 +2756,20 @@ def main(argv: list[str] | None = None) -> int:
     p_pb_run_cycle.add_argument("--ask", required=True, help="Decimal string market-simulation input")
     p_pb_run_cycle.add_argument("--recommendation-id-baseline")
     p_pb_run_cycle.add_argument("--recommendation-id-enhanced")
+    p_pb_run_cycle.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
 
     p_pb_reconcile = sub.add_parser("paper-book-reconcile", help="Reconcile one isolated paper book against its own fills/cash/positions (Milestone 8)")
     p_pb_reconcile.add_argument("--book-id", required=True)
     p_pb_reconcile.add_argument("--as-of", help="ISO8601 timestamp (default: now)")
+    p_pb_reconcile.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
 
     p_pb_compare = sub.add_parser("paper-experiment-compare", help="Compare baseline vs enhanced isolated paper books over a window (Milestone 8)")
     p_pb_compare.add_argument("--experiment-id", required=True)
@@ -2763,6 +2792,11 @@ def main(argv: list[str] | None = None) -> int:
         "--experiment-policy", default="BOTH_SEPARATE_PAPER_BOOKS",
         choices=("OBSERVE_ONLY", "BASELINE_ONLY", "ENHANCED_ONLY", "BOTH_SEPARATE_PAPER_BOOKS", "SHADOW_ENHANCED"),
     )
+    p_pb_integrate.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
 
     p_pb_lifecycle_run = sub.add_parser(
         "paper-book-lifecycle-run",
@@ -2775,6 +2809,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Stamp real wall-clock time as created_at audit metadata (Milestone 9.1) — never changes "
              "market-day calculations, order eligibility, price selection, holding-period calculation, "
              "snapshot as_of, or exit-decision effective date, which remain keyed to --as-of regardless",
+    )
+    p_pb_lifecycle_run.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
     )
 
     p_pb_exit_request = sub.add_parser(
@@ -2893,32 +2932,62 @@ def main(argv: list[str] | None = None) -> int:
 
     p_external_account = sub.add_parser("external-paper-account-check", help="Verify the isolated Alpaca paper account")
     p_external_account.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_account.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_preview = sub.add_parser("external-paper-preview", help="Persist an explicit external-paper preview")
     p_external_preview.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_preview.add_argument("--intent-id", required=True)
     p_external_preview.add_argument("--operator", required=True)
+    p_external_preview.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_submit = sub.add_parser("external-paper-submit", help="Explicitly submit a recently previewed limit order")
     p_external_submit.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_submit.add_argument("--intent-id", required=True)
     p_external_submit.add_argument("--preview-id", required=True)
     p_external_submit.add_argument("--operator", required=True)
     p_external_submit.add_argument("--reason", required=True)
+    p_external_submit.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_show = sub.add_parser("external-paper-order-show", help="Show bounded local external-order evidence")
     p_external_show.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_show.add_argument("--client-order-id", required=True)
     p_external_reconcile = sub.add_parser("external-paper-reconcile", help="Reconcile external broker and book state")
     p_external_reconcile.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_reconcile.add_argument("--client-order-id")
+    p_external_reconcile.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_cancel = sub.add_parser("external-paper-cancel", help="Explicitly cancel an external paper order")
     p_external_cancel.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_cancel.add_argument("--client-order-id", required=True)
     p_external_cancel.add_argument("--operator", required=True)
     p_external_cancel.add_argument("--reason", required=True)
+    p_external_cancel.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_retry = sub.add_parser("external-paper-retry-submit", help="Retry only after authoritative broker NOT_FOUND")
     p_external_retry.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_retry.add_argument("--intent-id", required=True)
     p_external_retry.add_argument("--operator", required=True)
     p_external_retry.add_argument("--reason", required=True)
+    p_external_retry.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_refresh = sub.add_parser(
         "external-paper-refresh-retry-preview",
         help="Refresh an expired preview for an order confirmed UNKNOWN_REQUIRES_RECONCILIATION (read-only, no broker call)",
@@ -3270,6 +3339,7 @@ def main(argv: list[str] | None = None) -> int:
             symbol=args.symbol, quantity_hint=args.quantity_hint, reference_price=args.reference_price,
             bid=args.bid, ask=args.ask, recommendation_id_baseline=args.recommendation_id_baseline,
             recommendation_id_enhanced=args.recommendation_id_enhanced,
+            config_path=args.paper_books_config,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
@@ -3279,7 +3349,9 @@ def main(argv: list[str] | None = None) -> int:
 
         cfg = load_config()
         as_of = _parse_iso_datetime(args.as_of) if args.as_of else None
-        outcome = paper_book_reconcile_cli(cfg.research_database_path, args.book_id, as_of)
+        outcome = paper_book_reconcile_cli(
+            cfg.research_database_path, args.book_id, as_of, config_path=args.paper_books_config,
+        )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
 
@@ -3313,6 +3385,7 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         outcome = paper_book_integrate_cycle_cli(
             cfg.research_database_path, cycle_id=args.cycle_id, experiment_policy=args.experiment_policy,
+            config_path=args.paper_books_config,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
@@ -3324,6 +3397,7 @@ def main(argv: list[str] | None = None) -> int:
         outcome = paper_book_lifecycle_run_cli(
             cfg.research_database_path, as_of=_parse_iso_datetime(args.as_of),
             integrate_cycle_ids=tuple(args.integrate_cycle_ids), audit_time_now=args.audit_time_now,
+            config_path=args.paper_books_config,
         )
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
@@ -3499,17 +3573,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "external-paper-account-check":
         cfg = load_config()
-        outcome = external_paper_account_check_cli(cfg.research_database_path, book_id=args.book_id)
+        outcome = external_paper_account_check_cli(
+            cfg.research_database_path, book_id=args.book_id, config_path=args.paper_books_config,
+        )
     elif args.command == "external-paper-preview":
         cfg = load_config()
         outcome = external_paper_preview_cli(
             cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id, operator=args.operator,
+            config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-submit":
         cfg = load_config()
         outcome = external_paper_submit_cli(
             cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
             preview_id=args.preview_id, operator=args.operator, reason=args.reason,
+            config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-order-show":
         cfg = load_config()
@@ -3520,18 +3598,19 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         outcome = external_paper_reconcile_cli(
             cfg.research_database_path, book_id=args.book_id, client_order_id=args.client_order_id,
+            config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-cancel":
         cfg = load_config()
         outcome = external_paper_cancel_cli(
             cfg.research_database_path, book_id=args.book_id, client_order_id=args.client_order_id,
-            operator=args.operator, reason=args.reason,
+            operator=args.operator, reason=args.reason, config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-retry-submit":
         cfg = load_config()
         outcome = external_paper_retry_cli(
             cfg.research_database_path, book_id=args.book_id, intent_id=args.intent_id,
-            operator=args.operator, reason=args.reason,
+            operator=args.operator, reason=args.reason, config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-refresh-retry-preview":
         cfg = load_config()

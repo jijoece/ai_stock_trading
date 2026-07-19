@@ -120,6 +120,7 @@ class ExternalBrokerSection:
     require_explicit_preview: bool
     require_recent_preview_seconds: int
     maximum_order_notional_usd: Decimal
+    maximum_daily_notional_usd: Decimal
     permitted_order_types: tuple[str, ...]
     permitted_time_in_force: tuple[str, ...]
     maximum_retry_attempts: int = 1
@@ -153,6 +154,12 @@ class ExternalBrokerSection:
             )
         if self.maximum_order_notional_usd <= 0:
             raise PaperBooksConfigError("external_broker.maximum_order_notional_usd must be > 0")
+        if self.maximum_daily_notional_usd <= 0:
+            raise PaperBooksConfigError("external_broker.maximum_daily_notional_usd must be > 0")
+        if self.maximum_daily_notional_usd < self.maximum_order_notional_usd:
+            raise PaperBooksConfigError(
+                "external_broker.maximum_daily_notional_usd must be >= maximum_order_notional_usd"
+            )
         if not 1 <= self.require_recent_preview_seconds <= 86_400:
             raise PaperBooksConfigError(
                 "external_broker.require_recent_preview_seconds must be in [1,86400]"
@@ -512,6 +519,7 @@ _DISABLED_EXTERNAL_BROKER_SECTION = ExternalBrokerSection(
     enabled=False, provider="alpaca_paper", allow_order_submission=False,
     enabled_book_ids=(), require_explicit_preview=True,
     require_recent_preview_seconds=300, maximum_order_notional_usd=Decimal("50.00"),
+    maximum_daily_notional_usd=Decimal("150.00"),
     permitted_order_types=("limit",), permitted_time_in_force=("day",),
     maximum_retry_attempts=1,
 )
@@ -946,7 +954,7 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             {
                 "enabled", "provider", "allow_order_submission", "enabled_book_ids",
                 "require_explicit_preview", "require_recent_preview_seconds",
-                "maximum_order_notional_usd", "permitted_order_types",
+                "maximum_order_notional_usd", "maximum_daily_notional_usd", "permitted_order_types",
                 "permitted_time_in_force", "maximum_retry_attempts",
                 "order_lease_ttl_seconds", "order_lease_heartbeat_seconds",
             },
@@ -981,6 +989,10 @@ def load_paper_books_config(path: str | Path | None = None) -> PaperBooksConfigu
             maximum_order_notional_usd=_decimal(
                 external_raw.get("maximum_order_notional_usd", "50.00"),
                 "external_broker.maximum_order_notional_usd",
+            ),
+            maximum_daily_notional_usd=_decimal(
+                external_raw.get("maximum_daily_notional_usd", "150.00"),
+                "external_broker.maximum_daily_notional_usd",
             ),
             permitted_order_types=tuple(item.lower() for item in permitted_order_types),
             permitted_time_in_force=tuple(item.lower() for item in permitted_tif),
