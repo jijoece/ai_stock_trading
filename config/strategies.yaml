@@ -59,3 +59,10 @@ shortlist:
   maximum_symbols_to_research_per_day: 3
   maximum_fresh_research_cycles_per_day: 3
   minimum_signal_strength_for_research: 0.0
+  # Milestone 24 Part C6: real per-symbol pre-research filter, replacing the
+  # misleading portfolio-exposure<100% gate. A symbol already within
+  # minimum_candidate_allocation_fraction of the cap cannot receive any
+  # allowed allocation, so it is excluded before it ever consumes a
+  # research token.
+  maximum_symbol_allocation_fraction: 0.08
+  minimum_candidate_allocation_fraction: 0.01

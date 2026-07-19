@@ -38,7 +38,29 @@ class _Position:
     stop: Decimal
     target: Decimal
     highest: Decimal
+    maximum_holding_sessions: int
     partial_stage: int = 0
+
+
+def _signal_set_hash(signals: tuple[EntrySignal, ...]) -> str:
+    """Milestone 24 Part C1: distinct signal sets must produce distinct
+    backtest run IDs, so the run identity cannot collapse two different
+    inputs onto one persisted row."""
+    rows = sorted(
+        (
+            {
+                "signal_id": signal.signal_id, "symbol": signal.symbol,
+                "generated_after_session": signal.generated_after_session.isoformat(),
+                "limit_price": str(signal.limit_price), "quantity_hint": str(signal.quantity_hint),
+                "initial_stop_reference": str(signal.initial_stop_reference) if signal.initial_stop_reference is not None else None,
+                "target_reference": str(signal.target_reference) if signal.target_reference is not None else None,
+                "maximum_holding_sessions": signal.maximum_holding_sessions,
+            }
+            for signal in signals
+        ),
+        key=lambda row: row["signal_id"],
+    )
+    return hash_config({"signals": rows})
 
 
 def _configuration_hash(config: BacktestConfiguration) -> str:
@@ -99,10 +121,20 @@ def _sell(
 def run_backtest(
     *, configuration: BacktestConfiguration, data_provider: HistoricalDataProvider,
     signals: tuple[EntrySignal, ...], economic_events=(), conn=None,
+    strategy_id: str | None = None, strategy_version: str | None = None,
+    strategy_config_hash: str | None = None,
 ) -> BacktestResult:
     config = configuration
     config_hash = _configuration_hash(config)
-    run_id = "backtest-" + hashlib.sha256(config_hash.encode()).hexdigest()[:32]
+    signal_set_hash = _signal_set_hash(signals)
+    # Milestone 24 Part C1: run identity must include the signal set, not
+    # just the configuration — two different signal sets run against the
+    # same configuration must never collide onto one persisted run ID.
+    input_hash = hash_config({
+        "configuration_hash": config_hash, "signal_set_hash": signal_set_hash,
+        "code_version": BACKTEST_CODE_VERSION,
+    })
+    run_id = "backtest-" + hashlib.sha256(input_hash.encode()).hexdigest()[:32]
     final_as_of = datetime.combine(config.end_date, time(23, 59, 59), tzinfo=timezone.utc)
     bars_by_symbol: dict[str, tuple[HistoricalBar, ...]] = {}
     for symbol in config.symbols:
@@ -175,7 +207,7 @@ def run_backtest(
                 reason, exit_price = "STOP_GAP", bar.open
             elif bar.low <= position.stop:
                 reason, exit_price = "HARD_OR_TRAILING_STOP", position.stop
-            elif held_sessions >= config.maximum_holding_market_days:
+            elif held_sessions >= position.maximum_holding_sessions:
                 reason, exit_price = "MAXIMUM_HOLDING_PERIOD", bar.open
 
             if reason is not None:
@@ -285,6 +317,21 @@ def run_backtest(
                 entry_price=fill_price, atr=atr, stop_multiple=config.initial_stop_multiple,
                 target_multiple=config.initial_target_multiple,
             )
+            # Milestone 24 Part C3: a strategy-specific exit always wins over
+            # the engine's generic ATR default — silently substituting the
+            # global default would erase the reason the strategy chose that
+            # level in the first place. Invalid values reject the signal
+            # rather than being coerced into something fillable.
+            if signal.initial_stop_reference is not None:
+                if signal.initial_stop_reference >= fill_price:
+                    rejected.append({"signal_id": signal.signal_id, "reason": "INVALID_STRATEGY_STOP"})
+                    continue
+                stop = signal.initial_stop_reference
+            if signal.target_reference is not None:
+                if signal.target_reference <= fill_price:
+                    rejected.append({"signal_id": signal.signal_id, "reason": "INVALID_STRATEGY_TARGET"})
+                    continue
+                target = signal.target_reference
             risk_qty = (pre_entry_equity * config.risk_fraction / (fill_price - stop)).to_integral_value(rounding=ROUND_FLOOR)
             cash_qty = ((cash - config.fee_per_order) / fill_price).to_integral_value(rounding=ROUND_FLOOR)
             quantity = min(signal.quantity_hint, risk_qty, cash_qty)
@@ -305,6 +352,7 @@ def run_backtest(
                 entry_price=fill_price, entry_date=current_date,
                 entry_session_index=session_index[current_date], entry_atr=atr,
                 stop=stop, target=target, highest=fill_price,
+                maximum_holding_sessions=signal.maximum_holding_sessions or config.maximum_holding_market_days,
             )
 
         equity, unrealized = mark_equity(current_date)
@@ -340,11 +388,18 @@ def run_backtest(
         metrics=report, unresolved_evaluations=tuple(unresolved),
     )
     if conn is not None:
-        _persist_result(conn, result, config)
+        _persist_result(
+            conn, result, config, input_hash=input_hash, signal_set_hash=signal_set_hash,
+            strategy_id=strategy_id, strategy_version=strategy_version,
+            strategy_config_hash=strategy_config_hash,
+        )
     return result
 
 
-def _persist_result(conn, result: BacktestResult, config: BacktestConfiguration) -> None:
+def _persist_result(
+    conn, result: BacktestResult, config: BacktestConfiguration, *, input_hash: str, signal_set_hash: str,
+    strategy_id: str | None, strategy_version: str | None, strategy_config_hash: str | None,
+) -> None:
     import json
     from ..storage.transactions import transaction
 
@@ -356,15 +411,30 @@ def _persist_result(conn, result: BacktestResult, config: BacktestConfiguration)
     created_at = datetime.combine(config.end_date, time(23, 59, 59), tzinfo=timezone.utc).isoformat()
     ending = result.daily_states[-1].equity if result.daily_states else config.initial_cash
     with transaction(conn):
+        existing = conn.execute(
+            "SELECT input_hash FROM backtest_runs WHERE backtest_run_id = ?", (result.backtest_run_id,),
+        ).fetchone()
+        if existing is not None and existing[0] is not None and existing[0] != input_hash:
+            # Milestone 24 Part C1: a run ID collision with a different input
+            # hash means two distinct signal sets or configurations hashed
+            # to the same ID (or a hashing bug) — never silently overwrite
+            # or keep whichever was inserted first.
+            raise BacktestError(
+                f"backtest_run_id {result.backtest_run_id!r} already exists with a different input hash"
+            )
+        if existing is not None:
+            return  # idempotent replay of the identical run — nothing new to persist
         conn.execute(
-            "INSERT OR IGNORE INTO backtest_runs "
+            "INSERT INTO backtest_runs "
             "(backtest_run_id, started_at, start_date, end_date, symbols_json, initial_cash, ending_equity, "
-            "configuration_hash, code_version, ambiguity_policy, status, report_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)",
+            "configuration_hash, code_version, ambiguity_policy, status, report_json, created_at, "
+            "input_hash, signal_set_hash, strategy_id, strategy_version, strategy_config_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?, ?, ?, ?)",
             (result.backtest_run_id, created_at, config.start_date.isoformat(), config.end_date.isoformat(),
              json.dumps(list(config.symbols)), str(config.initial_cash), str(ending), result.configuration_hash,
              BACKTEST_CODE_VERSION, config.ambiguity_policy,
-             json.dumps(result.metrics, sort_keys=True, default=encode), created_at),
+             json.dumps(result.metrics, sort_keys=True, default=encode), created_at,
+             input_hash, signal_set_hash, strategy_id, strategy_version, strategy_config_hash),
         )
         for state in result.daily_states:
             conn.execute(

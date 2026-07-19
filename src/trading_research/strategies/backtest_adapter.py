@@ -41,6 +41,13 @@ def strategy_signal_to_entry_signal(
         signal_id=signal_id, symbol=signal.symbol,
         generated_after_session=signal.data_as_of.date(),
         limit_price=limit_price, quantity_hint=quantity_hint,
+        # Milestone 24 Part C3: carry the strategy's own exit levels through
+        # to the shared engine so it never silently substitutes its generic
+        # ATR default for what the strategy actually decided.
+        initial_stop_reference=signal.initial_stop_reference,
+        target_reference=signal.target_reference,
+        maximum_holding_sessions=signal.expected_holding_period,
+        strategy_signal_id=signal_id,
     )
 
 
@@ -58,9 +65,23 @@ def run_strategy_backtest(
     strategy_signals = tuple(
         s for s in signals if s.strategy_id == strategy_id and s.status == StrategyStatus.ELIGIBLE
     )
+    # Milestone 24 Part C2: one strategy backtest must not silently blend
+    # signals produced under different strategy versions/configurations —
+    # a mixed set would make the resulting metrics unattributable to any
+    # single, reproducible strategy definition.
+    versions = {s.strategy_version for s in strategy_signals}
+    config_hashes = {s.configuration_hash for s in strategy_signals}
+    if len(versions) > 1 or len(config_hashes) > 1:
+        raise BacktestError(
+            f"strategy backtest for {strategy_id!r} received mixed strategy definitions: "
+            f"versions={sorted(versions)} configuration_hashes={sorted(config_hashes)}"
+        )
+    strategy_version = next(iter(versions), None)
+    strategy_config_hash = next(iter(config_hashes), None)
     entry_signals = tuple(strategy_signal_to_entry_signal(s) for s in strategy_signals)
     result = run_backtest(
         configuration=configuration, data_provider=data_provider, signals=entry_signals, conn=conn,
+        strategy_id=strategy_id, strategy_version=strategy_version, strategy_config_hash=strategy_config_hash,
     )
     metrics = compute_strategy_metrics(result, entry_signals, regime_by_date=regime_by_date)
     return StrategyBacktestResult(strategy_id=strategy_id, backtest_result=result, metrics=metrics)

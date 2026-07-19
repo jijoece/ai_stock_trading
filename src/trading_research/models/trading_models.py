@@ -144,6 +144,7 @@ class PortfolioState:
     settled_cash: Decimal | None
     existing_positions: dict[str, int] = field(default_factory=dict)  # symbol -> shares held
     sector_exposure_fraction: dict[str, float] = field(default_factory=dict)  # sector -> fraction of equity
+    symbol_exposure_fraction: dict[str, float] = field(default_factory=dict)  # symbol -> fraction of equity
     portfolio_exposure_fraction: float | None = None
     daily_loss_fraction: float = 0.0
     drawdown_fraction: float = 0.0

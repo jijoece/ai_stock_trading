@@ -40,13 +40,20 @@ def _sort_key(signal: StrategySignal) -> tuple[float, int, str]:
     return (-signal.signal_strength, quality_rank, data_as_of)
 
 
-def _within_concentration_limit(portfolio: PortfolioState | None) -> bool:
-    """Portfolio-level exposure gate. No per-symbol sector attribution is
-    available on a `StrategySignal`, so this checks only the account-wide
-    exposure fraction already carried on `PortfolioState`."""
+def _symbol_has_allocation_room(symbol: str, portfolio: PortfolioState | None, config: ShortlistConfig) -> bool:
+    """Milestone 24 Part C6: real, deterministic, per-symbol pre-research
+    filter — replaces the previous gate, which only checked whether total
+    portfolio exposure was below 100% and so let an already-maxed-out
+    single symbol through as long as the rest of the account had room. A
+    symbol that cannot receive at least `minimum_candidate_allocation_fraction`
+    more without breaching `maximum_symbol_allocation_fraction` should not
+    consume a research token. Advisory only — final risk validation remains
+    authoritative."""
     if portfolio is None:
         return True
-    return portfolio.portfolio_exposure_fraction is None or portfolio.portfolio_exposure_fraction < 1.0
+    current = portfolio.symbol_exposure_fraction.get(symbol, 0.0)
+    remaining = config.maximum_symbol_allocation_fraction - current
+    return remaining >= config.minimum_candidate_allocation_fraction
 
 
 def select_shortlist(
@@ -79,9 +86,9 @@ def select_shortlist(
             excluded.append(ShortlistEntry(symbol, signals_tuple, best_strength, False,
                                             "combined_shortlist_cap_reached"))
             continue
-        if not _within_concentration_limit(portfolio):
+        if not _symbol_has_allocation_room(symbol, portfolio, config):
             excluded.append(ShortlistEntry(symbol, signals_tuple, best_strength, False,
-                                            "portfolio_concentration_limit"))
+                                            "symbol_allocation_cap_reached"))
             continue
         entries.append(ShortlistEntry(symbol, signals_tuple, best_strength, True, "shortlisted"))
 
