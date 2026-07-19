@@ -21,6 +21,10 @@ research-results/retries/*
 !research-results/.gitkeep
 research-results/*.json
 research-results/*.md
+research-results/*.sqlite
+research-results/*.sqlite3
+research-results/*.sqlite3-*
+research-results/*.db
 !research-results/.gitkeep
 
 # Message Batch run artifacts (contain generated patches / results, not source)
