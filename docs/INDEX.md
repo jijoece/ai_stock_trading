@@ -27,6 +27,7 @@ read multiple milestone variants unless the task requires comparing them.
 | System boundaries and target architecture | [`AI-Driven-Stock-Trading-Architecture.md`](AI-Driven-Stock-Trading-Architecture.md) |
 | Original roadmap and acceptance criteria | [`AI-Stock-Trading-Implementation-Plan.md`](AI-Stock-Trading-Implementation-Plan.md) |
 | External research-source policy | [`AI-Stock-Trading-Research-Sources.md`](AI-Stock-Trading-Research-Sources.md) |
+| Deterministic strategy candidate selection (momentum/mean-reversion/catalyst) | [`strategy-candidate-selection.md`](strategy-candidate-selection.md) |
 | Latest model-provider safety closure | [`milestone12-1-2-model-provider-ownership.md`](milestone12-1-2-model-provider-ownership.md) |
 | Latest completed integrity implementation | [`milestone12-1-1-provider-health-closure.md`](milestone12-1-1-provider-health-closure.md) |
 | Prior completed integrity implementation | [`milestone12-1-provider-health-ci-integrity.md`](milestone12-1-provider-health-ci-integrity.md) |

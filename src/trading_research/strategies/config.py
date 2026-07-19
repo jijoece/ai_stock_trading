@@ -18,6 +18,19 @@ from ..hashing import hash_config
 
 DEFAULT_STRATEGY_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "strategies.yaml"
 
+# B9 activation progression. Each stage must be passed, in order, before the
+# next is entered; `strategy_candidate_selection.activation_stage` in
+# config/strategies.yaml records where the system currently stands.
+ACTIVATION_STAGES = (
+    "STAGE_1_OFFLINE_FIXTURES",
+    "STAGE_2_HISTORICAL_BACKTEST",
+    "STAGE_3_DAILY_READ_ONLY_CANDIDATE_LIST",
+    "STAGE_4_SHADOW_RECOMMENDATION_TRACKING",
+    "STAGE_5_LOCAL_PAPER_BOOK",
+    "STAGE_6_SUPERVISED_ALPACA_PAPER",
+    "STAGE_7_MULTI_DAY_PAPER_SOAK",
+)
+
 
 class StrategyConfigError(RuntimeError):
     """The strategy configuration is missing, malformed, or out of range."""
@@ -111,6 +124,7 @@ class ShortlistConfig:
 class StrategyConfig:
     version: int
     strategy_candidate_selection_enabled: bool
+    activation_stage: str
     momentum_breakout: MomentumBreakoutConfig
     mean_reversion: MeanReversionConfig
     event_catalyst: EventCatalystConfig
@@ -142,6 +156,19 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
     selection = raw["strategy_candidate_selection"] or {}
     if "enabled" not in selection:
         raise StrategyConfigError("strategy config strategy_candidate_selection missing key: 'enabled'")
+    if "activation_stage" not in selection:
+        raise StrategyConfigError("strategy config strategy_candidate_selection missing key: 'activation_stage'")
+    if selection["activation_stage"] not in ACTIVATION_STAGES:
+        raise StrategyConfigError(
+            f"strategy config activation_stage {selection['activation_stage']!r} not one of {ACTIVATION_STAGES}"
+        )
+    if bool(selection["enabled"]) and selection["activation_stage"] in (
+        "STAGE_1_OFFLINE_FIXTURES", "STAGE_2_HISTORICAL_BACKTEST",
+    ):
+        raise StrategyConfigError(
+            "strategy_candidate_selection cannot be enabled while activation_stage is still "
+            "offline-fixtures or historical-backtest only"
+        )
 
     mb = raw["momentum_breakout"] or {}
     required_mb = {"enabled", "breakout_lookback_days", "trend_sma_days", "trend_slope_lookback_days",
@@ -178,6 +205,7 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
     return StrategyConfig(
         version=raw["version"],
         strategy_candidate_selection_enabled=bool(selection["enabled"]),
+        activation_stage=selection["activation_stage"],
         momentum_breakout=MomentumBreakoutConfig(
             enabled=bool(mb["enabled"]),
             breakout_lookback_days=int(mb["breakout_lookback_days"]),
