@@ -6,8 +6,18 @@ version: 1
 # Activation stage (B9). Deterministic strategy candidate selection is
 # disabled by default — enabling it does not submit orders on its own,
 # but the flag stays false until the shortlist layer has been reviewed.
+#
+# activation_stage records progress through the required 7-stage rollout
+# (see ACTIVATION_STAGES in strategies/config.py and
+# docs/strategy-candidate-selection.md):
+#   STAGE_1_OFFLINE_FIXTURES -> STAGE_2_HISTORICAL_BACKTEST ->
+#   STAGE_3_DAILY_READ_ONLY_CANDIDATE_LIST ->
+#   STAGE_4_SHADOW_RECOMMENDATION_TRACKING -> STAGE_5_LOCAL_PAPER_BOOK ->
+#   STAGE_6_SUPERVISED_ALPACA_PAPER -> STAGE_7_MULTI_DAY_PAPER_SOAK
+# `enabled` cannot be true while still at stage 1 or 2 (loader-enforced).
 strategy_candidate_selection:
   enabled: false
+  activation_stage: STAGE_2_HISTORICAL_BACKTEST
 
 momentum_breakout:
   enabled: true
