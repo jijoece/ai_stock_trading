@@ -22,7 +22,7 @@ def test_page_imports_do_not_touch_database(dashboard_database: Path, monkeypatc
 def test_app_entry_point_renders_persisted_overview(dashboard_database: Path, monkeypatch):
     monkeypatch.setenv("AI_STOCK_TRADING_DB_PATH", str(dashboard_database))
 
-    app = AppTest.from_file("dashboard/streamlit_app.py", default_timeout=10).run()
+    app = AppTest.from_file("../../src/dashboard/streamlit_app.py", default_timeout=10).run()
 
     assert not app.exception
     assert app.title[0].value == "Overview"

@@ -691,6 +691,28 @@ CREATE TABLE IF NOT EXISTS paper_external_reconciliations (
     config_hash TEXT NOT NULL
 );
 
+-- Milestone 23 Part A3: the isolated reconciliation boundary for one
+-- externally-enabled book. Captured once, on the first successful external
+-- reconciliation call for the book (idempotent insert-or-ignore), this row
+-- freezes the local settled cash/positions and the broker cash/positions at
+-- that instant. All later reconciliation compares *deltas* from this
+-- baseline rather than raw totals, so pre-existing local-simulated state
+-- that was never mirrored to the broker (e.g. an earlier local-only fill in
+-- the same book) cancels out instead of surfacing as a false
+-- CASH_MISMATCH/POSITION_MISMATCH.
+CREATE TABLE IF NOT EXISTS paper_external_reconciliation_baseline (
+    book_id TEXT PRIMARY KEY REFERENCES paper_books(book_id),
+    snapshot_timestamp TEXT NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    local_settled_cash_usd TEXT NOT NULL,
+    local_positions_json TEXT NOT NULL,
+    broker_cash_usd TEXT NOT NULL,
+    broker_positions_json TEXT NOT NULL,
+    source_environment TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS paper_external_submission_queue (
     queue_id TEXT PRIMARY KEY,
     book_id TEXT NOT NULL REFERENCES paper_books(book_id),

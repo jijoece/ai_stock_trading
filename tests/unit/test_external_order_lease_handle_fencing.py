@@ -180,6 +180,7 @@ def test_preview_survives_a_slow_runtime_call_via_heartbeat(monkeypatch):
         cfg.external_broker.enabled, cfg.external_broker.provider, cfg.external_broker.allow_order_submission,
         cfg.external_broker.enabled_book_ids, cfg.external_broker.require_explicit_preview,
         cfg.external_broker.require_recent_preview_seconds, cfg.external_broker.maximum_order_notional_usd,
+        cfg.external_broker.maximum_daily_notional_usd,
         cfg.external_broker.permitted_order_types, cfg.external_broker.permitted_time_in_force,
         cfg.external_broker.maximum_retry_attempts, order_lease_ttl_seconds=41, order_lease_heartbeat_seconds=10,
     )
@@ -200,14 +201,14 @@ def test_preview_survives_a_slow_runtime_call_via_heartbeat(monkeypatch):
 def test_ttl_at_or_below_runtime_timeout_plus_margin_rejected():
     with pytest.raises(PaperBooksConfigError):
         ExternalBrokerSection(
-            True, "alpaca_paper", True, ("BASELINE",), True, 300, Decimal("100"),
+            True, "alpaca_paper", True, ("BASELINE",), True, 300, Decimal("100"), Decimal("300"),
             ("limit",), ("day",), 1, order_lease_ttl_seconds=40, order_lease_heartbeat_seconds=10,
         )
 
 
 def test_ttl_strictly_above_runtime_timeout_plus_margin_accepted():
     section = ExternalBrokerSection(
-        True, "alpaca_paper", True, ("BASELINE",), True, 300, Decimal("100"),
+        True, "alpaca_paper", True, ("BASELINE",), True, 300, Decimal("100"), Decimal("300"),
         ("limit",), ("day",), 1, order_lease_ttl_seconds=41, order_lease_heartbeat_seconds=10,
     )
     assert section.order_lease_ttl_seconds == 41

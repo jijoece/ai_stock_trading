@@ -74,6 +74,7 @@ paper_books:
     require_explicit_preview: true
     require_recent_preview_seconds: 300
     maximum_order_notional_usd: "50.00"
+    maximum_daily_notional_usd: "150.00"
     permitted_order_types:
       - limit
     permitted_time_in_force:
