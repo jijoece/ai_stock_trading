@@ -32,7 +32,8 @@ from trading_research.paper_books.config import (
 )
 from trading_research.paper_books.external_broker import (
     QUEUE_STATUS_AWAITING_SUBMISSION, STATE_SUBMISSION_REQUESTED,
-    derive_external_queue_status, preview_external_paper_order, submit_external_paper_order,
+    activate_external_reconciliation_baseline, derive_external_queue_status,
+    preview_external_paper_order, submit_external_paper_order,
 )
 from trading_research.paper_books.models import PaperBookOrderIntent, PaperRiskDecision, RISK_APPROVED
 from trading_research.storage import paper_books_repositories as repo
@@ -73,6 +74,16 @@ class _CrashBeforeBrokerCallRuntime:
     def submit_limit_order(self, payload):
         self.submit_calls += 1
         raise _SimulatedProcessCrash("process died before the broker call could complete")
+
+    def get_external_positions(self, book_id):
+        return {"book_id": book_id, "account_fingerprint": FINGERPRINT, "positions": []}
+
+    def get_external_account_snapshot(self, book_id):
+        return {
+            "provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+            "account_fingerprint": FINGERPRINT, "cash": "100000", "equity": "100000",
+            "buying_power": "100000", "currency": "USD", "as_of": NOW.isoformat(),
+        }
 
 
 def _config():
@@ -119,6 +130,10 @@ def test_reservation_and_submission_requested_survive_crash_before_broker_call(t
 
     conn = connect(db_path)
     _seed(conn)
+    activate_external_reconciliation_baseline(
+        conn, book_id="BASELINE", operator="alice", runtime=_CrashBeforeBrokerCallRuntime(), config=cfg,
+        clock=lambda: NOW,
+    )
     preview_runtime = _CrashBeforeBrokerCallRuntime()
     preview = preview_external_paper_order(
         conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
@@ -176,6 +191,10 @@ def test_crash_before_reservation_commit_leaves_zero_effects(tmp_path, monkeypat
 
     conn = connect(db_path)
     _seed(conn)
+    activate_external_reconciliation_baseline(
+        conn, book_id="BASELINE", operator="alice", runtime=_CrashBeforeBrokerCallRuntime(), config=cfg,
+        clock=lambda: NOW,
+    )
     preview_runtime = _CrashBeforeBrokerCallRuntime()
     preview = preview_external_paper_order(
         conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",

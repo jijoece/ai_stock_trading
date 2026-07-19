@@ -11,8 +11,9 @@ from trading_research.paper_books.config import (
     PaperBooksConfiguration, RiskSection, ScheduledIntegrationSection, ValuationSection,
 )
 from trading_research.paper_books.external_broker import (
-    ExternalPaperError, STATE_FILLED, STATE_SUBMITTED, STATE_UNKNOWN,
-    _safety_checks, _verify_fingerprint_history, cancel_external_paper_order,
+    ExternalPaperError, STATE_FILLED, STATE_REJECTED, STATE_SUBMITTED, STATE_UNKNOWN,
+    _reserve_daily_notional, _safety_checks, _verify_fingerprint_history,
+    activate_external_reconciliation_baseline, cancel_external_paper_order,
     derive_external_order_identity, preview_external_paper_order,
     reconcile_external_paper_order, retry_external_paper_order, submit_external_paper_order,
 )
@@ -87,7 +88,18 @@ def _seed_sell(conn, quantity=Decimal("10"), *, sell_quantity=Decimal("4"), limi
     return repo.load_order_intent(conn, "BASELINE", "intent-sell")
 
 
+def _activate_baseline(conn, runtime, cfg, book_id="BASELINE"):
+    """Milestone 24 Part A3: submission now fails closed without an
+    explicitly activated reconciliation baseline — every test that submits
+    must activate one first (idempotent, so calling it more than once is
+    harmless)."""
+    return activate_external_reconciliation_baseline(
+        conn, book_id=book_id, operator="alice", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+
+
 def _preview_sell(conn, runtime, cfg):
+    _activate_baseline(conn, runtime, cfg)
     return preview_external_paper_order(
         conn, book_id="BASELINE", paper_order_intent_id="intent-sell", operator="alice",
         runtime=runtime, config=cfg, clock=lambda: NOW,
@@ -190,6 +202,7 @@ class FakeRuntime:
 
 
 def _preview(conn, runtime, cfg):
+    _activate_baseline(conn, runtime, cfg)
     return preview_external_paper_order(
         conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
         runtime=runtime, config=cfg, clock=lambda: NOW,
@@ -1799,3 +1812,302 @@ def test_pending_intent_still_previews_normally():
     _seed(conn)
     record = _preview(conn, FakeRuntime(), _config())
     assert record["result"] == "APPROVED"
+
+
+# --- Milestone 24 Part A1/A2/A3: account-wide daily cap, atomic reservation,
+# and explicit reconciliation baseline activation --------------------------
+
+
+def _fresh_intent(conn, *, book_id, intent_id, quantity, limit_price):
+    decision = PaperRiskDecision(
+        RISK_APPROVED, quantity * limit_price, quantity * limit_price, quantity, (), "risk-v1",
+    )
+    risk_id = f"risk-{intent_id}"
+    repo.save_risk_decision(conn, risk_id, book_id, "cycle-1", f"rec-{intent_id}", "AAPL", decision, "snap-1", NOW)
+    intent = PaperBookOrderIntent(
+        paper_order_intent_id=intent_id, book_id=book_id, experiment_arm=book_id,
+        cycle_id="cycle-1", recommendation_id=f"rec-{intent_id}", symbol="AAPL", side="BUY",
+        order_type="LIMIT", quantity=quantity, limit_price=limit_price,
+        notional_usd=quantity * limit_price, time_in_force="DAY", as_of=NOW,
+        risk_decision_id=risk_id, portfolio_snapshot_id="snap-1", config_hash="cfg-m11", created_at=NOW,
+    )
+    repo.save_order_intent(conn, intent)
+    return repo.load_order_intent(conn, book_id, intent_id)
+
+
+class _AltFingerprintRuntime(FakeRuntime):
+    """A distinct, unrelated Alpaca paper account — every fingerprint-
+    bearing response is overridden to prove its daily cap is tracked
+    independently of `FakeRuntime`'s `FINGERPRINT`."""
+
+    ALT_FINGERPRINT = "acct_ffffffffffffffffffffffffffffffff"
+
+    def account_check(self, book_id):
+        return {**super().account_check(book_id), "account_fingerprint": self.ALT_FINGERPRINT}
+
+    def preview_limit_order(self, payload):
+        return {**super().preview_limit_order(payload), "account_fingerprint": self.ALT_FINGERPRINT}
+
+    def _make_order(self, payload):
+        order = super()._make_order(payload)
+        order["account_fingerprint"] = self.ALT_FINGERPRINT
+        return order
+
+    def get_external_positions(self, book_id):
+        return {**super().get_external_positions(book_id), "account_fingerprint": self.ALT_FINGERPRINT}
+
+    def get_external_account_snapshot(self, book_id):
+        return {**super().get_external_account_snapshot(book_id), "account_fingerprint": self.ALT_FINGERPRINT}
+
+
+class _RejectingRuntime(FakeRuntime):
+    """The broker responds definitively (not ambiguously) with REJECTED —
+    no notional was ever actually sent, so the daily reservation must
+    release rather than keep holding the account's budget."""
+
+    def submit_limit_order(self, payload):
+        self.submit_calls += 1
+        order = self._make_order(payload)
+        order["status"] = "REJECTED"
+        order["rejection_code"] = "INSUFFICIENT_BUYING_POWER"
+        self.order = order
+        return dict(order)
+
+
+def test_daily_notional_cap_is_account_wide_across_books():
+    """A1: the cap is scoped by (account_fingerprint, UTC date), aggregating
+    every book that shares the fingerprint — not by book_id. (A separate,
+    pre-existing invariant, `_verify_fingerprint_history`'s
+    `ACCOUNT_ALREADY_MAPPED` check, already forbids two books from actually
+    sharing one live Alpaca paper account end to end; this test exercises
+    the reservation layer directly, which is where A1's aggregation itself
+    lives and where that unrelated invariant does not apply.)"""
+    from dataclasses import replace
+
+    conn = connect(":memory:")
+    cash_ledger.open_book(conn, book_id="BASELINE", starting_cash_usd=Decimal("100000"), config_hash="cfg-m11", clock=lambda: NOW)
+    cash_ledger.open_book(conn, book_id="ENHANCED", starting_cash_usd=Decimal("100000"), config_hash="cfg-m11", clock=lambda: NOW)
+    intent_b = _fresh_intent(conn, book_id="BASELINE", intent_id="intent-b", quantity=Decimal("1"), limit_price=Decimal("100"))
+    intent_e = _fresh_intent(conn, book_id="ENHANCED", intent_id="intent-e", quantity=Decimal("1"), limit_price=Decimal("51"))
+
+    cfg = _config()
+    cfg = replace(cfg, external_broker=replace(cfg.external_broker, maximum_daily_notional_usd=Decimal("150")))
+
+    reserved = _reserve_daily_notional(
+        conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id="epb-baseline-100",
+        intent=intent_b, now=NOW,
+    )
+    assert reserved["state"] == "RESERVED"
+
+    # Same Alpaca paper account (fingerprint), a different local book: $51
+    # more would push the account past its $150 daily cap.
+    with pytest.raises(ExternalPaperError) as excinfo:
+        _reserve_daily_notional(
+            conn, cfg, book_id="ENHANCED", fingerprint=FINGERPRINT, client_order_id="epb-enhanced-51",
+            intent=intent_e, now=NOW,
+        )
+    assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
+
+
+def test_different_account_fingerprints_have_independent_daily_caps():
+    from dataclasses import replace
+
+    conn = connect(":memory:")
+    cash_ledger.open_book(conn, book_id="BASELINE", starting_cash_usd=Decimal("100000"), config_hash="cfg-m11", clock=lambda: NOW)
+    cash_ledger.open_book(conn, book_id="ENHANCED", starting_cash_usd=Decimal("100000"), config_hash="cfg-m11", clock=lambda: NOW)
+    _fresh_intent(conn, book_id="BASELINE", intent_id="intent-b", quantity=Decimal("1"), limit_price=Decimal("100"))
+    _fresh_intent(conn, book_id="ENHANCED", intent_id="intent-e", quantity=Decimal("1"), limit_price=Decimal("100"))
+
+    runtime_a, runtime_b = FakeRuntime(), _AltFingerprintRuntime()
+    cfg_baseline = _config(books=("BASELINE",))
+    cfg_baseline = replace(cfg_baseline, external_broker=replace(cfg_baseline.external_broker, maximum_daily_notional_usd=Decimal("100")))
+    cfg_enhanced = _config(books=("ENHANCED",))
+    cfg_enhanced = replace(cfg_enhanced, external_broker=replace(cfg_enhanced.external_broker, maximum_daily_notional_usd=Decimal("100")))
+
+    activate_external_reconciliation_baseline(
+        conn, book_id="BASELINE", operator="alice", runtime=runtime_a, config=cfg_baseline, clock=lambda: NOW,
+    )
+    activate_external_reconciliation_baseline(
+        conn, book_id="ENHANCED", operator="alice", runtime=runtime_b, config=cfg_enhanced, clock=lambda: NOW,
+    )
+
+    preview_b = preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-b", operator="alice",
+        runtime=runtime_a, config=cfg_baseline, clock=lambda: NOW,
+    )
+    result_b = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-b", preview_id=preview_b["preview_id"],
+        operator="alice", reason="first account, exhausts its own cap", runtime=runtime_a, config=cfg_baseline,
+        clock=lambda: NOW,
+    )
+    assert result_b["status"] == STATE_SUBMITTED
+
+    # A different, unrelated Alpaca paper account at the identical notional
+    # cap must not be blocked by the first account's exhausted budget.
+    preview_e = preview_external_paper_order(
+        conn, book_id="ENHANCED", paper_order_intent_id="intent-e", operator="alice",
+        runtime=runtime_b, config=cfg_enhanced, clock=lambda: NOW,
+    )
+    result_e = submit_external_paper_order(
+        conn, book_id="ENHANCED", paper_order_intent_id="intent-e", preview_id=preview_e["preview_id"],
+        operator="alice", reason="second, independent account", runtime=runtime_b, config=cfg_enhanced,
+        clock=lambda: NOW,
+    )
+    assert result_e["status"] == STATE_SUBMITTED
+
+
+def test_concurrent_reservations_cannot_exceed_account_cap():
+    from dataclasses import replace
+
+    conn = connect(":memory:")
+    intent = _seed(conn)  # intent-1: quantity 2 * limit 40 = $80 notional
+    cfg = _config()
+    cfg = replace(cfg, external_broker=replace(cfg.external_broker, maximum_daily_notional_usd=Decimal("100")))
+    reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
+    # A reservation committed by a concurrent process/book for the same
+    # account/day, just before this one's atomic check-and-reserve runs.
+    repo.save_external_daily_reservation(conn, {
+        "client_order_id": "epb-competing-concurrent-reservation", "account_fingerprint": FINGERPRINT,
+        "reservation_date": reservation_date, "book_id": "ENHANCED",
+        "reserved_notional_usd": Decimal("60"), "state": "RESERVED",
+        "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError) as excinfo:
+        _reserve_daily_notional(
+            conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id="epb-new-order-over-cap",
+            intent=intent, now=NOW,
+        )
+    assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
+    # The would-be-blocked reservation was never created.
+    assert repo.load_external_daily_reservation(conn, "epb-new-order-over-cap") is None
+
+
+def test_duplicate_client_order_id_reuses_existing_reservation():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg = _config()
+    client_order_id, _ = derive_external_order_identity({**intent, "_external_config_hash": cfg.config_hash})
+    first = _reserve_daily_notional(
+        conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id=client_order_id,
+        intent=intent, now=NOW,
+    )
+    second = _reserve_daily_notional(
+        conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id=client_order_id,
+        intent=intent, now=NOW,
+    )
+    assert first["client_order_id"] == second["client_order_id"]
+    assert Decimal(str(first["reserved_notional_usd"])) == Decimal(str(second["reserved_notional_usd"])) == Decimal("80")
+    reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
+    assert repo.sum_external_daily_reserved_notional(conn, FINGERPRINT, reservation_date) == Decimal("80")
+
+
+def test_broker_rejection_releases_daily_reservation():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), _RejectingRuntime()
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="rejected order", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_REJECTED
+    reservation = repo.load_external_daily_reservation(conn, preview["client_order_id"])
+    assert reservation["state"] == "RELEASED"
+
+
+def test_ambiguous_submission_marks_reservation_reconciliation_required():
+    """Complements `test_ambiguous_submission_is_repaired_by_lookup_without_
+    resubmit` and `test_authoritative_not_found_allows_one_explicit_retry`,
+    which already prove a blind resubmit is blocked while ambiguous — this
+    proves the daily reservation itself also stays held (not released) and
+    keeps counting against the account's cap until reconciliation resolves
+    it."""
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    reservation = repo.load_external_daily_reservation(conn, preview["client_order_id"])
+    assert reservation["state"] == "RECONCILIATION_REQUIRED"
+    reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
+    assert repo.sum_external_daily_reserved_notional(conn, FINGERPRINT, reservation_date) == Decimal("80")
+
+
+def test_submission_without_baseline_fails_closed():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )  # deliberately no activate_external_reconciliation_baseline call
+    with pytest.raises(ExternalPaperError) as excinfo:
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+            operator="alice", reason="no baseline activated", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "RECONCILIATION_BASELINE_MISSING"
+    assert runtime.submit_calls == 0
+
+
+def test_reconciliation_does_not_auto_create_missing_baseline():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview = preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    outcome = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert outcome["critical"] == 1
+    assert "RECONCILIATION_BASELINE_MISSING" in outcome["statuses"]
+    assert repo.load_external_reconciliation_baseline(conn, "BASELINE") is None
+
+
+def test_baseline_requires_operator_review_after_prior_external_activity():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    with pytest.raises(ExternalPaperError) as excinfo:
+        activate_external_reconciliation_baseline(
+            conn, book_id="BASELINE", operator="alice", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "BASELINE_REQUIRES_OPERATOR_REVIEW"
+    assert repo.load_external_reconciliation_baseline(conn, "BASELINE") is None
+
+
+def test_baseline_account_fingerprint_mismatch_fails_closed():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    repo.save_external_reconciliation_baseline(conn, {
+        "book_id": "BASELINE", "snapshot_timestamp": NOW.isoformat(),
+        "account_fingerprint": "acct_deadbeefdeadbeefdeadbeefdeadbeef",
+        "local_settled_cash_usd": "100000", "local_positions_json": "{}",
+        "broker_cash_usd": "100000", "broker_positions_json": "{}",
+        "source_environment": "paper", "config_hash": cfg.config_hash, "created_at": NOW.isoformat(),
+    })
+    preview = preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    with pytest.raises(ExternalPaperError) as excinfo:
+        submit_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+            operator="alice", reason="baseline fingerprint mismatch", runtime=runtime, config=cfg,
+            clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "ACCOUNT_FINGERPRINT_MISMATCH"
+    assert runtime.submit_calls == 0
