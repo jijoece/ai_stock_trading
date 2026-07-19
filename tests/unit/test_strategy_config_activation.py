@@ -32,6 +32,7 @@ _BASE = {
         "maximum_candidates_per_strategy": 5, "maximum_combined_shortlist": 10,
         "maximum_symbols_to_research_per_day": 3, "maximum_fresh_research_cycles_per_day": 3,
         "minimum_signal_strength_for_research": 0.0,
+        "maximum_symbol_allocation_fraction": 0.08, "minimum_candidate_allocation_fraction": 0.01,
     },
 }
 

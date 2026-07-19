@@ -113,6 +113,8 @@ class ShortlistConfig:
     maximum_symbols_to_research_per_day: int
     maximum_fresh_research_cycles_per_day: int
     minimum_signal_strength_for_research: float
+    maximum_symbol_allocation_fraction: float
+    minimum_candidate_allocation_fraction: float
     configuration_hash: str
 
     def __post_init__(self) -> None:
@@ -122,6 +124,13 @@ class ShortlistConfig:
                 raise StrategyConfigError(f"shortlist.{name} must be > 0")
         if not (0.0 <= self.minimum_signal_strength_for_research <= 1.0):
             raise StrategyConfigError("shortlist.minimum_signal_strength_for_research must be within [0.0, 1.0]")
+        if not (0.0 < self.maximum_symbol_allocation_fraction <= 1.0):
+            raise StrategyConfigError("shortlist.maximum_symbol_allocation_fraction must be within (0.0, 1.0]")
+        if not (0.0 < self.minimum_candidate_allocation_fraction <= self.maximum_symbol_allocation_fraction):
+            raise StrategyConfigError(
+                "shortlist.minimum_candidate_allocation_fraction must be within "
+                "(0.0, maximum_symbol_allocation_fraction]"
+            )
 
 
 @dataclass(frozen=True)
@@ -202,7 +211,8 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
     sl = raw["shortlist"] or {}
     required_sl = {"maximum_candidates_per_strategy", "maximum_combined_shortlist",
                    "maximum_symbols_to_research_per_day", "maximum_fresh_research_cycles_per_day",
-                   "minimum_signal_strength_for_research"}
+                   "minimum_signal_strength_for_research", "maximum_symbol_allocation_fraction",
+                   "minimum_candidate_allocation_fraction"}
     missing_sl = required_sl - sl.keys()
     if missing_sl:
         raise StrategyConfigError(f"strategy config shortlist missing keys: {sorted(missing_sl)}")
@@ -257,6 +267,8 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
             maximum_symbols_to_research_per_day=int(sl["maximum_symbols_to_research_per_day"]),
             maximum_fresh_research_cycles_per_day=int(sl["maximum_fresh_research_cycles_per_day"]),
             minimum_signal_strength_for_research=float(sl["minimum_signal_strength_for_research"]),
+            maximum_symbol_allocation_fraction=float(sl["maximum_symbol_allocation_fraction"]),
+            minimum_candidate_allocation_fraction=float(sl["minimum_candidate_allocation_fraction"]),
             configuration_hash=_sub_hash(raw, "shortlist"),
         ),
         config_hash=hash_config(raw),

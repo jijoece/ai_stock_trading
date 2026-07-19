@@ -1399,6 +1399,17 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     "paper_book_exit_decisions": {
         "partial_stage_id": "INTEGER",
     },
+    # Milestone 24 Part C1/C2: backtest identity must include the signal set,
+    # not just the run configuration, and a strategy backtest must record
+    # which single strategy version/config it ran so mixed-definition runs
+    # are traceable after the fact.
+    "backtest_runs": {
+        "input_hash": "TEXT",
+        "signal_set_hash": "TEXT",
+        "strategy_id": "TEXT",
+        "strategy_version": "TEXT",
+        "strategy_config_hash": "TEXT",
+    },
     "paper_soak_operator_runs": {
         "cross_book_verification_id": "TEXT",
         "cross_book_verification_status": "TEXT",

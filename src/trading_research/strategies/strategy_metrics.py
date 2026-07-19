@@ -5,6 +5,16 @@ point-in-time-safe output of the shared `backtesting.engine` — and reports
 the minimum metric set required before any strategy's signals are allowed
 to seed a paper candidate. Every value here is arithmetic over already
 computed, persisted fills and rejections; zero LLM calls.
+
+Metric definitions (Milestone 24 Part C4):
+- `exposure`: fraction of test-session days with an open position, counting
+  both completed trades and any position still open at the end of the test.
+- `time_to_fill_sessions`: trading-session gap (not calendar days) between
+  signal generation and fill — a weekend counts as one session step.
+- `profit_factor`: gross profit / gross loss; `None` when there are no
+  losing trades (an undefined ratio, never a nonfinite JSON number).
+- realized P/L and cost basis both include the entry (BUY) fee exactly
+  once, charged at trade open; each exit's own fee is added on top.
 """
 from __future__ import annotations
 
@@ -48,10 +58,14 @@ class StrategyBacktestMetrics:
     by_regime: dict = field(default_factory=dict)
 
 
-def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[Trade, ...]:
+def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[tuple[Trade, ...], tuple[dict, ...]]:
     """One open lot per symbol at a time (the shared engine enforces this),
     so a BUY opens a trade and the SELL(s) that bring its remaining
-    quantity to zero close it."""
+    quantity to zero close it. The entry (BUY) fee is charged once, at
+    open, into `realized_pnl` and into cost basis (Milestone 24 Part C4) —
+    a partial exit's SELL fee is added on top of that, never replacing it.
+    Any lot still open at the end of the test (no closing SELL yet) is
+    returned separately so callers can still count its exposure days."""
     trades: list[Trade] = []
     open_lot: dict[str, dict] = {}
     ordered = sorted(fills, key=lambda f: (f.symbol, f.market_date, 0 if f.side == "BUY" else 1))
@@ -59,8 +73,9 @@ def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[Trade, ...]:
         if fill.side == "BUY":
             open_lot[fill.symbol] = {
                 "entry_price": fill.fill_price, "entry_date": fill.market_date,
+                "entry_fee": fill.fees,
                 "original_quantity": fill.quantity, "remaining_quantity": fill.quantity,
-                "realized_pnl": Decimal("0"), "exit_reason": None, "exit_date": fill.market_date,
+                "realized_pnl": -fill.fees, "exit_reason": None, "exit_date": fill.market_date,
             }
             continue
         lot = open_lot.get(fill.symbol)
@@ -71,7 +86,7 @@ def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[Trade, ...]:
         lot["exit_reason"] = fill.exit_reason
         lot["exit_date"] = fill.market_date
         if lot["remaining_quantity"] <= 0:
-            cost_basis = lot["entry_price"] * lot["original_quantity"]
+            cost_basis = lot["entry_price"] * lot["original_quantity"] + lot["entry_fee"]
             trades.append(Trade(
                 symbol=fill.symbol, entry_date=lot["entry_date"], exit_date=lot["exit_date"],
                 entry_price=lot["entry_price"], quantity=lot["original_quantity"],
@@ -81,7 +96,7 @@ def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[Trade, ...]:
                 exit_reason=lot["exit_reason"],
             ))
             del open_lot[fill.symbol]
-    return tuple(trades)
+    return tuple(trades), tuple(open_lot.values())
 
 
 def _median(values: list[Decimal]) -> Decimal | None:
@@ -99,12 +114,11 @@ def _trade_metrics(trades: tuple[Trade, ...]) -> dict:
     losses = [t for t in trades if t.realized_pnl < 0]
     gross_profit = sum((t.realized_pnl for t in wins), Decimal("0"))
     gross_loss = -sum((t.realized_pnl for t in losses), Decimal("0"))
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = Decimal("Infinity")
-    else:
-        profit_factor = None
+    # Milestone 24 Part C4: profit_factor must stay JSON-serializable. With
+    # no losing trades the ratio is undefined (division by zero), not
+    # infinite — represented as `None` rather than a nonfinite Decimal that
+    # `json.dumps` cannot encode.
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
     return {
         "number_of_trades": n,
         "win_rate": (Decimal(len(wins)) / n) if n else None,
@@ -122,26 +136,45 @@ def compute_strategy_metrics(
     *,
     regime_by_date: dict | None = None,
 ) -> StrategyBacktestMetrics:
-    trades = _reconstruct_trades(result.fills)
+    trades, open_lots = _reconstruct_trades(result.fills)
     buy_fills = {f.order_id: f for f in result.fills if f.side == "BUY"}
     signal_by_id = {s.signal_id: s for s in entry_signals}
 
-    time_to_fill_days: list[int] = []
+    # Milestone 24 Part C4: true trading-session gap, not calendar days — a
+    # weekend between signal generation and fill must count as one session
+    # step, not three calendar days.
+    session_dates = {state.market_date for state in result.daily_states}
+    ordered_sessions = sorted(session_dates)
+    session_position = {d: i for i, d in enumerate(ordered_sessions)}
+    import bisect
+    time_to_fill_sessions: list[int] = []
     for order_id, fill in buy_fills.items():
         signal_id = order_id[len("bt-order-"):]
         signal = signal_by_id.get(signal_id)
-        if signal is not None:
-            time_to_fill_days.append((fill.market_date - signal.generated_after_session).days)
-    time_to_fill = (Decimal(sum(time_to_fill_days)) / len(time_to_fill_days)) if time_to_fill_days else None
+        if signal is not None and fill.market_date in session_position:
+            # Index of the last session at/before the signal's own
+            # generation session (normally that session itself).
+            generation_index = bisect.bisect_right(ordered_sessions, signal.generated_after_session) - 1
+            if generation_index >= 0:
+                time_to_fill_sessions.append(session_position[fill.market_date] - generation_index)
+    time_to_fill = (
+        Decimal(sum(time_to_fill_sessions)) / len(time_to_fill_sessions)
+    ) if time_to_fill_sessions else None
 
     number_of_signals = len(entry_signals)
     unfilled_count = sum(1 for row in result.rejected_entries if row["reason"] in _UNFILLED_REASONS)
     percentage_unfilled = (Decimal(unfilled_count) / number_of_signals) if number_of_signals else Decimal("0")
 
-    session_dates = {state.market_date for state in result.daily_states}
-    days_with_position = len({
-        d for t in trades for d in session_dates if t.entry_date <= d <= t.exit_date
-    })
+    # Milestone 24 Part C4: exposure must count both completed trades and
+    # any position still open at the end of the test — a strategy that was
+    # in the market on the final day was still exposed that day.
+    final_date = max(session_dates) if session_dates else None
+    closed_days = {d for t in trades for d in session_dates if t.entry_date <= d <= t.exit_date}
+    open_days = {
+        d for lot in open_lots for d in session_dates
+        if final_date is not None and lot["entry_date"] <= d <= final_date
+    }
+    days_with_position = len(closed_days | open_days)
     total_days = len(result.daily_states)
     exposure = (Decimal(days_with_position) / total_days) if total_days else Decimal("0")
 

@@ -41,12 +41,22 @@ class EntrySignal:
     generated_after_session: date
     limit_price: Decimal
     quantity_hint: Decimal
+    initial_stop_reference: Decimal | None = None
+    target_reference: Decimal | None = None
+    maximum_holding_sessions: int | None = None
+    strategy_signal_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.limit_price <= 0 or self.quantity_hint <= 0:
             raise BacktestError("entry signal price and quantity must be positive")
         if self.quantity_hint != self.quantity_hint.to_integral_value():
             raise BacktestError("backtests support whole-share signals only")
+        if self.initial_stop_reference is not None and self.initial_stop_reference <= 0:
+            raise BacktestError("entry signal initial_stop_reference must be positive")
+        if self.target_reference is not None and self.target_reference <= 0:
+            raise BacktestError("entry signal target_reference must be positive")
+        if self.maximum_holding_sessions is not None and self.maximum_holding_sessions <= 0:
+            raise BacktestError("entry signal maximum_holding_sessions must be positive")
 
 
 @dataclass(frozen=True)
