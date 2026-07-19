@@ -468,12 +468,56 @@ else:
 
 
 def test_oversize_schema_rejected(tmp_path):
+    # The byte limit is now enforced against the normalized *transport*
+    # schema, before it is ever written to disk — a more precisely
+    # attributed failure than the old write-time CODEX_SCHEMA_REJECTED path
+    # (`_write_temp_schema`'s own byte check remains as defense in depth but
+    # is unreachable in this flow since the transport-level check runs first
+    # against the identical byte count).
     binary, _ = _normal_fake(tmp_path)
     huge_schema_request = _request()
     provider = CodexResearchProvider(_config(tmp_path, binary, maximum_schema_bytes=5))
     with pytest.raises(ProviderUnavailableError) as exc_info:
         provider.generate_structured(huge_schema_request)
-    assert exc_info.value.code == "CODEX_SCHEMA_REJECTED"
+    assert exc_info.value.code == "CODEX_TRANSPORT_SCHEMA_UNSUPPORTED"
+
+
+def test_transport_schema_written_to_disk_not_canonical_schema(tmp_path):
+    """The file passed via `--output-schema` must be the Codex-compatible
+    transport schema (bound keywords stripped, all properties required) —
+    never the canonical schema directly."""
+    captured_schema = tmp_path / "captured-schema.json"
+    binary = _fake_binary(tmp_path, f"""
+import json, pathlib, sys
+args = sys.argv[1:]
+{_PREFLIGHT_STANZA}
+if args[:1] == ["exec"]:
+    schema_path = args[args.index("--output-schema") + 1]
+    pathlib.Path({str(captured_schema)!r}).write_text(pathlib.Path(schema_path).read_text())
+    sys.stdin.read()
+    print(json.dumps({{"type": "thread.started", "thread_id": "t"}}))
+    print(json.dumps({{"type": "turn.started"}}))
+    print(json.dumps({{"type": "item.completed", "item": {{"id": "item_0", "type": "agent_message", "text": json.dumps({{"value": "ok"}})}}}}))
+    print(json.dumps({{"type": "turn.completed", "usage": {{"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0, "reasoning_output_tokens": 0}}}}))
+    sys.exit(0)
+sys.exit(1)
+""")
+    CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
+    written = json.loads(captured_schema.read_text())
+    assert "maxLength" not in json.dumps(written)
+    assert written["required"] == ["value"]
+    assert written["additionalProperties"] is False
+
+
+def test_response_passing_transport_schema_but_failing_canonical_is_rejected(tmp_path):
+    """A response that satisfies the broader transport schema (e.g. a
+    string longer than the canonical maxLength, which transport no longer
+    bounds) must still be rejected by canonical post-response validation and
+    never persisted as a successful role report."""
+    oversized_value = "y" * 100  # canonical SCHEMA bounds `value` to maxLength 20
+    binary, _ = _normal_fake(tmp_path, structured={"value": oversized_value})
+    with pytest.raises(SchemaValidationError):
+        CodexResearchProvider(_config(tmp_path, binary)).generate_structured(_request())
 
 
 # --- JSONL parsing -----------------------------------------------------------

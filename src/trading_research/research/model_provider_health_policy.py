@@ -60,6 +60,7 @@ STRUCTURAL_MODEL_PROVIDER_FAILURE_CODES = frozenset(
         "CODEX_INVALID_CONFIGURATION",
         # Schema / CLI contract rejection
         "CODEX_SCHEMA_REJECTED",
+        "CODEX_TRANSPORT_SCHEMA_UNSUPPORTED",
         "CLAUDE_CODE_SCHEMA_REJECTED",
         "CLAUDE_CODE_LOCAL_SCHEMA_FAILED",
         # Missing required usage metadata

@@ -10,6 +10,7 @@ __pycache__/
 # Generated research artifacts (contain third-party content / run-specific data)
 data/*.sqlite3
 data/*.sqlite3-*
+data/reddit_free_cache/
 research-input/*.json
 research-input/*.md
 !research-input/.gitkeep

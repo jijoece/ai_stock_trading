@@ -49,6 +49,7 @@ from .bounded_subprocess import (
 )
 from .codex_failure_classifier import classify_codex_diagnostic
 from .codex_jsonl_adapter import parse_codex_jsonl
+from .codex_schema_transport import build_codex_transport_schema, transport_schema_byte_size
 from .codex_version_policy import (
     MINIMUM_SUPPORTED_VERSION,
     CodexVersionParseError,
@@ -456,9 +457,14 @@ class CodexResearchProvider:
         return value
 
     def generate_structured(self, request: ResearchModelRequest) -> ResearchModelResponse:
+        # Canonical schema: validated as-is, and the ONLY schema the parsed
+        # response is ever checked against (see `validate_against_schema`
+        # below). Never sent to Codex directly — Codex's structured-output
+        # validator rejects constructs (bound keywords, partially-required
+        # object nodes) that the canonical schema legitimately uses.
         schema = dict(request.json_schema)
         try:
-            schema_text = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         except (TypeError, ValueError) as exc:
             raise ProviderUnavailableError(
                 "Research JSON Schema is not serializable", code="CODEX_SCHEMA_REJECTED", retryable=False,
@@ -469,6 +475,25 @@ class CodexResearchProvider:
             raise ProviderUnavailableError(
                 "Research JSON Schema is invalid", code="CODEX_SCHEMA_REJECTED", retryable=False,
             ) from exc
+
+        # Transport schema: a Codex-compatible, possibly-broader rewrite of
+        # the canonical schema (`codex_schema_transport.py`). This is the
+        # only schema ever written to disk and passed to `--output-schema`.
+        transport_schema = build_codex_transport_schema(schema)
+        try:
+            Draft7Validator.check_schema(transport_schema)
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                "Codex transport schema is not valid Draft-07 JSON Schema",
+                code="CODEX_TRANSPORT_SCHEMA_UNSUPPORTED", retryable=False,
+            ) from exc
+        if transport_schema_byte_size(transport_schema) > self._config.maximum_schema_bytes:
+            raise ProviderUnavailableError(
+                "Codex transport schema exceeds the configured byte limit",
+                code="CODEX_TRANSPORT_SCHEMA_UNSUPPORTED", retryable=False,
+            )
+        schema_text = json.dumps(transport_schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
         prompt = self._prompt_envelope(request)
         if len(prompt) > self._config.maximum_prompt_bytes:
             raise ProviderUnavailableError(
