@@ -30,7 +30,19 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _load_config_or_error():
+def _load_config_or_error(config_path: str | Path | None = None):
+    """Loads `config/paper_books.yaml` by default. `config_path`, when given,
+    is an operator-supplied override that must be an existing regular file —
+    an explicit override that fails validation is never silently replaced by
+    the tracked default (fail closed, not fail open)."""
+    if config_path is not None:
+        resolved = Path(config_path)
+        if not resolved.is_file():
+            return None, f"--paper-books-config path does not exist or is not a regular file: {resolved}"
+        try:
+            return load_paper_books_config(resolved), None
+        except PaperBooksConfigError as exc:
+            return None, str(exc)
     try:
         return load_paper_books_config(), None
     except PaperBooksConfigError as exc:
@@ -108,8 +120,10 @@ def paper_book_snapshot_cli(db_path: Path, book_id: str, as_of: datetime) -> dic
         }
 
 
-def paper_book_reconcile_cli(db_path: Path, book_id: str, as_of: datetime | None = None) -> dict:
-    cfg, error = _load_config_or_error()
+def paper_book_reconcile_cli(
+    db_path: Path, book_id: str, as_of: datetime | None = None, config_path: str | Path | None = None,
+) -> dict:
+    cfg, error = _load_config_or_error(config_path)
     if error:
         return {"error": error}
     if not cfg.enabled:
@@ -126,15 +140,16 @@ def paper_book_reconcile_cli(db_path: Path, book_id: str, as_of: datetime | None
 def paper_book_run_cycle_cli(
     db_path: Path, *, cycle_id: str, experiment_policy: str, symbol: str, quantity_hint: str,
     reference_price: str, bid: str, ask: str, recommendation_id_baseline: str | None = None,
-    recommendation_id_enhanced: str | None = None,
+    recommendation_id_enhanced: str | None = None, config_path: str | Path | None = None,
 ) -> dict:
     """Fixture-mode, single-symbol, book-aware cycle: builds a snapshot,
     evaluates deterministic risk, builds/persists an order intent, and
     submits it to the local-simulated fill engine for every book the
     experiment policy (and its own explicit enablement) allows. Never
     invokes Claude, never fetches real evidence — this is the offline,
-    provider-mode=fixture path only."""
-    cfg, error = _load_config_or_error()
+    provider-mode=fixture path only. `config_path` is an optional explicit
+    operator-supplied override of the tracked `config/paper_books.yaml`."""
+    cfg, error = _load_config_or_error(config_path)
     if error:
         return {"error": error}
     if not cfg.enabled:
@@ -260,7 +275,9 @@ def paper_promotion_status_cli(
         }
 
 
-def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_policy: str) -> dict:
+def paper_book_integrate_cycle_cli(
+    db_path: Path, *, cycle_id: str, experiment_policy: str, config_path: str | Path | None = None,
+) -> dict:
     """`paper-book-integrate-cycle` (docs/milestone-8.1.md Step 11): loads an
     ACTUAL persisted scheduled-research-cycle (never a fixture recommendation)
     and drives it through the isolated paper books. Fails closed with an
@@ -268,8 +285,10 @@ def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_p
     `paper_books.scheduled_integration.enabled` is false, or the cycle_id is
     unknown. Returns sanitized, deterministic, structured JSON only — no raw
     Claude prompt/response content ever appears here (this function never
-    touches `research_committee_reports`/model request-response tables)."""
-    cfg, error = _load_config_or_error()
+    touches `research_committee_reports`/model request-response tables).
+    `config_path` is an optional explicit operator-supplied override of the
+    tracked `config/paper_books.yaml`."""
+    cfg, error = _load_config_or_error(config_path)
     if error:
         return {"error": error}
     if not cfg.enabled:
@@ -307,6 +326,7 @@ def paper_book_integrate_cycle_cli(db_path: Path, *, cycle_id: str, experiment_p
 
 def paper_book_lifecycle_run_cli(
     db_path: Path, *, as_of: datetime, integrate_cycle_ids: tuple[str, ...] = (), audit_time_now: bool = False,
+    config_path: str | Path | None = None,
 ) -> dict:
     """`paper-book-lifecycle-run` (docs/milestone-9.md Section 11; clock
     semantics corrected in Milestone 9.1 Section 5). Fails closed with an
@@ -327,8 +347,10 @@ def paper_book_lifecycle_run_cli(
     `created_at` audit metadata, never market-day calculations, order
     eligibility, price selection, holding-period calculation, snapshot
     `as_of`, or exit-decision effective date, all of which remain keyed to
-    `as_of` unconditionally inside `run_paper_book_lifecycle` itself."""
-    cfg, error = _load_config_or_error()
+    `as_of` unconditionally inside `run_paper_book_lifecycle` itself.
+    `config_path` is an optional explicit operator-supplied override of the
+    tracked `config/paper_books.yaml`."""
+    cfg, error = _load_config_or_error(config_path)
     if error:
         return {"error": error}
     if not cfg.enabled:
