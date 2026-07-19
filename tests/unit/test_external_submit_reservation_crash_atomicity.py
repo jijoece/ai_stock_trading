@@ -89,7 +89,7 @@ def _config():
         scheduled_integration=ScheduledIntegrationSection(False), config_hash="cfg-m11", raw={},
         external_broker=ExternalBrokerSection(
             True, "alpaca_paper", True, ("BASELINE",), True, 300,
-            Decimal("100"), ("limit",), ("day",), 1,
+            Decimal("100"), Decimal("300"), ("limit",), ("day",), 1,
         ),
     )
 

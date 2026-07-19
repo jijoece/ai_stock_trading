@@ -1629,6 +1629,35 @@ def list_external_reconciliations(
     return result
 
 
+def save_external_reconciliation_baseline(conn: sqlite3.Connection, record: dict, *, commit: bool = True) -> bool:
+    """INSERT OR IGNORE so the baseline is captured exactly once per book —
+    a later call with a different snapshot is silently discarded, never
+    overwriting the original activation-time reference point."""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_reconciliation_baseline "
+        "(book_id, snapshot_timestamp, account_fingerprint, local_settled_cash_usd, local_positions_json, "
+        "broker_cash_usd, broker_positions_json, source_environment, config_hash, created_at) "
+        "VALUES (:book_id, :snapshot_timestamp, :account_fingerprint, :local_settled_cash_usd, "
+        ":local_positions_json, :broker_cash_usd, :broker_positions_json, :source_environment, "
+        ":config_hash, :created_at)",
+        record,
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def load_external_reconciliation_baseline(conn: sqlite3.Connection, book_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_external_reconciliation_baseline WHERE book_id = ?", (book_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["local_positions"] = {k: v for k, v in json.loads(item.pop("local_positions_json")).items()}
+    item["broker_positions"] = {k: v for k, v in json.loads(item.pop("broker_positions_json")).items()}
+    return item
+
+
 def enqueue_external_submission(
     conn: sqlite3.Connection, *, queue_id: str, book_id: str, paper_order_intent_id: str,
     source: str, created_at: str,
