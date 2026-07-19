@@ -15,6 +15,7 @@ from .config import MomentumBreakoutConfig
 from .contracts import StrategyContext, StrategyMarketData, StrategySignal, StrategyStatus
 from .factors import average_true_range, closes, prior_high, sma_slope, volume_ratio
 from .safety_gates import classify_safety_status
+from .timestamps import bar_series_data_as_of
 
 STRATEGY_ID = "momentum_breakout"
 STRATEGY_VERSION = "1.0.0"
@@ -43,6 +44,10 @@ class MomentumBreakoutStrategy:
             return self._signal(symbol, context.now, status, 0.0, reasons, {})
 
         bars = market_data.bars
+        data_as_of, future_reason = bar_series_data_as_of(bars, context.now)
+        if future_reason is not None:
+            return self._signal(symbol, context.now, StrategyStatus.INCOMPLETE, 0.0, (future_reason,), {})
+
         close_series = closes(bars)
         latest_close = close_series[-1]
 
@@ -55,12 +60,12 @@ class MomentumBreakoutStrategy:
         if breakout_level is None or vol_ratio is None or trend_slope is None or atr is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
-                ("insufficient_factor_history",), {},
+                ("insufficient_factor_history",), {}, data_as_of=data_as_of,
             )
         if relative_strength is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
-                ("missing_relative_strength",), {},
+                ("missing_relative_strength",), {}, data_as_of=data_as_of,
             )
 
         breakout_confirmed = latest_close > breakout_level
@@ -95,7 +100,8 @@ class MomentumBreakoutStrategy:
         )
         if not eligible:
             return self._signal(symbol, context.now,
-                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values)
+                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values,
+                                 data_as_of=data_as_of)
 
         signal_strength = self._signal_strength(
             extension_percent, cfg.maximum_breakout_extension_percent,
@@ -109,7 +115,7 @@ class MomentumBreakoutStrategy:
             symbol, context.now, StrategyStatus.ELIGIBLE, signal_strength, reasons, factor_values,
             entry_reference=entry, limit_reference=entry, invalidation_price=stop,
             initial_stop_reference=stop, target_reference=None,
-            expected_holding_period=cfg.maximum_holding_days,
+            expected_holding_period=cfg.maximum_holding_days, data_as_of=data_as_of,
         )
 
     @staticmethod
@@ -147,6 +153,7 @@ class MomentumBreakoutStrategy:
         initial_stop_reference: Decimal | None = None,
         target_reference: Decimal | None = None,
         expected_holding_period: int | None = None,
+        data_as_of: datetime | None = None,
     ) -> StrategySignal:
         data_quality = "complete" if status == StrategyStatus.ELIGIBLE or status == StrategyStatus.NOT_ELIGIBLE else status.value.lower()
         return StrategySignal(
@@ -154,7 +161,7 @@ class MomentumBreakoutStrategy:
             strategy_version=self.strategy_version,
             symbol=symbol,
             signal_timestamp=now if now.tzinfo else now.replace(tzinfo=timezone.utc),
-            data_as_of=now,
+            data_as_of=data_as_of,
             status=status,
             signal_strength=signal_strength,
             entry_reference=entry_reference,

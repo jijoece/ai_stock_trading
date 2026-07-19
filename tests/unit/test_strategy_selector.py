@@ -1,4 +1,5 @@
 import ast
+from datetime import timedelta
 from decimal import Decimal
 
 from trading_research.models.trading_models import PortfolioState
@@ -11,12 +12,17 @@ from tests.unit._strategy_test_helpers import NOW
 SHORTLIST_CONFIG = load_strategy_config().shortlist
 
 
-def _signal(symbol: str, strength: float, status: StrategyStatus = StrategyStatus.ELIGIBLE, strategy_id: str = "momentum_breakout") -> StrategySignal:
+def _signal(
+    symbol: str, strength: float, status: StrategyStatus = StrategyStatus.ELIGIBLE,
+    strategy_id: str = "momentum_breakout", data_as_of=NOW,
+) -> StrategySignal:
+    entry = Decimal("100") if status == StrategyStatus.ELIGIBLE else None
+    stop = Decimal("95") if status == StrategyStatus.ELIGIBLE else None
     return StrategySignal(
         strategy_id=strategy_id, strategy_version="1.0.0", symbol=symbol,
-        signal_timestamp=NOW, data_as_of=NOW, status=status, signal_strength=strength,
-        entry_reference=None, limit_reference=None, invalidation_price=None,
-        initial_stop_reference=None, target_reference=None, expected_holding_period=10,
+        signal_timestamp=NOW, data_as_of=data_as_of, status=status, signal_strength=strength,
+        entry_reference=entry, limit_reference=entry, invalidation_price=stop,
+        initial_stop_reference=stop, target_reference=None, expected_holding_period=10,
         reason_codes=("ok",), factor_values={"x": 1.0}, data_quality="complete",
         configuration_hash="cfgabc",
     )
@@ -67,6 +73,19 @@ def test_portfolio_concentration_filter_excludes_overexposed_account():
     result = select_shortlist(signals, SHORTLIST_CONFIG, portfolio=portfolio)
     assert result.entries == ()
     assert result.excluded[0].reason == "portfolio_concentration_limit"
+
+
+def test_freshness_tie_break_prefers_newer_data_as_of():
+    """Milestone 24 Part B2: two otherwise-identical eligible signals (same
+    strength, same data_quality) for different symbols — the one with the
+    newer `data_as_of` must rank ahead in the combined shortlist."""
+    from dataclasses import replace
+    config = replace(SHORTLIST_CONFIG, maximum_candidates_per_strategy=10, maximum_combined_shortlist=1)
+    older = _signal("OLD", 0.7, data_as_of=NOW - timedelta(days=1))
+    newer = _signal("NEW", 0.7, data_as_of=NOW)
+    signals = {"momentum_breakout": (older, newer)}
+    result = select_shortlist(signals, config)
+    assert result.symbols == ("NEW",)
 
 
 def test_zero_llm_calls_during_scanning():

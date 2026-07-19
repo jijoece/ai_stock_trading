@@ -1,5 +1,6 @@
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -9,6 +10,7 @@ from trading_research.strategies.contracts import (
     StrategyMarketData,
     StrategySignal,
     StrategyStatus,
+    derive_canonical_strategy_signal_id,
 )
 
 from tests.unit._strategy_test_helpers import build_bars, passing_screening_result
@@ -25,10 +27,10 @@ def make_signal(**overrides) -> StrategySignal:
         data_as_of=NOW,
         status=StrategyStatus.ELIGIBLE,
         signal_strength=0.5,
-        entry_reference=None,
-        limit_reference=None,
-        invalidation_price=None,
-        initial_stop_reference=None,
+        entry_reference=Decimal("100"),
+        limit_reference=Decimal("100"),
+        invalidation_price=Decimal("95"),
+        initial_stop_reference=Decimal("95"),
         target_reference=None,
         expected_holding_period=20,
         reason_codes=("breakout_confirmed",),
@@ -80,3 +82,67 @@ def test_market_data_bars_must_be_ordered_oldest_to_newest():
 def test_context_requires_timezone_aware_now():
     with pytest.raises(StrategyContractError):
         StrategyContext(now=datetime(2026, 7, 11), screening_result=passing_screening_result())
+
+
+def test_eligible_signal_requires_positive_entry_and_stop_fields():
+    with pytest.raises(StrategyContractError):
+        make_signal(entry_reference=None)
+    with pytest.raises(StrategyContractError):
+        make_signal(initial_stop_reference=None)
+    with pytest.raises(StrategyContractError):
+        make_signal(invalidation_price=None)
+    with pytest.raises(StrategyContractError):
+        make_signal(data_as_of=None)
+
+
+def test_eligible_signal_stop_must_be_below_entry():
+    with pytest.raises(StrategyContractError):
+        make_signal(entry_reference=Decimal("100"), initial_stop_reference=Decimal("100"))
+    with pytest.raises(StrategyContractError):
+        make_signal(entry_reference=Decimal("100"), initial_stop_reference=Decimal("105"))
+
+
+def test_eligible_signal_target_must_exceed_entry_when_present():
+    with pytest.raises(StrategyContractError):
+        make_signal(entry_reference=Decimal("100"), target_reference=Decimal("100"))
+    with pytest.raises(StrategyContractError):
+        make_signal(entry_reference=Decimal("100"), target_reference=Decimal("90"))
+    # A valid target above entry is fine.
+    signal = make_signal(entry_reference=Decimal("100"), target_reference=Decimal("110"))
+    assert signal.target_reference == Decimal("110")
+
+
+def test_non_eligible_signal_may_omit_execution_fields():
+    signal = make_signal(
+        status=StrategyStatus.NOT_ELIGIBLE, entry_reference=None, limit_reference=None,
+        invalidation_price=None, initial_stop_reference=None, data_as_of=None,
+    )
+    assert signal.status == StrategyStatus.NOT_ELIGIBLE
+
+
+def test_identical_signals_produce_identical_canonical_ids():
+    """Milestone 24 Part B7."""
+    a = make_signal()
+    b = make_signal()
+    assert derive_canonical_strategy_signal_id(a) == derive_canonical_strategy_signal_id(b)
+
+
+def test_canonical_id_changes_when_execution_relevant_factors_change():
+    base = make_signal()
+    base_id = derive_canonical_strategy_signal_id(base)
+    variants = (
+        replace(base, entry_reference=Decimal("101")),
+        replace(base, limit_reference=Decimal("101")),
+        replace(base, initial_stop_reference=Decimal("90")),
+        replace(base, invalidation_price=Decimal("90")),
+        replace(base, target_reference=Decimal("120")),
+        replace(base, expected_holding_period=21),
+        replace(base, reason_codes=("breakout_confirmed", "volume_confirmed")),
+        replace(base, factor_values={"volume_ratio": 2.5}),
+        replace(base, configuration_hash="different-hash"),
+        replace(base, data_as_of=NOW.replace(hour=22)),
+        replace(base, status=StrategyStatus.NOT_ELIGIBLE, entry_reference=None, limit_reference=None,
+                invalidation_price=None, initial_stop_reference=None),
+    )
+    for variant in variants:
+        assert derive_canonical_strategy_signal_id(variant) != base_id

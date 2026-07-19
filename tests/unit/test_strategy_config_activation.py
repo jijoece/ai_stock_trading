@@ -25,7 +25,8 @@ _BASE = {
     "event_catalyst": {
         "enabled": True, "maximum_event_age_hours": 72.0, "minimum_volume_ratio": 1.5,
         "volume_lookback_days": 20, "maximum_gap_percent": 8.0, "confirmation_window_days": 3,
-        "maximum_holding_days": 15,
+        "maximum_holding_days": 15, "minimum_positive_response_percent": 1.0,
+        "atr_period": 14, "atr_stop_multiple": 2.0,
     },
     "shortlist": {
         "maximum_candidates_per_strategy": 5, "maximum_combined_shortlist": 10,

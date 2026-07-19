@@ -8,12 +8,11 @@ signal or raises a strategy's own numbers.
 """
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
-from .contracts import StrategySignal, StrategyStatus
+from .contracts import StrategySignal, StrategyStatus, derive_canonical_strategy_signal_id
 
 
 class StrategyExecutionBoundaryError(ValueError):
@@ -64,11 +63,10 @@ class StrategyOrderIntentContext:
 
 
 def derive_strategy_signal_id(signal: StrategySignal) -> str:
-    raw = (
-        f"{signal.strategy_id}:{signal.strategy_version}:{signal.symbol}:"
-        f"{signal.signal_timestamp.isoformat()}:{signal.configuration_hash}"
-    )
-    return "strat-sig-" + hashlib.sha256(raw.encode()).hexdigest()[:32]
+    """Milestone 24 Part B7: delegates to the single canonical derivation in
+    `contracts.py` — kept as a re-export here so existing call sites in this
+    module do not need to change."""
+    return derive_canonical_strategy_signal_id(signal)
 
 
 def build_strategy_order_intent_context(signal: StrategySignal) -> StrategyOrderIntentContext:

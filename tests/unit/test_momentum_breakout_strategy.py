@@ -102,3 +102,41 @@ def test_stale_data_is_stale():
     market_data = StrategyMarketData(symbol="TEST", bars=bars)
     signal = STRATEGY.evaluate("TEST", market_data, _context(stale_screening_result()))
     assert signal.status == StrategyStatus.STALE
+
+
+def test_data_as_of_is_derived_from_latest_bar_availability():
+    """Milestone 24 Part B1: data_as_of must reflect the actual source bar's
+    availability, never the evaluation clock (context.now) substituted in
+    its place."""
+    closes = _flat_then_breakout_closes()
+    volumes = [1_000_000] * (len(closes) - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(
+        symbol="TEST", bars=bars,
+        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+    )
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.ELIGIBLE
+    assert signal.data_as_of == bars[-1].available_at
+    assert signal.data_as_of != NOW
+
+
+def test_future_available_bar_is_rejected():
+    """A bar whose available_at is after context.now must never be used —
+    it would leak future information into a point-in-time decision."""
+    from dataclasses import replace
+    from datetime import timedelta
+
+    closes = _flat_then_breakout_closes()
+    volumes = [1_000_000] * (len(closes) - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    future_bar = replace(bars[-1], available_at=NOW + timedelta(days=1))
+    bars = bars[:-1] + (future_bar,)
+    market_data = StrategyMarketData(
+        symbol="TEST", bars=bars,
+        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+    )
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.INCOMPLETE
+    assert any("future_bar_available_at" in r for r in signal.reason_codes)
+    assert signal.data_as_of is None

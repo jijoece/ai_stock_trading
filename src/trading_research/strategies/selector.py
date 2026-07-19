@@ -34,10 +34,15 @@ class ShortlistResult:
         return tuple(e.symbol for e in self.entries)
 
 
-def _sort_key(signal: StrategySignal) -> tuple[float, int, str]:
+def _sort_key(signal: StrategySignal) -> tuple[float, int, float]:
+    """Milestone 24 Part B2: on a strength/quality tie, the *newer*
+    `data_as_of` must rank first. Sorting ascending on the negated epoch
+    timestamp achieves that (a larger/newer timestamp negates to a smaller
+    — earlier-sorting — value); a missing `data_as_of` sorts last, never
+    ahead of a signal with a known, verifiable freshness."""
     quality_rank = _DATA_QUALITY_RANK.get(signal.data_quality, 2)
-    data_as_of = signal.data_as_of.isoformat() if signal.data_as_of is not None else ""
-    return (-signal.signal_strength, quality_rank, data_as_of)
+    freshness_rank = -signal.data_as_of.timestamp() if signal.data_as_of is not None else float("inf")
+    return (-signal.signal_strength, quality_rank, freshness_rank)
 
 
 def _within_concentration_limit(portfolio: PortfolioState | None) -> bool:

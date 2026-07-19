@@ -32,6 +32,20 @@ def test_valid_oversold_setup_is_eligible():
     assert "rsi_oversold" in signal.reason_codes
 
 
+def test_mean_reversion_target_is_above_entry():
+    """Milestone 24 Part B5: the target must be the short-term mean, not the
+    long-term SMA (eligibility already requires latest_close > long-term
+    SMA, so using it as target always put the target below entry)."""
+    closes = _oversold_closes()
+    bars = build_bars(closes)
+    market_data = StrategyMarketData(symbol="TEST", bars=bars)
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.ELIGIBLE
+    assert signal.target_reference is not None
+    assert signal.target_reference > signal.entry_reference
+    assert float(signal.target_reference) == round(signal.factor_values["short_term_mean"], 4)
+
+
 def test_insufficient_deviation_is_not_eligible():
     # 224 bars of mild noise around 100 — a real (non-zero) but shallow stretch,
     # nowhere near the zscore_entry_threshold.
