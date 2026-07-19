@@ -17,8 +17,9 @@ from trading_research.paper_books.config import (
 )
 from trading_research.paper_books.external_broker import (
     STATE_FILLED, STATE_SUBMISSION_REQUESTED, STATE_UNKNOWN,
-    ExternalPaperError, derive_external_order_identity, preview_external_paper_order,
-    recover_stranded_submission, retry_external_paper_order, submit_external_paper_order,
+    ExternalPaperError, activate_external_reconciliation_baseline, derive_external_order_identity,
+    preview_external_paper_order, recover_stranded_submission, retry_external_paper_order,
+    submit_external_paper_order,
 )
 from trading_research.paper_books.models import PaperBookOrderIntent, PaperRiskDecision, RISK_APPROVED
 from trading_research.storage import paper_books_repositories as repo
@@ -174,6 +175,10 @@ def _strand_at_submission_requested(db_path, cfg) -> None:
     the connection (simulated process death)."""
     conn = connect(db_path)
     _seed(conn)
+    activate_external_reconciliation_baseline(
+        conn, book_id="BASELINE", operator="alice", runtime=_CrashBeforeBrokerCallRuntime(), config=cfg,
+        clock=lambda: NOW,
+    )
     preview = preview_external_paper_order(
         conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
         runtime=_CrashBeforeBrokerCallRuntime(), config=cfg, clock=lambda: NOW,
