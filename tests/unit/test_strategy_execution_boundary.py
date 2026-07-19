@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pytest
 
-from trading_research.strategies.contracts import StrategySignal, StrategyStatus
+from trading_research.strategies.contracts import StrategyContractError, StrategySignal, StrategyStatus
 from trading_research.strategies.execution_boundary import (
     OverlayDisposition,
     StrategyExecutionBoundaryError,
@@ -43,15 +43,16 @@ def test_non_eligible_signal_fails_closed():
 
 
 def test_eligible_signal_missing_stop_fails_closed():
-    signal = _eligible_signal(initial_stop_reference=None)
-    with pytest.raises(StrategyExecutionBoundaryError):
-        build_strategy_order_intent_context(signal)
+    # Milestone 24 Part B6: an ELIGIBLE signal missing its stop now fails
+    # closed at construction (StrategyContractError), one layer earlier
+    # than the execution boundary that used to be the only enforcer.
+    with pytest.raises(StrategyContractError):
+        _eligible_signal(initial_stop_reference=None)
 
 
 def test_eligible_signal_missing_invalidation_price_fails_closed():
-    signal = _eligible_signal(invalidation_price=None)
-    with pytest.raises(StrategyExecutionBoundaryError):
-        build_strategy_order_intent_context(signal)
+    with pytest.raises(StrategyContractError):
+        _eligible_signal(invalidation_price=None)
 
 
 def test_overlay_can_only_shrink_size():

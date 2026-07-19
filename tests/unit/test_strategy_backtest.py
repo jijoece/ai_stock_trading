@@ -16,11 +16,15 @@ from tests.unit._strategy_test_helpers import NOW, build_bars
 
 
 def _signal(*, data_as_of, limit_reference=Decimal("104"), status=StrategyStatus.ELIGIBLE, strategy_id="momentum_breakout") -> StrategySignal:
+    is_eligible = status == StrategyStatus.ELIGIBLE
+    entry = limit_reference if is_eligible else None
+    stop = limit_reference * Decimal("0.5") if is_eligible else None
+    target = limit_reference * Decimal("1.5") if is_eligible else None
     return StrategySignal(
         strategy_id=strategy_id, strategy_version="1.0.0", symbol="AAPL",
         signal_timestamp=NOW, data_as_of=data_as_of, status=status, signal_strength=0.7,
-        entry_reference=limit_reference, limit_reference=limit_reference, invalidation_price=Decimal("90"),
-        initial_stop_reference=Decimal("92"), target_reference=Decimal("120"), expected_holding_period=10,
+        entry_reference=entry, limit_reference=entry, invalidation_price=stop,
+        initial_stop_reference=stop, target_reference=target, expected_holding_period=10,
         reason_codes=("breakout_confirmed",), factor_values={"x": 1.0}, data_quality="complete",
         configuration_hash="cfg-hash",
     )

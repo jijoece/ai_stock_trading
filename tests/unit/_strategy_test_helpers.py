@@ -58,7 +58,11 @@ def build_bars(
     volumes = volumes if volumes is not None else [1_000_000] * n
     highs = highs if highs is not None else [c * 1.01 for c in closes]
     lows = lows if lows is not None else [c * 0.99 for c in closes]
-    start = start or date(2026, 1, 1)
+    # Milestone 24 Part B1: strategies now reject a bar whose `available_at`
+    # is after `context.now` (NOW, above) as future information. Default
+    # far enough before NOW that even a long lookback (e.g. a 200-day SMA
+    # plus buffer) never runs a bar series past it.
+    start = start or date(2024, 1, 1)
     bars = []
     for i in range(n):
         session_date = start + timedelta(days=i)

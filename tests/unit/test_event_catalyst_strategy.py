@@ -82,13 +82,99 @@ def test_conflicting_risk_event_blocks_positive_event():
 
 
 def test_unconfirmed_price_response_is_not_eligible():
-    closes = [100.0] * MIN_BARS  # no gap
-    volumes = [1_000_000] * MIN_BARS  # no volume confirmation
+    closes = [100.0] * MIN_BARS  # no gap, no move, no volume confirmation
+    volumes = [1_000_000] * MIN_BARS
     bars = build_bars(closes, volumes=volumes)
     market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(_event(),))
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
-    assert "unconfirmed_price_response" in signal.reason_codes
+    assert "volume_insufficient" in signal.reason_codes
+    assert "insufficient_price_response" in signal.reason_codes
+
+
+def test_negative_response_to_positive_event_is_not_eligible():
+    """Milestone 24 Part B3: a positive event with a *negative* signed
+    close-to-close response must never pass just because volume confirmed
+    and the (absolute) gap is within the ceiling."""
+    closes = [100.0] * (MIN_BARS - 1) + [98.0]  # -2% move, within the gap ceiling
+    volumes = [1_000_000] * (MIN_BARS - 1) + [3_000_000]  # confirming volume
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(_event(),))
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.NOT_ELIGIBLE
+    assert "insufficient_price_response" in signal.reason_codes
+    assert signal.factor_values["signed_response_percent"] < 0
+
+
+def test_insufficient_positive_response_to_positive_event_is_not_eligible():
+    closes = [100.0] * (MIN_BARS - 1) + [100.3]  # +0.3%, below minimum_positive_response_percent
+    volumes = [1_000_000] * (MIN_BARS - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(_event(),))
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.NOT_ELIGIBLE
+    assert "insufficient_price_response" in signal.reason_codes
+
+
+def test_confirmed_positive_response_to_positive_event_is_eligible():
+    signal = STRATEGY.evaluate(
+        "TEST", StrategyMarketData(symbol="TEST", bars=_bars_with_confirmation(), events=(_event(),)),
+        _context(),
+    )
+    assert signal.status == StrategyStatus.ELIGIBLE
+    assert "response_confirmed" in signal.reason_codes
+    assert signal.factor_values["signed_response_percent"] > 0
+
+
+def test_excessive_positive_gap_is_not_eligible():
+    closes = [100.0] * (MIN_BARS - 1) + [115.0]  # +15%, past maximum_gap_percent
+    volumes = [1_000_000] * (MIN_BARS - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(_event(),))
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.NOT_ELIGIBLE
+    assert "excessive_gap" in signal.reason_codes
+
+
+def test_eligible_event_signal_has_a_valid_deterministic_stop():
+    """Milestone 24 Part B4: an eligible event-catalyst signal must carry a
+    positive stop below entry, and must pass execution-boundary
+    construction (previously impossible — no stop was ever set)."""
+    from trading_research.strategies.execution_boundary import build_strategy_order_intent_context
+
+    signal = STRATEGY.evaluate(
+        "TEST", StrategyMarketData(symbol="TEST", bars=_bars_with_confirmation(), events=(_event(),)),
+        _context(),
+    )
+    assert signal.status == StrategyStatus.ELIGIBLE
+    assert signal.initial_stop_reference is not None
+    assert signal.invalidation_price is not None
+    assert 0 < signal.initial_stop_reference < signal.entry_reference
+    context = build_strategy_order_intent_context(signal)
+    assert context.strategy_stop == signal.initial_stop_reference
+
+
+def test_published_timestamp_after_decision_timestamp_is_incomplete():
+    bars = _bars_with_confirmation()
+    future_published = _event(published_timestamp=NOW + timedelta(hours=1), event_timestamp=NOW - timedelta(hours=2))
+    market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(future_published,))
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.INCOMPLETE
+    assert any("published_timestamp_after_decision_timestamp" in r for r in signal.reason_codes)
+
+
+def test_data_as_of_uses_source_availability_not_evaluation_clock():
+    """Milestone 24 Part B1: data_as_of must be derived from source
+    availability (event/bar timestamps), never simply `context.now`."""
+    bars = _bars_with_confirmation()
+    event = _event()
+    market_data = StrategyMarketData(symbol="TEST", bars=bars, events=(event,))
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.ELIGIBLE
+    assert signal.data_as_of is not None
+    assert signal.data_as_of != NOW
+    assert signal.data_as_of == max(event.published_timestamp, event.effective_timestamp, bars[-1].available_at)
+    assert signal.data_as_of <= NOW
 
 
 def test_event_timestamp_after_decision_timestamp_is_incomplete():
