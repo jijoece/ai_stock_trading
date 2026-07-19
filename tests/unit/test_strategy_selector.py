@@ -60,13 +60,29 @@ def test_only_eligible_signals_are_considered():
     assert result.entries == ()
 
 
-def test_portfolio_concentration_filter_excludes_overexposed_account():
-    portfolio = PortfolioState(account_equity=Decimal("10000"), settled_cash=Decimal("100"),
-                                portfolio_exposure_fraction=1.0)
+def test_symbol_at_allocation_cap_is_excluded():
+    """Milestone 24 Part C6: a symbol already at its per-symbol allocation
+    cap must be excluded even though the rest of the account has room —
+    the previous gate only checked total portfolio exposure and would have
+    let this symbol through."""
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": SHORTLIST_CONFIG.maximum_symbol_allocation_fraction},
+    )
     signals = {"momentum_breakout": (_signal("AAA", 0.9),)}
     result = select_shortlist(signals, SHORTLIST_CONFIG, portfolio=portfolio)
     assert result.entries == ()
-    assert result.excluded[0].reason == "portfolio_concentration_limit"
+    assert result.excluded[0].reason == "symbol_allocation_cap_reached"
+
+
+def test_symbol_with_allocation_room_is_included():
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.0},
+    )
+    signals = {"momentum_breakout": (_signal("AAA", 0.9),)}
+    result = select_shortlist(signals, SHORTLIST_CONFIG, portfolio=portfolio)
+    assert result.symbols == ("AAA",)
 
 
 def test_zero_llm_calls_during_scanning():
