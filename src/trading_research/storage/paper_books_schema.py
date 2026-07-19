@@ -902,6 +902,25 @@ CREATE TABLE IF NOT EXISTS paper_book_safety_events (
     created_at TEXT NOT NULL
 );
 
+-- Milestone 24 Part A2: atomic, account-wide external-paper daily notional
+-- reservation. Scoped by (account_fingerprint, reservation_date) rather than
+-- book_id so the same Alpaca paper account cannot exceed
+-- external_broker.maximum_daily_notional_usd by spreading submissions
+-- across more than one local book. client_order_id is globally unique
+-- (deterministically derived per order), so it alone is the primary key; a
+-- duplicate submission for the same client_order_id reuses this row instead
+-- of creating a second reservation.
+CREATE TABLE IF NOT EXISTS paper_external_daily_reservations (
+    client_order_id TEXT PRIMARY KEY,
+    account_fingerprint TEXT NOT NULL,
+    reservation_date TEXT NOT NULL,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    reserved_notional_usd TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('RESERVED', 'SUBMITTED', 'RELEASED', 'RECONCILIATION_REQUIRED')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS backtest_runs (
     backtest_run_id TEXT PRIMARY KEY,
     started_at TEXT NOT NULL,
@@ -1043,6 +1062,8 @@ CREATE INDEX IF NOT EXISTS idx_economic_events_schedule
     ON economic_calendar_events(market, scheduled_at, available_at);
 CREATE INDEX IF NOT EXISTS idx_safety_events_book
     ON paper_book_safety_events(book_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_paper_external_daily_reservations_scope
+    ON paper_external_daily_reservations(account_fingerprint, reservation_date, state);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -1354,6 +1375,19 @@ BEGIN SELECT RAISE(ABORT, 'blackout decisions are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS trg_safety_events_no_update
 BEFORE UPDATE ON paper_book_safety_events
 BEGIN SELECT RAISE(ABORT, 'safety events are append-only'); END;
+
+-- Milestone 24 Part A2: only state/updated_at may change on a reservation
+-- (a RESERVED -> SUBMITTED/RELEASED/RECONCILIATION_REQUIRED transition);
+-- every other field is frozen once the reservation is created.
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_daily_reservations_core_immutable
+BEFORE UPDATE ON paper_external_daily_reservations
+WHEN NEW.client_order_id != OLD.client_order_id OR NEW.account_fingerprint != OLD.account_fingerprint
+    OR NEW.reservation_date != OLD.reservation_date OR NEW.book_id != OLD.book_id
+    OR NEW.reserved_notional_usd != OLD.reserved_notional_usd OR NEW.created_at != OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'paper_external_daily_reservations core fields are immutable — only state/updated_at may change'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_daily_reservations_no_delete
+BEFORE DELETE ON paper_external_daily_reservations
+BEGIN SELECT RAISE(ABORT, 'paper_external_daily_reservations rows are never deleted'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing

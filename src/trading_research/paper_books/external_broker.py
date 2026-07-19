@@ -57,6 +57,7 @@ CRITICAL_RECONCILIATION_STATUSES = frozenset({
     "FILL_APPLICATION_FAILED", "MALFORMED_BROKER_ORDER", "MALFORMED_BROKER_FILL",
     "BROKER_STATE_UNKNOWN", "RECONCILIATION_INTERNAL_ERROR", "RESERVATION_MISMATCH",
     "SHARE_RESERVATION_MISMATCH", "FROZEN_INTENT_MISMATCH", "EXTERNAL_NOTIONAL_LIMIT",
+    "RECONCILIATION_BASELINE_MISSING",
 })
 
 _TRANSITIONS = {
@@ -171,69 +172,71 @@ def _validate_frozen_notional(intent: dict, cfg: PaperBooksConfiguration, risk: 
         raise ExternalPaperError("EXTERNAL_NOTIONAL_LIMIT", "recomputed notional exceeds the strictest configured cap")
 
 
-def _daily_submitted_notional_usd(conn: sqlite3.Connection, book_id: str, now: datetime) -> Decimal:
-    """Sums the notional of every distinct external order that reached
-    SUBMITTED for this book on `now`'s UTC calendar day. One SUBMITTED event
-    per client_order_id is counted (a retry never re-emits SUBMITTED for the
-    same scope), so this reflects orders actually sent to the broker today,
-    not previews or later terminal states."""
-    today = now.astimezone(timezone.utc).date()
-    total = Decimal("0")
-    seen_client_order_ids: set[str] = set()
-    for event in repo.list_external_order_events(conn, book_id=book_id):
-        if event["new_state"] != STATE_SUBMITTED:
-            continue
-        client_order_id = event["client_order_id"]
-        if client_order_id in seen_client_order_ids:
-            continue
-        created_at = datetime.fromisoformat(event["created_at"])
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        if created_at.astimezone(timezone.utc).date() != today:
-            continue
-        seen_client_order_ids.add(client_order_id)
-        total += Decimal(event["quantity"]) * Decimal(event["limit_price"])
-    return total
+_RESERVATION_STATE_RESERVED = "RESERVED"
+_RESERVATION_STATE_SUBMITTED = "SUBMITTED"
+_RESERVATION_STATE_RELEASED = "RELEASED"
+_RESERVATION_STATE_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
-def _check_daily_notional_cap(
-    conn: sqlite3.Connection, cfg: PaperBooksConfiguration, book_id: str, intent: dict, now: datetime,
-) -> None:
-    already_submitted = _daily_submitted_notional_usd(conn, book_id, now)
-    this_order = Decimal(intent["quantity"]) * Decimal(intent["limit_price"])
-    if already_submitted + this_order > cfg.external_broker.maximum_daily_notional_usd:
-        raise ExternalPaperError(
-            "EXTERNAL_DAILY_NOTIONAL_LIMIT",
-            f"today's submitted external notional {already_submitted} plus this order {this_order} would exceed "
-            f"external_broker.maximum_daily_notional_usd {cfg.external_broker.maximum_daily_notional_usd}",
-        )
-
-
-def _ensure_reconciliation_baseline(
-    conn: sqlite3.Connection, *, book_id: str, fingerprint: str, local_positions: dict,
-    local_settled_cash: Decimal, broker_positions: dict, broker_cash: Decimal,
-    config: PaperBooksConfiguration, now: datetime,
+def _reserve_daily_notional(
+    conn: sqlite3.Connection, cfg: PaperBooksConfiguration, *, book_id: str, fingerprint: str,
+    client_order_id: str, intent: dict, now: datetime,
 ) -> dict:
-    """Milestone 23 Part A3: captures the local/broker cash and position
-    totals the first time reconciliation runs for this book (INSERT OR
-    IGNORE, so a concurrent or later call never overwrites the original
-    snapshot). Every later reconciliation compares *deltas* off this
-    baseline, not raw totals, so local-simulated state that predates
-    external activation (never mirrored to the broker) cancels out instead
-    of surfacing as a false CASH_MISMATCH/POSITION_MISMATCH."""
-    record = {
-        "book_id": book_id, "snapshot_timestamp": now.isoformat(), "account_fingerprint": fingerprint,
-        "local_settled_cash_usd": str(local_settled_cash),
-        "local_positions_json": json.dumps({k: str(v) for k, v in local_positions.items()}, sort_keys=True),
-        "broker_cash_usd": str(broker_cash),
-        "broker_positions_json": json.dumps({k: str(v) for k, v in broker_positions.items()}, sort_keys=True),
-        "source_environment": "paper", "config_hash": config.config_hash, "created_at": now.isoformat(),
-    }
-    repo.save_external_reconciliation_baseline(conn, record, commit=False)
-    baseline = repo.load_external_reconciliation_baseline(conn, book_id)
-    if baseline is None:
-        raise ExternalPaperError("RECONCILIATION_BASELINE_MISSING", "baseline insert-or-load invariant violated")
-    return baseline
+    """Milestone 24 Part A1/A2: atomic, account-wide external-paper daily
+    notional budget. Scoped by (account_fingerprint, UTC date) rather than
+    book_id, so the same Alpaca paper account cannot exceed
+    `external_broker.maximum_daily_notional_usd` by spreading submissions
+    across more than one local book (today exactly one book maps to one
+    external account, but this does not rely on that invariant).
+
+    Runs its own `BEGIN IMMEDIATE` .. `COMMIT` — never nested inside the
+    caller's order-scope-lease `fenced_write` — so the read-then-write
+    check-and-reserve is atomic even when two books/processes race to
+    reserve against the same account/day. A duplicate call for the same
+    `client_order_id` (a replay/retry) reuses the existing reservation
+    rather than creating or being blocked by a second one.
+    """
+    reservation_date = now.astimezone(timezone.utc).date().isoformat()
+    notional = Decimal(intent["quantity"]) * Decimal(intent["limit_price"])
+    with transaction(conn):
+        existing = repo.load_external_daily_reservation(conn, client_order_id)
+        if existing is not None:
+            return existing
+        already_reserved = repo.sum_external_daily_reserved_notional(conn, fingerprint, reservation_date)
+        if already_reserved + notional > cfg.external_broker.maximum_daily_notional_usd:
+            raise ExternalPaperError(
+                "EXTERNAL_DAILY_NOTIONAL_LIMIT",
+                f"today's reserved/submitted external notional {already_reserved} plus this order {notional} "
+                f"would exceed external_broker.maximum_daily_notional_usd "
+                f"{cfg.external_broker.maximum_daily_notional_usd} for account {fingerprint}",
+            )
+        record = {
+            "client_order_id": client_order_id, "account_fingerprint": fingerprint,
+            "reservation_date": reservation_date, "book_id": book_id,
+            "reserved_notional_usd": notional, "state": _RESERVATION_STATE_RESERVED,
+            "created_at": now.isoformat(), "updated_at": now.isoformat(),
+        }
+        repo.save_external_daily_reservation(conn, record, commit=False)
+        return record
+
+
+def _settle_daily_reservation(conn: sqlite3.Connection, *, client_order_id: str, status: str, now: datetime) -> None:
+    """Milestone 24 Part A2: resolves a reservation once the broker outcome
+    of its submission attempt is known. An ambiguous outcome (STATE_UNKNOWN
+    — the runtime call itself raised, so acceptance is unproven) retains the
+    reservation's hold on the daily budget and marks it RECONCILIATION_
+    REQUIRED rather than releasing it, so a blind concurrent resubmission
+    for a *different* order cannot slip under the cap while this one's fate
+    is still unknown. A definite non-executing terminal outcome (REJECTED/
+    CANCELLED/EXPIRED) releases the hold. Any other outcome means the
+    broker accepted the order, so the reservation settles to SUBMITTED."""
+    if status == STATE_UNKNOWN:
+        new_state = _RESERVATION_STATE_RECONCILIATION_REQUIRED
+    elif status in (STATE_REJECTED, STATE_CANCELLED, STATE_EXPIRED):
+        new_state = _RESERVATION_STATE_RELEASED
+    else:
+        new_state = _RESERVATION_STATE_SUBMITTED
+    repo.update_external_daily_reservation_state(conn, client_order_id, new_state, now.isoformat())
 
 
 def derive_external_order_identity(intent: dict) -> tuple[str, str]:
@@ -437,6 +440,105 @@ def check_external_paper_account(
 ) -> dict:
     _require_external_config(config, book_id)
     return _account_check(runtime, book_id)
+
+
+_BASELINE_POSITIONS_FIELDS = {"book_id", "account_fingerprint", "positions"}
+_BASELINE_ACCOUNT_FIELDS = {
+    "provider", "environment", "book_id", "account_fingerprint", "cash", "equity",
+    "buying_power", "currency", "as_of",
+}
+
+
+def activate_external_reconciliation_baseline(
+    conn: sqlite3.Connection, *, book_id: str, operator: str, runtime: ExternalPaperRuntime,
+    config: PaperBooksConfiguration, clock=None,
+) -> dict:
+    """Milestone 24 Part A3: explicit, operator-invoked activation/preflight
+    step that must run before the first external submission for a
+    book/account relationship. Idempotent — a second call once a baseline
+    already exists simply returns it unchanged (mirrors the
+    insert-or-ignore convention used throughout this module).
+
+    Reconciliation (`_run_reconciliation` below) never creates this
+    baseline itself; it only loads it and fails closed
+    (`RECONCILIATION_BASELINE_MISSING`) when absent, so a book can never
+    silently start comparing deltas off a baseline nobody explicitly
+    approved. If external order/submission activity already exists for
+    this book with no baseline on file, the local/broker state at this
+    point cannot be trusted as a clean starting reference — this refuses to
+    create a baseline and surfaces `BASELINE_REQUIRES_OPERATOR_REVIEW`
+    instead.
+    """
+    now = _now(clock)
+    operator = _bounded(operator, "operator", 128)
+    _require_external_config(config, book_id)
+    existing = repo.load_external_reconciliation_baseline(conn, book_id)
+    if existing is not None:
+        return existing
+    if repo.list_external_order_events(conn, book_id=book_id):
+        raise ExternalPaperError(
+            "BASELINE_REQUIRES_OPERATOR_REVIEW",
+            "external order/submission activity already exists for this book with no baseline on file — "
+            "an operator must review broker/local state manually before a baseline can be captured",
+        )
+    account = _account_check(runtime, book_id)
+    fingerprint = account["account_fingerprint"]
+    _verify_fingerprint_history(conn, book_id, fingerprint)
+    try:
+        broker_positions_payload = runtime.get_external_positions(book_id)
+        broker_account = runtime.get_external_account_snapshot(book_id)
+    except Exception as exc:
+        raise ExternalPaperError(
+            "BASELINE_ACTIVATION_FAILED", "unable to read broker state for baseline activation",
+        ) from exc
+    if not isinstance(broker_positions_payload, dict) or set(broker_positions_payload) != _BASELINE_POSITIONS_FIELDS:
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "positions response shape is invalid")
+    if not isinstance(broker_account, dict) or set(broker_account) != _BASELINE_ACCOUNT_FIELDS:
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "account response shape is invalid")
+    if (
+        broker_positions_payload.get("book_id") != book_id or broker_account.get("book_id") != book_id
+        or broker_account.get("provider") != "alpaca_paper" or broker_account.get("environment") != "paper"
+        or broker_positions_payload.get("account_fingerprint") != fingerprint
+        or broker_account.get("account_fingerprint") != fingerprint
+    ):
+        raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "baseline broker response scope is invalid")
+    local_positions = {p["symbol"]: Decimal(p["quantity"]) for p in repo.list_positions(conn, book_id)}
+    broker_positions = {
+        p["symbol"]: Decimal(str(p["quantity"])) for p in broker_positions_payload["positions"]
+    }
+    local_settled_cash = cash_ledger.settled_cash(conn, book_id)
+    broker_cash = Decimal(str(broker_account["cash"]))
+    record = {
+        "book_id": book_id, "snapshot_timestamp": now.isoformat(), "account_fingerprint": fingerprint,
+        "local_settled_cash_usd": str(local_settled_cash),
+        "local_positions_json": json.dumps({k: str(v) for k, v in local_positions.items()}, sort_keys=True),
+        "broker_cash_usd": str(broker_cash),
+        "broker_positions_json": json.dumps({k: str(v) for k, v in broker_positions.items()}, sort_keys=True),
+        "source_environment": "paper", "config_hash": config.config_hash, "created_at": now.isoformat(),
+    }
+    inserted = repo.save_external_reconciliation_baseline(conn, record, commit=True)
+    if not inserted:
+        raise ExternalPaperError("RECONCILIATION_BASELINE_MISSING", "baseline insert invariant violated")
+    return repo.load_external_reconciliation_baseline(conn, book_id)
+
+
+def _require_reconciliation_baseline(conn: sqlite3.Connection, book_id: str, fingerprint: str) -> dict:
+    """Milestone 24 Part A3: submission must fail closed when no baseline
+    has been explicitly activated for this book/account — never fall back
+    to auto-creating one at submission or reconciliation time."""
+    baseline = repo.load_external_reconciliation_baseline(conn, book_id)
+    if baseline is None:
+        raise ExternalPaperError(
+            "RECONCILIATION_BASELINE_MISSING",
+            "no reconciliation baseline exists for this book — call activate_external_reconciliation_baseline "
+            "before submitting",
+        )
+    if baseline["account_fingerprint"] != fingerprint:
+        raise ExternalPaperError(
+            "ACCOUNT_FINGERPRINT_MISMATCH",
+            "reconciliation baseline account fingerprint does not match the currently verified account",
+        )
+    return baseline
 
 
 def _payload(intent: dict, client_order_id: str, payload_hash: str, fingerprint: str, now: datetime) -> dict:
@@ -1019,6 +1121,7 @@ def submit_external_paper_order(
         account = _account_check(runtime, book_id)
         fingerprint = account["account_fingerprint"]
         _verify_fingerprint_history(conn, book_id, fingerprint)
+        _require_reconciliation_baseline(conn, book_id, fingerprint)
         _validated_preview(
             conn, preview_id=preview_id, intent=intent, client_order_id=client_order_id,
             payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
@@ -1032,13 +1135,17 @@ def submit_external_paper_order(
             if order is None:
                 raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
             return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
-        _check_daily_notional_cap(conn, config, book_id, intent, now)
+        _reserve_daily_notional(
+            conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
+            intent=intent, now=now,
+        )
         lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
             config=config, now=now, attempt_number=0, lease=lease,
         )
+        _settle_daily_reservation(conn, client_order_id=client_order_id, status=result["status"], now=now)
         if result["status"] != STATE_UNKNOWN:
             lease.heartbeat_or_raise()
             result["reconciliation"] = _reconcile_locked(
@@ -1265,6 +1372,7 @@ def retry_external_paper_order(
         fingerprint = account["account_fingerprint"]
         if fingerprint != current["account_fingerprint"]:
             raise ExternalPaperError("ACCOUNT_FINGERPRINT_MISMATCH", "account changed before retry")
+        _require_reconciliation_baseline(conn, book_id, fingerprint)
         preview = conn.execute(
             "SELECT preview_id FROM paper_external_order_previews WHERE book_id = ? AND paper_order_intent_id = ? "
             "AND result = 'APPROVED' ORDER BY previewed_at DESC LIMIT 1", (book_id, paper_order_intent_id),
@@ -1275,12 +1383,17 @@ def retry_external_paper_order(
             conn, preview_id=preview["preview_id"], intent=intent, client_order_id=client_order_id,
             payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
         )
+        _reserve_daily_notional(
+            conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
+            intent=intent, now=now,
+        )
         lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
             now=now, attempt_number=retries + 1, lease=lease,
         )
+        _settle_daily_reservation(conn, client_order_id=client_order_id, status=result["status"], now=now)
         with lease.fenced_write():
             repo.consume_external_lookup(
                 conn, lookup["lookup_id"], result["event"]["external_order_event_id"], commit=False,
@@ -1712,6 +1825,16 @@ def _run_reconciliation(
     statuses: list[str] = []
     if fingerprint != current["account_fingerprint"]:
         statuses.append("ACCOUNT_FINGERPRINT_MISMATCH")
+    # Milestone 24 Part A3: reconciliation never creates a baseline — it
+    # only loads it and fails closed when absent or fingerprint-mismatched
+    # (the explicit `activate_external_reconciliation_baseline` preflight is
+    # the only path that ever writes one).
+    baseline = repo.load_external_reconciliation_baseline(conn, book_id)
+    if baseline is None:
+        statuses.append("RECONCILIATION_BASELINE_MISSING")
+    elif baseline["account_fingerprint"] != fingerprint:
+        statuses.append("ACCOUNT_FINGERPRINT_MISMATCH")
+        baseline = None
     request_id = f"m11_{uuid.uuid4().hex}"
     try:
         order = runtime.get_order_by_client_order_id(book_id, client_order_id)
@@ -1851,35 +1974,42 @@ def _run_reconciliation(
                 raise ExternalPaperError("MALFORMED_RUNTIME_RESPONSE", "position response shape is invalid")
         if broker_positions_payload.get("account_fingerprint") != fingerprint or broker_account.get("account_fingerprint") != fingerprint:
             statuses.append("ACCOUNT_FINGERPRINT_MISMATCH")
-        local_positions = {p["symbol"]: Decimal(p["quantity"]) for p in repo.list_positions(conn, book_id)}
-        broker_positions = {p["symbol"]: Decimal(str(p["quantity"])) for p in broker_positions_payload["positions"]}
-        local_settled_cash = cash_ledger.settled_cash(conn, book_id)
-        broker_cash = Decimal(str(broker_account["cash"]))
-        # Milestone 23 Part A3: never compare raw local-vs-broker totals
-        # directly -- a book that also carries unrelated local-simulated
-        # activity (never mirrored to the broker) would then always look
-        # mismatched. Instead compare *deltas* off a one-time baseline
-        # captured the first time reconciliation runs for this book, so
-        # pre-existing local-only state cancels out on both sides.
-        baseline = _ensure_reconciliation_baseline(
-            conn, book_id=book_id, fingerprint=fingerprint, local_positions=local_positions,
-            local_settled_cash=local_settled_cash, broker_positions=broker_positions,
-            broker_cash=broker_cash, config=config, now=now,
-        )
-        baseline_local_positions = {k: Decimal(v) for k, v in baseline["local_positions"].items()}
-        baseline_broker_positions = {k: Decimal(v) for k, v in baseline["broker_positions"].items()}
-        baseline_local_cash = Decimal(baseline["local_settled_cash_usd"])
-        baseline_broker_cash = Decimal(baseline["broker_cash_usd"])
-        symbols = set(local_positions) | set(broker_positions) | set(baseline_local_positions) | set(baseline_broker_positions)
-        for symbol in symbols:
-            local_delta = local_positions.get(symbol, Decimal("0")) - baseline_local_positions.get(symbol, Decimal("0"))
-            expected_broker_qty = baseline_broker_positions.get(symbol, Decimal("0")) + local_delta
-            if expected_broker_qty != broker_positions.get(symbol, Decimal("0")):
-                statuses.append("POSITION_MISMATCH")
-                break
-        expected_broker_cash = baseline_broker_cash + (local_settled_cash - baseline_local_cash)
-        if expected_broker_cash != broker_cash:
-            statuses.append("CASH_MISMATCH")
+        # Milestone 24 Part A3: `baseline` was loaded (read-only) above,
+        # before this try block -- reconciliation never creates one itself.
+        # Without a baseline there is nothing safe to delta-compare against,
+        # so this position/cash check is skipped entirely; the missing-
+        # baseline status recorded above already makes this reconciliation
+        # critical.
+        if baseline is not None:
+            local_positions = {p["symbol"]: Decimal(p["quantity"]) for p in repo.list_positions(conn, book_id)}
+            broker_positions = {
+                p["symbol"]: Decimal(str(p["quantity"])) for p in broker_positions_payload["positions"]
+            }
+            local_settled_cash = cash_ledger.settled_cash(conn, book_id)
+            broker_cash = Decimal(str(broker_account["cash"]))
+            # Milestone 23 Part A3: never compare raw local-vs-broker totals
+            # directly -- a book that also carries unrelated local-simulated
+            # activity (never mirrored to the broker) would then always look
+            # mismatched. Instead compare *deltas* off the activation-time
+            # baseline, so pre-existing local-only state cancels out on both
+            # sides.
+            baseline_local_positions = {k: Decimal(v) for k, v in baseline["local_positions"].items()}
+            baseline_broker_positions = {k: Decimal(v) for k, v in baseline["broker_positions"].items()}
+            baseline_local_cash = Decimal(baseline["local_settled_cash_usd"])
+            baseline_broker_cash = Decimal(baseline["broker_cash_usd"])
+            symbols = (
+                set(local_positions) | set(broker_positions)
+                | set(baseline_local_positions) | set(baseline_broker_positions)
+            )
+            for symbol in symbols:
+                local_delta = local_positions.get(symbol, Decimal("0")) - baseline_local_positions.get(symbol, Decimal("0"))
+                expected_broker_qty = baseline_broker_positions.get(symbol, Decimal("0")) + local_delta
+                if expected_broker_qty != broker_positions.get(symbol, Decimal("0")):
+                    statuses.append("POSITION_MISMATCH")
+                    break
+            expected_broker_cash = baseline_broker_cash + (local_settled_cash - baseline_local_cash)
+            if expected_broker_cash != broker_cash:
+                statuses.append("CASH_MISMATCH")
     except ExternalPaperError:
         statuses.append("UNKNOWN")
     except (InvalidOperation, ValueError, TypeError, KeyError, AttributeError):

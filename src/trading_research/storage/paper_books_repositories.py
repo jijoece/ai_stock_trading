@@ -1658,6 +1658,61 @@ def load_external_reconciliation_baseline(conn: sqlite3.Connection, book_id: str
     return item
 
 
+def load_external_daily_reservation(conn: sqlite3.Connection, client_order_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM paper_external_daily_reservations WHERE client_order_id = ?", (client_order_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def sum_external_daily_reserved_notional(
+    conn: sqlite3.Connection, account_fingerprint: str, reservation_date: str,
+    *, exclude_client_order_id: str | None = None,
+) -> Decimal:
+    """Sums every non-released reservation for this account/day —
+    RESERVED, SUBMITTED, and RECONCILIATION_REQUIRED (an ambiguous outcome
+    may still have reached the broker, so it must keep counting against the
+    cap until an operator resolves it). RELEASED reservations never count."""
+    query = (
+        "SELECT reserved_notional_usd FROM paper_external_daily_reservations "
+        "WHERE account_fingerprint = ? AND reservation_date = ? "
+        "AND state IN ('RESERVED', 'SUBMITTED', 'RECONCILIATION_REQUIRED')"
+    )
+    params: list[object] = [account_fingerprint, reservation_date]
+    if exclude_client_order_id is not None:
+        query += " AND client_order_id != ?"
+        params.append(exclude_client_order_id)
+    total = Decimal("0")
+    for row in conn.execute(query, params).fetchall():
+        total += Decimal(row["reserved_notional_usd"])
+    return total
+
+
+def save_external_daily_reservation(conn: sqlite3.Connection, record: dict, *, commit: bool = True) -> bool:
+    """Insert-or-ignore on the deterministic client_order_id primary key — a
+    duplicate submission for the same order reuses its original reservation
+    rather than creating (or being blocked by) a second one."""
+    cursor = conn.execute(
+        "INSERT OR IGNORE INTO paper_external_daily_reservations "
+        "(client_order_id, account_fingerprint, reservation_date, book_id, reserved_notional_usd, state, "
+        "created_at, updated_at) VALUES (:client_order_id, :account_fingerprint, :reservation_date, :book_id, "
+        ":reserved_notional_usd, :state, :created_at, :updated_at)",
+        {**record, "reserved_notional_usd": str(record["reserved_notional_usd"])},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def update_external_daily_reservation_state(
+    conn: sqlite3.Connection, client_order_id: str, new_state: str, updated_at: str, *, commit: bool = True,
+) -> None:
+    conn.execute(
+        "UPDATE paper_external_daily_reservations SET state = ?, updated_at = ? WHERE client_order_id = ?",
+        (new_state, updated_at, client_order_id),
+    )
+    _commit_if(conn, commit)
+
+
 def enqueue_external_submission(
     conn: sqlite3.Connection, *, queue_id: str, book_id: str, paper_order_intent_id: str,
     source: str, created_at: str,

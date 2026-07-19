@@ -333,6 +333,18 @@ def external_paper_account_check_cli(
     )
 
 
+def external_paper_activate_baseline_cli(
+    db_path: Path, *, book_id: str, operator: str, config_path: str | Path | None = None,
+) -> dict:
+    from .paper_books.external_broker import activate_external_reconciliation_baseline
+    return _external_paper_cli(
+        db_path, lambda conn, runtime, config: activate_external_reconciliation_baseline(
+            conn, book_id=book_id, operator=operator, runtime=runtime, config=config,
+        ),
+        config_path=config_path,
+    )
+
+
 def external_paper_preview_cli(
     db_path: Path, *, book_id: str, intent_id: str, operator: str, config_path: str | Path | None = None,
 ) -> dict:
@@ -2937,6 +2949,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
              "(must exist as a regular file; default: config/paper_books.yaml)",
     )
+    p_external_activate_baseline = sub.add_parser(
+        "external-paper-activate-baseline",
+        help="Explicitly capture the pre-submission reconciliation baseline for a book/account",
+    )
+    p_external_activate_baseline.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
+    p_external_activate_baseline.add_argument("--operator", required=True)
+    p_external_activate_baseline.add_argument(
+        "--paper-books-config",
+        help="Explicit operator-supplied paper_books config file overriding config/paper_books.yaml "
+             "(must exist as a regular file; default: config/paper_books.yaml)",
+    )
     p_external_preview = sub.add_parser("external-paper-preview", help="Persist an explicit external-paper preview")
     p_external_preview.add_argument("--book-id", required=True, choices=("BASELINE", "ENHANCED"))
     p_external_preview.add_argument("--intent-id", required=True)
@@ -3575,6 +3598,12 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config()
         outcome = external_paper_account_check_cli(
             cfg.research_database_path, book_id=args.book_id, config_path=args.paper_books_config,
+        )
+    elif args.command == "external-paper-activate-baseline":
+        cfg = load_config()
+        outcome = external_paper_activate_baseline_cli(
+            cfg.research_database_path, book_id=args.book_id, operator=args.operator,
+            config_path=args.paper_books_config,
         )
     elif args.command == "external-paper-preview":
         cfg = load_config()
