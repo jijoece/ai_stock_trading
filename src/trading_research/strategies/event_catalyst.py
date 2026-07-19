@@ -13,8 +13,9 @@ from decimal import Decimal
 
 from .config import EventCatalystConfig
 from .contracts import StrategyContext, StrategyMarketData, StrategySignal, StrategyStatus
-from .factors import closes, volume_ratio
+from .factors import average_true_range, closes, volume_ratio
 from .safety_gates import classify_safety_status
+from .timestamps import bar_series_data_as_of
 
 STRATEGY_ID = "event_catalyst"
 STRATEGY_VERSION = "1.0.0"
@@ -34,12 +35,19 @@ class EventDrivenCatalystStrategy:
         context: StrategyContext,
     ) -> StrategySignal:
         cfg = self._config
-        minimum_bars = cfg.volume_lookback_days + cfg.confirmation_window_days + 1
+        minimum_bars = max(
+            cfg.volume_lookback_days + cfg.confirmation_window_days + 1, cfg.atr_period + 1,
+        )
 
         safety = classify_safety_status(context.screening_result, market_data.bars, minimum_bars)
         if safety is not None:
             status, reasons = safety
             return self._signal(symbol, context.now, status, 0.0, reasons, {})
+
+        bars = market_data.bars
+        confirming_bar_data_as_of, future_reason = bar_series_data_as_of(bars, context.now)
+        if future_reason is not None:
+            return self._signal(symbol, context.now, StrategyStatus.INCOMPLETE, 0.0, (future_reason,), {})
 
         events = [e for e in market_data.events if e.symbol == symbol]
         if not events:
@@ -48,11 +56,20 @@ class EventDrivenCatalystStrategy:
                 ("no_event_present",), {},
             )
 
+        # Milestone 24 Part B1: neither an event that has not yet happened
+        # nor one that has not yet been published may be treated as known
+        # at this decision point — both would leak future information into
+        # a point-in-time evaluation.
         for event in events:
             if event.event_timestamp > context.now:
                 return self._signal(
                     symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
                     (f"event_timestamp_after_decision_timestamp:{event.event_id}",), {},
+                )
+            if event.published_timestamp > context.now:
+                return self._signal(
+                    symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                    (f"published_timestamp_after_decision_timestamp:{event.event_id}",), {},
                 )
 
         max_age = timedelta(hours=cfg.maximum_event_age_hours)
@@ -76,47 +93,83 @@ class EventDrivenCatalystStrategy:
                 symbol, context.now, StrategyStatus.NOT_ELIGIBLE, 0.0,
                 ("event_not_positive",), {},
             )
+        selected_event = min(positive_events, key=lambda e: e.event_timestamp)
 
-        bars = market_data.bars
         close_series = closes(bars)
         latest_close = close_series[-1]
         prior_close = close_series[-2] if len(close_series) >= 2 else None
         vol_ratio = volume_ratio(bars, cfg.volume_lookback_days)
+        atr = average_true_range(bars, cfg.atr_period)
 
-        if vol_ratio is None or prior_close is None:
+        if vol_ratio is None or prior_close is None or atr is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
                 ("insufficient_factor_history",), {},
             )
 
+        # Milestone 24 Part B1: data_as_of is the latest availability
+        # timestamp among the selected event's published timestamp, its
+        # effective timestamp (only once already effective — an event
+        # announced now but effective later must not backdate data_as_of
+        # into the future), and the latest confirming bar's available_at.
+        data_as_of_candidates = [selected_event.published_timestamp, confirming_bar_data_as_of]
+        if selected_event.effective_timestamp <= context.now:
+            data_as_of_candidates.append(selected_event.effective_timestamp)
+        data_as_of = max(data_as_of_candidates)
+
+        # Milestone 24 Part B3: signed price response — an event confirmed
+        # by volume but with a *negative* close-to-close move must never
+        # pass just because its magnitude is within the gap ceiling.
+        # `gap_percent` (absolute) remains a separate upper-bound extension
+        # guard; `signed_response_percent` is the actual confirmation gate.
+        signed_response_percent = (
+            (latest_close - prior_close) / prior_close * 100.0 if prior_close > 0 else float("-inf")
+        )
         gap_percent = abs(latest_close - prior_close) / prior_close * 100.0 if prior_close > 0 else float("inf")
         volume_confirmed = vol_ratio >= cfg.minimum_volume_ratio
+        response_confirmed = signed_response_percent >= cfg.minimum_positive_response_percent
         gap_ok = gap_percent <= cfg.maximum_gap_percent
 
         reasons = (
             "recent_positive_event_confirmed",
-            ("volume_confirmed" if volume_confirmed else "unconfirmed_price_response"),
+            ("volume_confirmed" if volume_confirmed else "volume_insufficient"),
+            ("response_confirmed" if response_confirmed else "insufficient_price_response"),
             ("gap_ok" if gap_ok else "excessive_gap"),
         )
         factor_values = {
             "volume_ratio": vol_ratio,
             "gap_percent": gap_percent,
-            "event_age_hours": (context.now - positive_events[0].event_timestamp).total_seconds() / 3600.0,
+            "signed_response_percent": signed_response_percent,
+            "atr": atr,
+            "event_age_hours": (context.now - selected_event.event_timestamp).total_seconds() / 3600.0,
         }
 
-        eligible = volume_confirmed and gap_ok
+        eligible = volume_confirmed and response_confirmed and gap_ok
         if not eligible:
             return self._signal(symbol, context.now,
-                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values)
+                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values,
+                                 data_as_of=data_as_of)
 
         signal_strength = self._signal_strength(vol_ratio, cfg.minimum_volume_ratio, gap_percent, cfg.maximum_gap_percent)
 
         entry = Decimal(str(latest_close))
+        # Milestone 24 Part B4: event-catalyst signals previously had no
+        # invalidation price or initial stop at all, so an eligible signal
+        # could never pass `build_strategy_order_intent_context`. Derive a
+        # deterministic positive stop from ATR, same convention as the
+        # other two strategies; never fabricate one when ATR/the resulting
+        # stop is not usable.
+        stop = Decimal(str(round(latest_close - cfg.atr_stop_multiple * atr, 4)))
+        if stop <= 0 or stop >= entry:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("invalid_atr_stop",), factor_values, data_as_of=data_as_of,
+            )
         return self._signal(
             symbol, context.now, StrategyStatus.ELIGIBLE, signal_strength, reasons, factor_values,
-            entry_reference=entry, limit_reference=entry, invalidation_price=None,
-            initial_stop_reference=None, target_reference=None,
-            expected_holding_period=cfg.maximum_holding_days,
+            entry_reference=entry, limit_reference=entry, invalidation_price=stop,
+            initial_stop_reference=stop, target_reference=None,
+            expected_holding_period=cfg.maximum_holding_days, data_as_of=data_as_of,
         )
 
     @staticmethod
@@ -142,6 +195,7 @@ class EventDrivenCatalystStrategy:
         initial_stop_reference: Decimal | None = None,
         target_reference: Decimal | None = None,
         expected_holding_period: int | None = None,
+        data_as_of: datetime | None = None,
     ) -> StrategySignal:
         data_quality = (
             "complete" if status in (StrategyStatus.ELIGIBLE, StrategyStatus.NOT_ELIGIBLE)
@@ -152,7 +206,7 @@ class EventDrivenCatalystStrategy:
             strategy_version=self.strategy_version,
             symbol=symbol,
             signal_timestamp=now if now.tzinfo else now.replace(tzinfo=timezone.utc),
-            data_as_of=now,
+            data_as_of=data_as_of,
             status=status,
             signal_strength=signal_strength,
             entry_reference=entry_reference,

@@ -18,6 +18,7 @@ from .config import MeanReversionConfig
 from .contracts import StrategyContext, StrategyMarketData, StrategySignal, StrategyStatus
 from .factors import average_true_range, closes, rolling_zscore, rsi_wilder, simple_moving_average
 from .safety_gates import classify_safety_status
+from .timestamps import bar_series_data_as_of
 
 STRATEGY_ID = "mean_reversion"
 STRATEGY_VERSION = "1.0.0"
@@ -47,24 +48,29 @@ class MeanReversionStrategy:
             return self._signal(symbol, context.now, status, 0.0, reasons, {})
 
         bars = market_data.bars
+        data_as_of, future_reason = bar_series_data_as_of(bars, context.now)
+        if future_reason is not None:
+            return self._signal(symbol, context.now, StrategyStatus.INCOMPLETE, 0.0, (future_reason,), {})
+
         close_series = closes(bars)
         latest_close = close_series[-1]
 
         zscore = rolling_zscore(close_series, cfg.mean_lookback_days)
         rsi = rsi_wilder(close_series, cfg.rsi_period)
+        short_term_mean = simple_moving_average(close_series, cfg.mean_lookback_days)
         long_trend_sma = simple_moving_average(close_series, cfg.long_trend_sma_days) \
             if cfg.require_price_above_long_trend else None
         atr = average_true_range(bars, cfg.atr_period)
 
-        if zscore is None or rsi is None or atr is None:
+        if zscore is None or rsi is None or atr is None or short_term_mean is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
-                ("insufficient_factor_history",), {},
+                ("insufficient_factor_history",), {}, data_as_of=data_as_of,
             )
         if cfg.require_price_above_long_trend and long_trend_sma is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
-                ("missing_long_trend_history",), {},
+                ("missing_long_trend_history",), {}, data_as_of=data_as_of,
             )
 
         severe_risk_flags = market_data.catalyst.sec_filing_risk_flags if market_data.catalyst else ()
@@ -88,24 +94,37 @@ class MeanReversionStrategy:
             "zscore": zscore,
             "rsi": rsi,
             "atr": atr,
+            "short_term_mean": short_term_mean,
             **({"long_trend_sma": long_trend_sma} if long_trend_sma is not None else {}),
         }
 
         eligible = zscore_ok and rsi_ok and long_trend_intact and no_severe_risk
         if not eligible:
             return self._signal(symbol, context.now,
-                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values)
+                                 StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values,
+                                 data_as_of=data_as_of)
 
         signal_strength = self._signal_strength(zscore, cfg.zscore_entry_threshold, rsi, cfg.maximum_entry_rsi)
 
         entry = Decimal(str(latest_close))
         stop = Decimal(str(round(latest_close - cfg.atr_stop_multiple * atr, 4)))
-        target = Decimal(str(round(long_trend_sma, 4))) if long_trend_sma is not None else None
+        # Milestone 24 Part B5: eligibility already requires
+        # `latest_close > long_trend_sma` (the long-term SMA is a structural
+        # trend gate, not a reversion target) — using it as the target put
+        # the target below entry on every eligible long signal. The
+        # short-term mean is the actual reversion target, and only when it
+        # sits above entry; a not-yet-reverted short-term mean produces no
+        # target rather than an inverted one (fail closed at the execution
+        # boundary, which requires a stop but treats target as optional).
+        target = (
+            Decimal(str(round(short_term_mean, 4)))
+            if short_term_mean > latest_close else None
+        )
         return self._signal(
             symbol, context.now, StrategyStatus.ELIGIBLE, signal_strength, reasons, factor_values,
             entry_reference=entry, limit_reference=entry, invalidation_price=stop,
             initial_stop_reference=stop, target_reference=target,
-            expected_holding_period=cfg.maximum_holding_days,
+            expected_holding_period=cfg.maximum_holding_days, data_as_of=data_as_of,
         )
 
     @staticmethod
@@ -132,6 +151,7 @@ class MeanReversionStrategy:
         initial_stop_reference: Decimal | None = None,
         target_reference: Decimal | None = None,
         expected_holding_period: int | None = None,
+        data_as_of: datetime | None = None,
     ) -> StrategySignal:
         data_quality = (
             "complete" if status in (StrategyStatus.ELIGIBLE, StrategyStatus.NOT_ELIGIBLE)
@@ -142,7 +162,7 @@ class MeanReversionStrategy:
             strategy_version=self.strategy_version,
             symbol=symbol,
             signal_timestamp=now if now.tzinfo else now.replace(tzinfo=timezone.utc),
-            data_as_of=now,
+            data_as_of=data_as_of,
             status=status,
             signal_strength=signal_strength,
             entry_reference=entry_reference,

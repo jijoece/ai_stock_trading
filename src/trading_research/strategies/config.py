@@ -93,11 +93,15 @@ class EventCatalystConfig:
     maximum_gap_percent: float
     confirmation_window_days: int
     maximum_holding_days: int
+    minimum_positive_response_percent: float
+    atr_period: int
+    atr_stop_multiple: float
     configuration_hash: str
 
     def __post_init__(self) -> None:
         for name in ("maximum_event_age_hours", "minimum_volume_ratio", "volume_lookback_days",
-                     "maximum_gap_percent", "confirmation_window_days", "maximum_holding_days"):
+                     "maximum_gap_percent", "confirmation_window_days", "maximum_holding_days",
+                     "minimum_positive_response_percent", "atr_period", "atr_stop_multiple"):
             if getattr(self, name) <= 0:
                 raise StrategyConfigError(f"event_catalyst.{name} must be > 0")
 
@@ -189,7 +193,8 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
 
     ec = raw["event_catalyst"] or {}
     required_ec = {"enabled", "maximum_event_age_hours", "minimum_volume_ratio", "volume_lookback_days",
-                   "maximum_gap_percent", "confirmation_window_days", "maximum_holding_days"}
+                   "maximum_gap_percent", "confirmation_window_days", "maximum_holding_days",
+                   "minimum_positive_response_percent", "atr_period", "atr_stop_multiple"}
     missing_ec = required_ec - ec.keys()
     if missing_ec:
         raise StrategyConfigError(f"strategy config event_catalyst missing keys: {sorted(missing_ec)}")
@@ -241,6 +246,9 @@ def load_strategy_config(path: str | Path | None = None) -> StrategyConfig:
             maximum_gap_percent=float(ec["maximum_gap_percent"]),
             confirmation_window_days=int(ec["confirmation_window_days"]),
             maximum_holding_days=int(ec["maximum_holding_days"]),
+            minimum_positive_response_percent=float(ec["minimum_positive_response_percent"]),
+            atr_period=int(ec["atr_period"]),
+            atr_stop_multiple=float(ec["atr_stop_multiple"]),
             configuration_hash=_sub_hash(raw, "event_catalyst"),
         ),
         shortlist=ShortlistConfig(
