@@ -133,6 +133,15 @@ class CatalystRiskFlags:
 
 
 @dataclass(frozen=True)
+class PortfolioPositionSnapshot:
+    """Point-in-time inputs needed to prove one symbol's market value."""
+
+    quantity: int | None
+    market_price: Decimal | None
+    price_as_of: datetime | None
+
+
+@dataclass(frozen=True)
 class PortfolioState:
     """Typed snapshot of account/portfolio state, mapped by callers into the
     flat fields `risk/position_sizing.RiskInputs` expects. Kept separate from
@@ -145,6 +154,7 @@ class PortfolioState:
     existing_positions: dict[str, int] = field(default_factory=dict)  # symbol -> shares held
     sector_exposure_fraction: dict[str, float] = field(default_factory=dict)  # sector -> fraction of equity
     symbol_exposure_fraction: dict[str, float] = field(default_factory=dict)  # symbol -> fraction of equity
+    symbol_exposure_complete: bool = False
     portfolio_exposure_fraction: float | None = None
     daily_loss_fraction: float = 0.0
     drawdown_fraction: float = 0.0
@@ -152,6 +162,56 @@ class PortfolioState:
 
     def shares_held(self, symbol: str) -> int | None:
         return self.existing_positions.get(symbol, 0)
+
+    @classmethod
+    def from_position_snapshots(
+        cls,
+        *,
+        account_equity: Decimal | None,
+        settled_cash: Decimal | None,
+        positions: dict[str, PortfolioPositionSnapshot],
+        as_of: datetime,
+        maximum_price_age_seconds: int,
+    ) -> "PortfolioState":
+        """Build a fail-closed per-symbol exposure snapshot.
+
+        Any missing/nonpositive equity, quantity, price, or stale/future
+        price makes the whole exposure map incomplete. Partial values remain
+        visible for audit but cannot be treated as favorable zero exposure.
+        """
+        existing_positions = {
+            symbol: snapshot.quantity
+            for symbol, snapshot in positions.items()
+            if type(snapshot.quantity) is int and snapshot.quantity > 0
+        }
+        exposures: dict[str, float] = {}
+        complete = (
+            account_equity is not None and account_equity > 0
+            and as_of.tzinfo is not None
+            and type(maximum_price_age_seconds) is int and maximum_price_age_seconds >= 0
+        )
+        if complete:
+            for symbol, snapshot in positions.items():
+                quantity = snapshot.quantity
+                price = snapshot.market_price
+                price_as_of = snapshot.price_as_of
+                if (
+                    type(quantity) is not int or quantity <= 0
+                    or price is None or price <= 0
+                    or price_as_of is None or price_as_of.tzinfo is None
+                    or price_as_of > as_of
+                    or (as_of - price_as_of).total_seconds() > maximum_price_age_seconds
+                ):
+                    complete = False
+                    break
+                exposures[symbol] = float(Decimal(quantity) * price / account_equity)
+        return cls(
+            account_equity=account_equity, settled_cash=settled_cash,
+            existing_positions=existing_positions, symbol_exposure_fraction=exposures,
+            symbol_exposure_complete=complete,
+            portfolio_exposure_fraction=sum(exposures.values()) if complete else None,
+            as_of=as_of,
+        )
 
 
 def utc_now() -> datetime:

@@ -15,6 +15,8 @@ Metric definitions (Milestone 24 Part C4):
   losing trades (an undefined ratio, never a nonfinite JSON number).
 - realized P/L and cost basis both include the entry (BUY) fee exactly
   once, charged at trade open; each exit's own fee is added on top.
+- `average_holding_days` remains explicit calendar-day compatibility data;
+  `average_holding_sessions` is the strategy-evaluation metric.
 """
 from __future__ import annotations
 
@@ -37,6 +39,7 @@ class Trade:
     realized_pnl: Decimal
     return_fraction: Decimal
     holding_days: int
+    holding_sessions: int
     exit_reason: str | None
 
 
@@ -51,6 +54,7 @@ class StrategyBacktestMetrics:
     profit_factor: Decimal | None
     expectancy: Decimal | None
     average_holding_days: Decimal | None
+    average_holding_sessions: Decimal | None
     turnover: Decimal
     exposure: Decimal
     time_to_fill_sessions: Decimal | None
@@ -58,7 +62,9 @@ class StrategyBacktestMetrics:
     by_regime: dict = field(default_factory=dict)
 
 
-def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[tuple[Trade, ...], tuple[dict, ...]]:
+def _reconstruct_trades(
+    fills: tuple[BacktestFill, ...], session_dates: tuple[date, ...] = (),
+) -> tuple[tuple[Trade, ...], tuple[dict, ...]]:
     """One open lot per symbol at a time (the shared engine enforces this),
     so a BUY opens a trade and the SELL(s) that bring its remaining
     quantity to zero close it. The entry (BUY) fee is charged once, at
@@ -68,17 +74,37 @@ def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[tuple[Trade, .
     returned separately so callers can still count its exposure days."""
     trades: list[Trade] = []
     open_lot: dict[str, dict] = {}
-    ordered = sorted(fills, key=lambda f: (f.symbol, f.market_date, 0 if f.side == "BUY" else 1))
+    # New fills carry a global monotonic sequence. Legacy fills keep their
+    # supplied tuple order within a session; side is never used as a tie
+    # breaker because that can move a later BUY ahead of an earlier SELL.
+    ordered = [
+        fill for _, fill in sorted(
+            enumerate(fills),
+            key=lambda item: (
+                item[1].market_date,
+                item[1].fill_sequence if item[1].fill_sequence is not None else item[0],
+                item[0],
+            ),
+        )
+    ]
+    session_position = {market_date: index for index, market_date in enumerate(sorted(session_dates))}
     for fill in ordered:
         if fill.side == "BUY":
-            open_lot[fill.symbol] = {
+            lot_key = fill.position_id or f"legacy:{fill.symbol}"
+            open_lot[lot_key] = {
+                "position_id": fill.position_id, "symbol": fill.symbol,
                 "entry_price": fill.fill_price, "entry_date": fill.market_date,
                 "entry_fee": fill.fees,
                 "original_quantity": fill.quantity, "remaining_quantity": fill.quantity,
                 "realized_pnl": -fill.fees, "exit_reason": None, "exit_date": fill.market_date,
             }
             continue
-        lot = open_lot.get(fill.symbol)
+        lot_key = fill.position_id
+        if lot_key is None:
+            lot_key = next(
+                (key for key, candidate in open_lot.items() if candidate["symbol"] == fill.symbol), None,
+            )
+        lot = open_lot.get(lot_key) if lot_key is not None else None
         if lot is None:
             continue
         lot["realized_pnl"] += (fill.fill_price - lot["entry_price"]) * fill.quantity - fill.fees
@@ -93,9 +119,13 @@ def _reconstruct_trades(fills: tuple[BacktestFill, ...]) -> tuple[tuple[Trade, .
                 realized_pnl=lot["realized_pnl"],
                 return_fraction=(lot["realized_pnl"] / cost_basis) if cost_basis > 0 else Decimal("0"),
                 holding_days=(lot["exit_date"] - lot["entry_date"]).days,
+                holding_sessions=max(
+                    0,
+                    session_position.get(lot["exit_date"], 0) - session_position.get(lot["entry_date"], 0),
+                ),
                 exit_reason=lot["exit_reason"],
             ))
-            del open_lot[fill.symbol]
+            del open_lot[lot_key]
     return tuple(trades), tuple(open_lot.values())
 
 
@@ -127,6 +157,9 @@ def _trade_metrics(trades: tuple[Trade, ...]) -> dict:
         "profit_factor": profit_factor,
         "expectancy": (sum((t.realized_pnl for t in trades), Decimal("0")) / n) if n else None,
         "average_holding_days": (Decimal(sum(t.holding_days for t in trades)) / n) if n else None,
+        "average_holding_sessions": (
+            Decimal(sum(t.holding_sessions for t in trades)) / n
+        ) if n else None,
     }
 
 
@@ -136,7 +169,8 @@ def compute_strategy_metrics(
     *,
     regime_by_date: dict | None = None,
 ) -> StrategyBacktestMetrics:
-    trades, open_lots = _reconstruct_trades(result.fills)
+    session_dates = tuple(state.market_date for state in result.daily_states)
+    trades, open_lots = _reconstruct_trades(result.fills, session_dates)
     buy_fills = {f.order_id: f for f in result.fills if f.side == "BUY"}
     signal_by_id = {s.signal_id: s for s in entry_signals}
 
@@ -201,6 +235,7 @@ def compute_strategy_metrics(
         profit_factor=base["profit_factor"],
         expectancy=base["expectancy"],
         average_holding_days=base["average_holding_days"],
+        average_holding_sessions=base["average_holding_sessions"],
         turnover=turnover,
         exposure=exposure,
         time_to_fill_sessions=time_to_fill,

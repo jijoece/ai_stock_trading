@@ -108,6 +108,13 @@ class EventCatalystConfig:
 
 @dataclass(frozen=True)
 class ShortlistConfig:
+    """Research prefilter limits.
+
+    `maximum_symbol_allocation_fraction` is intentionally conservative and
+    must not be interpreted as the authoritative execution-risk cap. The
+    tracked 8% value is below the standing 10% paper-book concentration cap;
+    final risk validation remains authoritative.
+    """
     maximum_candidates_per_strategy: int
     maximum_combined_shortlist: int
     maximum_symbols_to_research_per_day: int
