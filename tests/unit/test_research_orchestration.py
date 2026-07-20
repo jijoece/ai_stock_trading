@@ -18,6 +18,13 @@ from trading_research.research.orchestration import (
     compute_research_run_id,
 )
 from trading_research.research.prompt_registry import PromptRegistry
+from trading_research.research.models import (
+    TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT,
+    TOKEN_ACCOUNTING_REASONING_SEPARATE,
+)
+from trading_research.storage.database import connect
+from trading_research.storage.shadow_operations_repositories import list_budget_reservations
+from trading_research.research.token_budget import PersistentResearchTokenBudgetController
 
 from tests.support.research_fixtures import FakeResearchRepository
 
@@ -387,3 +394,116 @@ def test_full_committee_behavior_unchanged_when_manager_configured():
     assert result.status == RUN_STATUS_COMPLETED
     assert result.decision.rating == "OVERWEIGHT"
     assert repo.runs[result.research_run_id]["status"] == RUN_STATUS_COMPLETED
+
+
+def _token_controller(tmp_path, *, policy=TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT, cap=100_000):
+    conn = connect(tmp_path / "orchestration-token-budget.sqlite3")
+    return conn, PersistentResearchTokenBudgetController(
+        conn=conn, daily_token_cap=cap, maximum_reasoning_tokens=100,
+        token_accounting_policy=policy, clock=lambda: NOW,
+    )
+
+
+def test_fresh_provider_call_cannot_run_when_reservation_is_rejected(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+    })
+    conn, controller = _token_controller(tmp_path, cap=1)
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=FakeResearchRepository(),
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
+    assert provider.calls == []
+    assert list_budget_reservations(conn) == []
+
+
+def test_successful_provider_call_settles_input_output_and_reasoning(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(
+            kind="response", payload=ANALYST_REPORT_PAYLOAD,
+            usage_overrides={
+                "input_tokens": 100, "output_tokens": 50, "reasoning_output_tokens": 25,
+                "token_accounting_policy": TOKEN_ACCOUNTING_REASONING_SEPARATE,
+            },
+        ),
+    })
+    conn, controller = _token_controller(tmp_path, policy=TOKEN_ACCOUNTING_REASONING_SEPARATE)
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=FakeResearchRepository(),
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    assert result.status == RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER
+    [reservation] = list_budget_reservations(conn)
+    assert reservation["status"] == "SETTLED"
+    assert reservation["consumed_input_tokens"] == 100
+    assert reservation["consumed_output_tokens"] == 50
+    assert reservation["consumed_reasoning_tokens"] == 25
+
+
+def test_reused_research_creates_no_new_token_reservation(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(
+            kind="response", payload=ANALYST_REPORT_PAYLOAD,
+            usage_overrides={
+                "reasoning_output_tokens": 10,
+                "token_accounting_policy": TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT,
+            },
+        ),
+    })
+    repo = FakeResearchRepository()
+    conn, controller = _token_controller(tmp_path)
+    first = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    reservation_count = len(list_budget_reservations(conn))
+    second = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    assert first.reused_existing_run is False
+    assert second.reused_existing_run is True
+    assert len(provider.calls) == 1
+    assert len(list_budget_reservations(conn)) == reservation_count
+
+
+def test_provider_unavailable_releases_reservation(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="unavailable"),
+    })
+    conn, controller = _token_controller(tmp_path)
+    analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=FakeResearchRepository(),
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    [reservation] = list_budget_reservations(conn)
+    assert reservation["status"] == "RELEASED"
+
+
+def test_timeout_becomes_ambiguous_and_blocks_automatic_retry(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(kind="timeout"),
+        ("fundamental", 2): ScriptedStep(kind="response", payload=ANALYST_REPORT_PAYLOAD),
+    })
+    conn, controller = _token_controller(tmp_path)
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=FakeResearchRepository(),
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=2), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
+    assert len(provider.calls) == 1
+    [reservation] = list_budget_reservations(conn)
+    assert reservation["status"] == "AMBIGUOUS"

@@ -73,9 +73,31 @@ CREATE TABLE IF NOT EXISTS shadow_budget_reservations (
     consumed_output_tokens INTEGER NOT NULL DEFAULT 0,
     consumed_latency_seconds INTEGER NOT NULL DEFAULT 0,
     emergency_margin_breached INTEGER NOT NULL DEFAULT 0,
+    reservation_kind TEXT NOT NULL DEFAULT 'RESEARCH_COST',
+    budget_date TEXT,
+    reserved_reasoning_tokens INTEGER,
+    consumed_reasoning_tokens INTEGER,
+    token_accounting_policy TEXT,
+    provider_request_id TEXT,
     created_at TEXT NOT NULL,
     settled_at TEXT,
     UNIQUE (idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_token_budget_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL REFERENCES shadow_budget_reservations(reservation_id),
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    operator TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reconciliation_source TEXT NOT NULL,
+    provider_request_id TEXT,
+    actual_input_tokens INTEGER,
+    actual_output_tokens INTEGER,
+    actual_reasoning_tokens INTEGER,
+    token_accounting_policy TEXT,
+    reconciled_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS shadow_budget_usage (
@@ -171,10 +193,32 @@ CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_role ON shadow_role_bud
 CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_symbol ON shadow_role_budget_checks(symbol);
 CREATE INDEX IF NOT EXISTS idx_shadow_role_budget_checks_decision ON shadow_role_budget_checks(decision);
 CREATE INDEX IF NOT EXISTS idx_shadow_budget_usage_attempts_reservation ON shadow_budget_usage_attempts(reservation_id);
+CREATE INDEX IF NOT EXISTS idx_shadow_token_budget_reconciliations_reservation
+    ON shadow_token_budget_reconciliations(reservation_id);
 """
 
 
 def apply_shadow_operations_schema(conn) -> None:
     conn.executescript(SHADOW_OPERATIONS_DDL)
+    # CREATE TABLE IF NOT EXISTS does not add columns to databases created by
+    # older releases.  Keep this additive migration local and idempotent so
+    # existing operational databases gain the token-accounting audit fields
+    # without a destructive table rebuild.
+    existing_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(shadow_budget_reservations)").fetchall()
+    }
+    additive_columns = {
+        "reservation_kind": "TEXT NOT NULL DEFAULT 'RESEARCH_COST'",
+        "budget_date": "TEXT",
+        "reserved_reasoning_tokens": "INTEGER",
+        "consumed_reasoning_tokens": "INTEGER",
+        "token_accounting_policy": "TEXT",
+        "provider_request_id": "TEXT",
+    }
+    for column_name, declaration in additive_columns.items():
+        if column_name not in existing_columns:
+            conn.execute(
+                f"ALTER TABLE shadow_budget_reservations ADD COLUMN {column_name} {declaration}"
+            )
     conn.executescript(SHADOW_OPERATIONS_INDEXES)
     conn.commit()
