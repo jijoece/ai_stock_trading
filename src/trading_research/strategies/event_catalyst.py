@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from .config import EventCatalystConfig
 from .contracts import StrategyContext, StrategyMarketData, StrategySignal, StrategyStatus
-from .factors import average_true_range, closes, volume_ratio
+from .factors import average_true_range
 from .safety_gates import classify_safety_status
 from .timestamps import bar_series_data_as_of
 
@@ -93,73 +93,144 @@ class EventDrivenCatalystStrategy:
                 symbol, context.now, StrategyStatus.NOT_ELIGIBLE, 0.0,
                 ("event_not_positive",), {},
             )
-        selected_event = min(positive_events, key=lambda e: e.event_timestamp)
+        # Milestone 25 Part B5: select the most recent qualifying positive
+        # event, not the oldest — an older event must never mask a newer
+        # material one. Ordered by published_timestamp desc (when the
+        # information became knowable to the market), then
+        # effective_timestamp desc, then event_timestamp desc, with
+        # event_id ascending as the final deterministic tie-break.
+        selected_event = min(
+            positive_events,
+            key=lambda e: (
+                -e.published_timestamp.timestamp(),
+                -e.effective_timestamp.timestamp(),
+                -e.event_timestamp.timestamp(),
+                e.event_id,
+            ),
+        )
 
-        close_series = closes(bars)
-        latest_close = close_series[-1]
-        prior_close = close_series[-2] if len(close_series) >= 2 else None
-        vol_ratio = volume_ratio(bars, cfg.volume_lookback_days)
         atr = average_true_range(bars, cfg.atr_period)
-
-        if vol_ratio is None or prior_close is None or atr is None:
+        if atr is None:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
-                ("insufficient_factor_history",), {},
+                ("missing_atr_history",), {},
             )
 
-        # Milestone 24 Part B1: data_as_of is the latest availability
-        # timestamp among the selected event's published timestamp, its
-        # effective timestamp (only once already effective — an event
-        # announced now but effective later must not backdate data_as_of
-        # into the future), and the latest confirming bar's available_at.
+        # Milestone 25 Part B4/B6: align the reference/confirmation bars to
+        # the selected event's actual market timing rather than always
+        # comparing the latest close to the immediately previous close.
+        reference_index, first_tradable_index = self._reference_and_first_tradable_index(
+            bars, selected_event.published_timestamp,
+        )
+        if reference_index is None:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("no_pre_event_reference_bar",), {},
+            )
+        if first_tradable_index is None:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("no_first_post_event_session",), {},
+            )
+        last_bar_index = len(bars) - 1
+        if first_tradable_index > last_bar_index:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("no_confirmation_bar",), {},
+            )
+        if first_tradable_index < cfg.volume_lookback_days:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("missing_volume_history",), {},
+            )
+
+        pre_event_reference_close = float(bars[reference_index].close)
+        confirmation_bar = bars[last_bar_index]
+        confirmation_close = float(confirmation_bar.close)
+        # Milestone 25 Part B7: confirmation_window_days is interpreted as a
+        # maximum count of market *sessions* after the first tradable
+        # session, not calendar days.
+        sessions_since_first_tradable_session = last_bar_index - first_tradable_index
+
+        window_bars = bars[first_tradable_index:last_bar_index + 1]
+        baseline_bars = bars[first_tradable_index - cfg.volume_lookback_days:first_tradable_index]
+        baseline_avg_volume = sum(b.volume for b in baseline_bars) / cfg.volume_lookback_days
+        if baseline_avg_volume <= 0:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("missing_volume_history",), {},
+            )
+        window_avg_volume = sum(b.volume for b in window_bars) / len(window_bars)
+        post_event_volume_ratio = window_avg_volume / baseline_avg_volume
+
+        # Milestone 25 Part B1: data_as_of covers every bar actually used
+        # (via the already-verified full-series bound) plus the selected
+        # event's own knowability timestamps.
         data_as_of_candidates = [selected_event.published_timestamp, confirming_bar_data_as_of]
         if selected_event.effective_timestamp <= context.now:
             data_as_of_candidates.append(selected_event.effective_timestamp)
         data_as_of = max(data_as_of_candidates)
 
-        # Milestone 24 Part B3: signed price response — an event confirmed
-        # by volume but with a *negative* close-to-close move must never
-        # pass just because its magnitude is within the gap ceiling.
-        # `gap_percent` (absolute) remains a separate upper-bound extension
-        # guard; `signed_response_percent` is the actual confirmation gate.
-        signed_response_percent = (
-            (latest_close - prior_close) / prior_close * 100.0 if prior_close > 0 else float("-inf")
+        if pre_event_reference_close <= 0:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("no_pre_event_reference_bar",), {}, data_as_of=data_as_of,
+            )
+
+        # Milestone 25 Part B8: the event-aligned response, not the latest
+        # one-day return.
+        event_response_percent = (confirmation_close - pre_event_reference_close) / pre_event_reference_close * 100.0
+        maximum_post_event_extension_percent = max(
+            abs(float(b.close) - pre_event_reference_close) / pre_event_reference_close * 100.0
+            for b in window_bars
         )
-        gap_percent = abs(latest_close - prior_close) / prior_close * 100.0 if prior_close > 0 else float("inf")
-        volume_confirmed = vol_ratio >= cfg.minimum_volume_ratio
-        response_confirmed = signed_response_percent >= cfg.minimum_positive_response_percent
-        gap_ok = gap_percent <= cfg.maximum_gap_percent
+
+        within_window = sessions_since_first_tradable_session < cfg.confirmation_window_days
+        volume_confirmed = post_event_volume_ratio >= cfg.minimum_volume_ratio
+        response_confirmed = event_response_percent >= cfg.minimum_positive_response_percent
+        extension_ok = maximum_post_event_extension_percent <= cfg.maximum_gap_percent
 
         reasons = (
             "recent_positive_event_confirmed",
             ("volume_confirmed" if volume_confirmed else "volume_insufficient"),
             ("response_confirmed" if response_confirmed else "insufficient_price_response"),
-            ("gap_ok" if gap_ok else "excessive_gap"),
+            ("gap_ok" if extension_ok else "excessive_gap"),
+            ("within_confirmation_window" if within_window else "confirmation_window_expired"),
         )
         factor_values = {
-            "volume_ratio": vol_ratio,
-            "gap_percent": gap_percent,
-            "signed_response_percent": signed_response_percent,
+            "volume_ratio": post_event_volume_ratio,
+            "gap_percent": maximum_post_event_extension_percent,
+            "signed_response_percent": event_response_percent,
             "atr": atr,
             "event_age_hours": (context.now - selected_event.event_timestamp).total_seconds() / 3600.0,
+            "pre_event_reference_close": pre_event_reference_close,
+            "confirmation_close": confirmation_close,
+            "event_response_percent": event_response_percent,
+            "maximum_post_event_extension_percent": maximum_post_event_extension_percent,
+            "post_event_volume_ratio": post_event_volume_ratio,
+            "sessions_since_first_tradable_session": float(sessions_since_first_tradable_session),
+            "selected_event_age_hours": (context.now - selected_event.event_timestamp).total_seconds() / 3600.0,
         }
 
-        eligible = volume_confirmed and response_confirmed and gap_ok
+        eligible = volume_confirmed and response_confirmed and extension_ok and within_window
         if not eligible:
             return self._signal(symbol, context.now,
                                  StrategyStatus.NOT_ELIGIBLE, 0.0, reasons, factor_values,
                                  data_as_of=data_as_of)
 
-        signal_strength = self._signal_strength(vol_ratio, cfg.minimum_volume_ratio, gap_percent, cfg.maximum_gap_percent)
+        signal_strength = self._signal_strength(
+            post_event_volume_ratio, cfg.minimum_volume_ratio,
+            maximum_post_event_extension_percent, cfg.maximum_gap_percent,
+        )
 
-        entry = Decimal(str(latest_close))
+        entry = Decimal(str(confirmation_close))
         # Milestone 24 Part B4: event-catalyst signals previously had no
         # invalidation price or initial stop at all, so an eligible signal
         # could never pass `build_strategy_order_intent_context`. Derive a
         # deterministic positive stop from ATR, same convention as the
         # other two strategies; never fabricate one when ATR/the resulting
         # stop is not usable.
-        stop = Decimal(str(round(latest_close - cfg.atr_stop_multiple * atr, 4)))
+        stop = Decimal(str(round(confirmation_close - cfg.atr_stop_multiple * atr, 4)))
         if stop <= 0 or stop >= entry:
             return self._signal(
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
@@ -171,6 +242,51 @@ class EventDrivenCatalystStrategy:
             initial_stop_reference=stop, target_reference=None,
             expected_holding_period=cfg.maximum_holding_days, data_as_of=data_as_of,
         )
+
+    @staticmethod
+    def _reference_and_first_tradable_index(
+        bars: tuple, published_timestamp: datetime,
+    ) -> tuple[int | None, int | None]:
+        """Milestone 25 Part B6: deterministic, daily-bars-only market-timing
+        alignment for one event's `published_timestamp`.
+
+        - A bar exists for the published calendar date and publication
+          happened before that bar's `available_at` (i.e. during market
+          hours, before the session closed): the reference is the last
+          completed bar *before* that session, and — because a still-daily
+          bar cannot prove whether the still-open session already reflects
+          the news — the first tradable confirmation session is
+          conservatively the *next* session after the published day.
+        - A bar exists for the published date and publication happened at
+          or after that bar's `available_at` (published after market
+          close): the reference is that session's own completed close, and
+          the first tradable session is the next one.
+        - No bar exists for the published date (weekend/holiday): the
+          reference is the last completed session strictly before
+          publication, and the first tradable session is the next
+          available session on or after publication.
+
+        Returns `(reference_index, first_tradable_index)`; either may be
+        `None` when it cannot be determined from the available bars.
+        """
+        published_date = published_timestamp.date()
+        same_day_index = next((i for i, b in enumerate(bars) if b.session_date == published_date), None)
+        if same_day_index is not None:
+            bar = bars[same_day_index]
+            if published_timestamp < bar.available_at:
+                reference_index = same_day_index - 1 if same_day_index > 0 else None
+                first_tradable_index = same_day_index + 1 if same_day_index + 1 < len(bars) else None
+            else:
+                reference_index = same_day_index
+                first_tradable_index = same_day_index + 1 if same_day_index + 1 < len(bars) else None
+        else:
+            prior_indices = [i for i, b in enumerate(bars) if b.session_date < published_date]
+            if not prior_indices:
+                return None, None
+            reference_index = prior_indices[-1]
+            after_indices = [i for i, b in enumerate(bars) if b.session_date > published_date]
+            first_tradable_index = after_indices[0] if after_indices else None
+        return reference_index, first_tradable_index
 
     @staticmethod
     def _signal_strength(vol_ratio: float, min_vol_ratio: float, gap_percent: float, max_gap: float) -> float:

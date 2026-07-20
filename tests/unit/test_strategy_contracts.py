@@ -10,7 +10,8 @@ from trading_research.strategies.contracts import (
     StrategyMarketData,
     StrategySignal,
     StrategyStatus,
-    derive_canonical_strategy_signal_id,
+    derive_strategy_evaluation_id,
+    derive_strategy_signal_content_id,
 )
 
 from tests.unit._strategy_test_helpers import build_bars, passing_screening_result
@@ -120,16 +121,17 @@ def test_non_eligible_signal_may_omit_execution_fields():
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
 
 
-def test_identical_signals_produce_identical_canonical_ids():
-    """Milestone 24 Part B7."""
+def test_identical_signals_produce_identical_content_and_evaluation_ids():
+    """Milestone 25 Part B10."""
     a = make_signal()
     b = make_signal()
-    assert derive_canonical_strategy_signal_id(a) == derive_canonical_strategy_signal_id(b)
+    assert derive_strategy_signal_content_id(a) == derive_strategy_signal_content_id(b)
+    assert derive_strategy_evaluation_id(a) == derive_strategy_evaluation_id(b)
 
 
-def test_canonical_id_changes_when_execution_relevant_factors_change():
+def test_content_id_changes_when_execution_relevant_factors_change():
     base = make_signal()
-    base_id = derive_canonical_strategy_signal_id(base)
+    base_id = derive_strategy_signal_content_id(base)
     variants = (
         replace(base, entry_reference=Decimal("101")),
         replace(base, limit_reference=Decimal("101")),
@@ -145,4 +147,20 @@ def test_canonical_id_changes_when_execution_relevant_factors_change():
                 invalidation_price=None, initial_stop_reference=None),
     )
     for variant in variants:
-        assert derive_canonical_strategy_signal_id(variant) != base_id
+        assert derive_strategy_signal_content_id(variant) != base_id
+
+
+def test_content_id_is_unchanged_by_evaluation_time_but_evaluation_id_changes():
+    """Milestone 25 Part B10: an unchanged signal re-evaluated at a
+    different signal_timestamp keeps the same content ID but gets a
+    different evaluation ID."""
+    base = make_signal()
+    later = replace(base, signal_timestamp=NOW.replace(hour=23))
+    assert derive_strategy_signal_content_id(base) == derive_strategy_signal_content_id(later)
+    assert derive_strategy_evaluation_id(base) != derive_strategy_evaluation_id(later)
+
+
+def test_evaluation_id_changes_when_content_changes():
+    base = make_signal()
+    variant = replace(base, entry_reference=Decimal("101"))
+    assert derive_strategy_evaluation_id(base) != derive_strategy_evaluation_id(variant)

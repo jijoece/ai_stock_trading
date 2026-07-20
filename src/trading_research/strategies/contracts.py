@@ -152,25 +152,15 @@ class CandidateStrategy(Protocol):
         ...
 
 
-def derive_canonical_strategy_signal_id(signal: StrategySignal) -> str:
-    """Milestone 24 Part B7: the single canonical strategy-signal identity.
-
-    Derived from every execution-relevant, immutable field — strategy
-    identity/version, symbol, both timestamps, status, entry/limit/stop/
-    invalidation/target references, holding period, reason codes, numeric
-    factor values, and configuration hash — under sorted canonical JSON
-    serialization. Two signals identical across all of these fields always
-    produce the same ID; changing any one of them changes the ID. This is
-    the only signal-ID derivation in the codebase — execution boundary,
-    backtest adapter, and any future persistence/order-intent linkage all
-    call this function rather than deriving their own.
-    """
-    payload = {
+def _content_payload(signal: StrategySignal) -> dict:
+    """Milestone 25 Part B10: every field that represents unchanged
+    *economic signal content* — excludes `signal_timestamp` (the moment of
+    one evaluation invocation), which lives only in the evaluation ID."""
+    return {
         "strategy_id": signal.strategy_id,
         "strategy_version": signal.strategy_version,
         "symbol": signal.symbol,
         "data_as_of": signal.data_as_of.isoformat() if signal.data_as_of is not None else None,
-        "signal_timestamp": signal.signal_timestamp.isoformat(),
         "status": signal.status.value,
         "entry_reference": str(signal.entry_reference) if signal.entry_reference is not None else None,
         "limit_reference": str(signal.limit_reference) if signal.limit_reference is not None else None,
@@ -184,5 +174,31 @@ def derive_canonical_strategy_signal_id(signal: StrategySignal) -> str:
         "factor_values": {key: signal.factor_values[key] for key in sorted(signal.factor_values)},
         "configuration_hash": signal.configuration_hash,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def derive_strategy_signal_content_id(signal: StrategySignal) -> str:
+    """Milestone 25 Part B10: the content identity of a strategy signal —
+    represents unchanged economic signal content, independent of *when* the
+    signal was evaluated. An unchanged signal re-evaluated five minutes
+    later produces the same content ID; changing any economically
+    meaningful field (status, references, factors, reason codes,
+    configuration) changes it. Use this ID for research reuse, candidate
+    deduplication, strategy signal persistence identity, and future
+    order-intent deduplication.
+    """
+    encoded = json.dumps(_content_payload(signal), sort_keys=True, separators=(",", ":")).encode()
     return "strat-sig-" + hashlib.sha256(encoded).hexdigest()[:32]
+
+
+def derive_strategy_evaluation_id(signal: StrategySignal) -> str:
+    """Milestone 25 Part B10: the evaluation identity of a strategy signal —
+    the audit record for one evaluation invocation. Includes
+    `signal_timestamp`, so two structurally identical signals evaluated at
+    different times get different evaluation IDs even though they share the
+    same content ID. Use this ID for audit history and individual scanner
+    invocation tracing — never for deduplication (use
+    `derive_strategy_signal_content_id` instead).
+    """
+    payload = {**_content_payload(signal), "signal_timestamp": signal.signal_timestamp.isoformat()}
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return "strat-eval-" + hashlib.sha256(encoded).hexdigest()[:32]

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
-from .contracts import StrategySignal, StrategyStatus, derive_canonical_strategy_signal_id
+from .contracts import StrategySignal, StrategyStatus, derive_strategy_signal_content_id
 
 
 class StrategyExecutionBoundaryError(ValueError):
@@ -63,10 +63,12 @@ class StrategyOrderIntentContext:
 
 
 def derive_strategy_signal_id(signal: StrategySignal) -> str:
-    """Milestone 24 Part B7: delegates to the single canonical derivation in
-    `contracts.py` — kept as a re-export here so existing call sites in this
-    module do not need to change."""
-    return derive_canonical_strategy_signal_id(signal)
+    """Milestone 25 Part B10: delegates to the content-identity derivation
+    in `contracts.py` — an order intent must dedupe on unchanged signal
+    content, not on the moment it happened to be (re-)evaluated. Kept as a
+    re-export here so existing call sites in this module do not need to
+    change."""
+    return derive_strategy_signal_content_id(signal)
 
 
 def build_strategy_order_intent_context(signal: StrategySignal) -> StrategyOrderIntentContext:
