@@ -16,6 +16,23 @@ from decimal import Decimal
 from ..utc import canonical_utc_iso
 
 
+class AttemptReservationIntegrityError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_ACTIVE_ATTEMPT_RESERVATION_STATES = (
+    "RESERVED", "RECONCILIATION_REQUIRED", "SUBMITTED",
+)
+_ATTEMPT_RESERVATION_TRANSITION_SOURCES = {
+    "SUBMITTED": frozenset({"RESERVED", "RECONCILIATION_REQUIRED"}),
+    "RELEASED": frozenset({"RESERVED", "RECONCILIATION_REQUIRED"}),
+    "RECONCILIATION_REQUIRED": frozenset({"RESERVED"}),
+    "SUPERSEDED_BY_RETRY": frozenset({"RESERVED", "RECONCILIATION_REQUIRED"}),
+}
+
+
 def _dec(value: str | None) -> Decimal | None:
     return None if value is None else Decimal(value)
 
@@ -1725,17 +1742,49 @@ def load_attempt_reservation(
     return dict(row) if row else None
 
 
-def find_attempt_reservation_by_attempt(
+def list_attempt_reservations_for_attempt(
     conn: sqlite3.Connection, client_order_id: str, attempt_number: int,
+    account_fingerprint: str, book_id: str,
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM paper_external_attempt_reservations "
+        "WHERE client_order_id = ? AND attempt_number = ? "
+        "AND account_fingerprint = ? AND book_id = ? "
+        "ORDER BY created_at, reservation_date, reservation_id",
+        (client_order_id, attempt_number, account_fingerprint, book_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_active_attempt_reservation(
+    conn: sqlite3.Connection, client_order_id: str, attempt_number: int,
+    account_fingerprint: str, book_id: str,
 ) -> dict | None:
-    """Milestone 25 Part A3: locate the (unique in practice) reservation
-    for one prior submission attempt, regardless of its reservation_date —
-    used to resolve a stale cross-day ambiguous reservation before a retry
-    reserves against the current date."""
+    rows = conn.execute(
+        "SELECT * FROM paper_external_attempt_reservations "
+        "WHERE client_order_id = ? AND attempt_number = ? "
+        "AND account_fingerprint = ? AND book_id = ? "
+        "AND state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED') "
+        "ORDER BY created_at, reservation_date, reservation_id LIMIT 2",
+        (client_order_id, attempt_number, account_fingerprint, book_id),
+    ).fetchall()
+    if len(rows) > 1:
+        raise AttemptReservationIntegrityError(
+            "ATTEMPT_RESERVATION_CONFLICT", "multiple active reservations exist for one attempt lineage",
+        )
+    return dict(rows[0]) if rows else None
+
+
+def load_latest_attempt_reservation(
+    conn: sqlite3.Connection, client_order_id: str, attempt_number: int,
+    account_fingerprint: str, book_id: str,
+) -> dict | None:
     row = conn.execute(
         "SELECT * FROM paper_external_attempt_reservations "
-        "WHERE client_order_id = ? AND attempt_number = ? ORDER BY created_at LIMIT 1",
-        (client_order_id, attempt_number),
+        "WHERE client_order_id = ? AND attempt_number = ? "
+        "AND account_fingerprint = ? AND book_id = ? "
+        "ORDER BY created_at DESC, reservation_date DESC, reservation_id DESC LIMIT 1",
+        (client_order_id, attempt_number, account_fingerprint, book_id),
     ).fetchone()
     return dict(row) if row else None
 
@@ -1760,6 +1809,26 @@ def sum_attempt_reservations_by_date(
     total = Decimal("0")
     for row in conn.execute(query, params).fetchall():
         total += Decimal(row["reserved_notional_usd"])
+    # Rolling-upgrade protection: count an active legacy row only when an
+    # equivalent active attempt-0 row has not yet been backfilled. Normal
+    # initialized databases take the fast NOT EXISTS path and never double
+    # count migrated rows.
+    legacy_query = (
+        "SELECT legacy.reserved_notional_usd FROM paper_external_daily_reservations AS legacy "
+        "WHERE legacy.account_fingerprint = ? AND legacy.reservation_date = ? "
+        "AND legacy.state IN ('RESERVED', 'SUBMITTED', 'RECONCILIATION_REQUIRED') "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM paper_external_attempt_reservations AS attempt "
+        "WHERE attempt.client_order_id = legacy.client_order_id "
+        "AND attempt.attempt_number = 0 "
+        "AND attempt.account_fingerprint = legacy.account_fingerprint "
+        "AND attempt.reservation_date = legacy.reservation_date "
+        "AND attempt.book_id = legacy.book_id "
+        "AND attempt.reserved_notional_usd = legacy.reserved_notional_usd "
+        "AND attempt.state IN ('RESERVED', 'SUBMITTED', 'RECONCILIATION_REQUIRED'))"
+    )
+    for row in conn.execute(legacy_query, (account_fingerprint, reservation_date)).fetchall():
+        total += Decimal(row["reserved_notional_usd"])
     return total
 
 
@@ -1781,16 +1850,58 @@ def save_attempt_reservation(
     return cursor.rowcount > 0
 
 
-def update_attempt_reservation_state(
-    conn: sqlite3.Connection, reservation_id: str, new_state: str, updated_at: str, *, commit: bool = True,
-) -> None:
-    """Milestone 25 Part A3: transition an attempt reservation's state.
-    Only state and updated_at may change; all other fields are immutable."""
-    conn.execute(
-        "UPDATE paper_external_attempt_reservations SET state = ?, updated_at = ? WHERE reservation_id = ?",
-        (new_state, updated_at, reservation_id),
+def transition_attempt_reservation_state(
+    conn: sqlite3.Connection, reservation_id: str, expected_states: tuple[str, ...] | frozenset[str],
+    new_state: str, updated_at: str, *, commit: bool = True,
+) -> dict:
+    """Conditionally apply an allowed, idempotent reservation transition."""
+    expected = frozenset(expected_states)
+    allowed = _ATTEMPT_RESERVATION_TRANSITION_SOURCES.get(new_state, frozenset())
+    if not expected or not expected.issubset(allowed):
+        raise AttemptReservationIntegrityError(
+            "RESERVATION_STATE_CONFLICT", "requested reservation transition is not allowed",
+        )
+    placeholders = ", ".join("?" for _ in expected)
+    cursor = conn.execute(
+        "UPDATE paper_external_attempt_reservations SET state = ?, updated_at = ? "
+        f"WHERE reservation_id = ? AND state IN ({placeholders})",
+        (new_state, updated_at, reservation_id, *sorted(expected)),
     )
-    _commit_if(conn, commit)
+    if cursor.rowcount == 1:
+        row = load_attempt_reservation(conn, reservation_id)
+        assert row is not None
+        _sync_legacy_attempt_zero_reservation(conn, row, updated_at)
+        _commit_if(conn, commit)
+        return row
+    row = load_attempt_reservation(conn, reservation_id)
+    if row is not None and row["state"] == new_state:
+        _sync_legacy_attempt_zero_reservation(conn, row, updated_at)
+        _commit_if(conn, commit)
+        return row
+    raise AttemptReservationIntegrityError(
+        "RESERVATION_STATE_CONFLICT", "reservation state changed or reservation is missing",
+    )
+
+
+def _sync_legacy_attempt_zero_reservation(
+    conn: sqlite3.Connection, attempt: dict, updated_at: str,
+) -> None:
+    """Keep a migrated legacy row from becoming active again after transition."""
+    if attempt["attempt_number"] != 0:
+        return
+    legacy_state = (
+        "RELEASED" if attempt["state"] == "SUPERSEDED_BY_RETRY" else attempt["state"]
+    )
+    conn.execute(
+        "UPDATE paper_external_daily_reservations SET state = ?, updated_at = ? "
+        "WHERE client_order_id = ? AND account_fingerprint = ? AND reservation_date = ? "
+        "AND book_id = ? AND reserved_notional_usd = ? "
+        "AND state IN ('RESERVED', 'SUBMITTED', 'RECONCILIATION_REQUIRED')",
+        (
+            legacy_state, updated_at, attempt["client_order_id"], attempt["account_fingerprint"],
+            attempt["reservation_date"], attempt["book_id"], attempt["reserved_notional_usd"],
+        ),
+    )
 
 
 def enqueue_external_submission(

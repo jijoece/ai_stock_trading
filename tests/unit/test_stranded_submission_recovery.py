@@ -211,6 +211,13 @@ def test_recovery_finds_broker_order_and_applies_fills(tmp_path):
     assert event["new_state"] == STATE_FILLED
     fills = repo.list_fills_for_intent(restarted, "BASELINE", "intent-1")
     assert len(fills) == 1
+    client_order_id, _ = derive_external_order_identity(
+        repo.load_order_intent(restarted, "BASELINE", "intent-1"),
+    )
+    daily = repo.load_latest_attempt_reservation(
+        restarted, client_order_id, 0, FINGERPRINT, "BASELINE",
+    )
+    assert daily["state"] == "SUBMITTED"
     # Terminal releases only the remaining reservation.
     assert cash_ledger.reserved_cash(restarted, "BASELINE") == Decimal("0")
     restarted.close()
@@ -240,6 +247,10 @@ def test_recovery_with_authoritative_not_found_transitions_to_unknown(tmp_path):
     lookup = repo.load_latest_external_lookup(restarted, "BASELINE", client_order_id)
     assert lookup["result"] == "NOT_FOUND"
     assert lookup["authoritative"] == 1
+    daily = repo.load_latest_attempt_reservation(
+        restarted, client_order_id, 0, FINGERPRINT, "BASELINE",
+    )
+    assert daily["state"] == "RECONCILIATION_REQUIRED"
     restarted.close()
 
 
@@ -266,6 +277,33 @@ def test_recovery_with_lookup_timeout_is_ambiguous_not_authoritative(tmp_path):
     lookup = repo.load_latest_external_lookup(restarted, "BASELINE", client_order_id)
     # A timeout/exception is never authoritative NOT_FOUND evidence.
     assert lookup["authoritative"] == 0
+    daily = repo.load_latest_attempt_reservation(
+        restarted, client_order_id, 0, FINGERPRINT, "BASELINE",
+    )
+    assert daily["state"] == "RECONCILIATION_REQUIRED"
+    restarted.close()
+
+
+def test_recovery_rejected_order_releases_unconfirmed_attempt_reservation(tmp_path):
+    db_path = tmp_path / "recover-rejected.sqlite3"
+    cfg = _config()
+    _strand_at_submission_requested(db_path, cfg)
+
+    restarted = connect(db_path)
+    runtime = _RecoveryRuntime(
+        lookup_mode="rejected", order_overrides={"status": "REJECTED", "filled_quantity": "0"},
+    )
+    recover_stranded_submission(
+        restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    client_order_id, _ = derive_external_order_identity(
+        repo.load_order_intent(restarted, "BASELINE", "intent-1"),
+    )
+    daily = repo.load_latest_attempt_reservation(
+        restarted, client_order_id, 0, FINGERPRINT, "BASELINE",
+    )
+    assert daily["state"] == "RELEASED"
     restarted.close()
 
 

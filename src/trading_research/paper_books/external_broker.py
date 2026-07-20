@@ -20,6 +20,7 @@ from typing import Protocol
 from ..shadow import pause as pause_mod
 from ..storage import paper_books_repositories as repo
 from ..storage.database import begin_immediate
+from ..storage.paper_books_schema import derive_external_attempt_reservation_id
 from ..storage.transactions import transaction
 from ..storage.shadow_alerts_repositories import list_alerts
 from . import cash_ledger, positions
@@ -180,21 +181,57 @@ _RESERVATION_STATE_SUPERSEDED_BY_RETRY = "SUPERSEDED_BY_RETRY"
 
 
 def _derive_reservation_id(client_order_id: str, attempt_number: int, account_fingerprint: str, reservation_date: str) -> str:
-    """Milestone 25 Part A2: deterministic reservation identity combining
-    attempt number, account fingerprint, and date to support cross-day retries."""
-    immutable = {
-        "client_order_id": client_order_id,
-        "attempt_number": attempt_number,
-        "account_fingerprint": account_fingerprint,
-        "reservation_date": reservation_date,
-    }
-    return _digest("resvn_", immutable, 40)
+    return derive_external_attempt_reservation_id(
+        client_order_id, attempt_number, account_fingerprint, reservation_date,
+    )
+
+
+def _raise_reservation_integrity(exc: repo.AttemptReservationIntegrityError) -> None:
+    raise ExternalPaperError(exc.code, str(exc)) from exc
+
+
+def _validate_attempt_reservation_payload(
+    reservation: dict, *, client_order_id: str, attempt_number: int, fingerprint: str,
+    book_id: str, notional: Decimal, reservation_date: str | None = None,
+) -> None:
+    try:
+        stored_notional = Decimal(reservation["reserved_notional_usd"])
+    except (InvalidOperation, KeyError, TypeError) as exc:
+        raise ExternalPaperError(
+            "ATTEMPT_RESERVATION_PAYLOAD_MISMATCH", "attempt reservation notional is malformed",
+        ) from exc
+    mismatched = (
+        reservation.get("client_order_id") != client_order_id
+        or reservation.get("attempt_number") != attempt_number
+        or reservation.get("account_fingerprint") != fingerprint
+        or reservation.get("book_id") != book_id
+        or stored_notional != notional
+        or (reservation_date is not None and reservation.get("reservation_date") != reservation_date)
+    )
+    if mismatched:
+        raise ExternalPaperError(
+            "ATTEMPT_RESERVATION_PAYLOAD_MISMATCH",
+            "attempt reservation immutable fields do not match the requested reservation",
+        )
+
+
+def _transition_attempt_reservation(
+    conn: sqlite3.Connection, reservation_id: str, expected_states: tuple[str, ...],
+    new_state: str, now: datetime, *, commit: bool = True,
+) -> dict:
+    try:
+        return repo.transition_attempt_reservation_state(
+            conn, reservation_id, expected_states, new_state, now.isoformat(), commit=commit,
+        )
+    except repo.AttemptReservationIntegrityError as exc:
+        _raise_reservation_integrity(exc)
 
 
 def _reserve_daily_notional(
     conn: sqlite3.Connection, cfg: PaperBooksConfiguration, *, book_id: str, fingerprint: str,
     client_order_id: str, attempt_number: int, intent: dict, now: datetime,
     supersede_reservation_id: str | None = None,
+    supersede_attempt_number: int | None = None,
 ) -> dict:
     """Milestone 25 Part A2/A3: atomic, account-wide external-paper daily
     notional budget with attempt-scoped identity. Scoped by
@@ -228,16 +265,66 @@ def _reserve_daily_notional(
     with transaction(conn):
         existing = repo.load_attempt_reservation(conn, reservation_id)
         if existing is not None:
+            _validate_attempt_reservation_payload(
+                existing, client_order_id=client_order_id, attempt_number=attempt_number,
+                fingerprint=fingerprint, book_id=book_id, notional=notional,
+                reservation_date=reservation_date,
+            )
             return existing
+        try:
+            active = repo.load_active_attempt_reservation(
+                conn, client_order_id, attempt_number, fingerprint, book_id,
+            )
+        except repo.AttemptReservationIntegrityError as exc:
+            _raise_reservation_integrity(exc)
+        if active is not None:
+            _validate_attempt_reservation_payload(
+                active, client_order_id=client_order_id, attempt_number=attempt_number,
+                fingerprint=fingerprint, book_id=book_id, notional=notional,
+            )
+            if (
+                active["reservation_date"] != reservation_date
+                and active["state"] != _RESERVATION_STATE_RESERVED
+            ):
+                raise ExternalPaperError(
+                    "ATTEMPT_RESERVATION_CONFLICT",
+                    "only an unstarted reserved attempt may carry forward across dates",
+                )
+            return active
         if supersede_reservation_id is not None:
             prior = repo.load_attempt_reservation(conn, supersede_reservation_id)
-            if prior is not None and prior["state"] in (
-                _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
-            ):
-                repo.update_attempt_reservation_state(
-                    conn, supersede_reservation_id, _RESERVATION_STATE_SUPERSEDED_BY_RETRY,
-                    now.isoformat(), commit=False,
+            if prior is None:
+                raise ExternalPaperError(
+                    "ATTEMPT_RESERVATION_MISSING", "prior attempt reservation is required for retry",
                 )
+            if supersede_attempt_number is None:
+                raise ExternalPaperError(
+                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt number is required for retry",
+                )
+            try:
+                prior_notional = Decimal(prior["reserved_notional_usd"])
+            except (InvalidOperation, KeyError, TypeError) as exc:
+                raise ExternalPaperError(
+                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation is malformed",
+                ) from exc
+            if (
+                prior.get("client_order_id") != client_order_id
+                or prior.get("attempt_number") != supersede_attempt_number
+                or prior.get("account_fingerprint") != fingerprint
+                or prior.get("book_id") != book_id
+                or prior_notional != notional
+                or prior.get("state") not in (
+                    _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+                )
+            ):
+                raise ExternalPaperError(
+                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation scope or state differs",
+                )
+            _transition_attempt_reservation(
+                conn, supersede_reservation_id,
+                (_RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED),
+                _RESERVATION_STATE_SUPERSEDED_BY_RETRY, now, commit=False,
+            )
         already_reserved = repo.sum_attempt_reservations_by_date(conn, fingerprint, reservation_date)
         if already_reserved + notional > cfg.external_broker.maximum_daily_notional_usd:
             raise ExternalPaperError(
@@ -258,8 +345,8 @@ def _reserve_daily_notional(
 
 
 def _settle_daily_reservation(
-    conn: sqlite3.Connection, *, client_order_id: str, attempt_number: int, fingerprint: str,
-    reservation_date: str, status: str, now: datetime,
+    conn: sqlite3.Connection, *, reservation_id: str, status: str, now: datetime,
+    commit: bool = True,
 ) -> None:
     """Milestone 25 Part A2/A3: resolves an attempt-scoped reservation once
     the broker outcome of its submission attempt is known. An ambiguous
@@ -273,12 +360,72 @@ def _settle_daily_reservation(
     settles to SUBMITTED."""
     if status == STATE_UNKNOWN:
         new_state = _RESERVATION_STATE_RECONCILIATION_REQUIRED
-    elif status in (STATE_REJECTED, STATE_CANCELLED, STATE_EXPIRED):
+    elif status == STATE_REJECTED:
         new_state = _RESERVATION_STATE_RELEASED
     else:
         new_state = _RESERVATION_STATE_SUBMITTED
-    reservation_id = _derive_reservation_id(client_order_id, attempt_number, fingerprint, reservation_date)
-    repo.update_attempt_reservation_state(conn, reservation_id, new_state, now.isoformat())
+    expected_states = (
+        (_RESERVATION_STATE_RESERVED,)
+        if new_state == _RESERVATION_STATE_RECONCILIATION_REQUIRED
+        else (_RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED)
+    )
+    _transition_attempt_reservation(
+        conn, reservation_id, expected_states, new_state, now, commit=commit,
+    )
+
+
+def _reconcile_attempt_reservation(
+    conn: sqlite3.Connection, *, event: dict, book_id: str, target_state: str,
+    now: datetime, commit: bool = False,
+) -> dict | None:
+    """Repair the current attempt's budget state without downgrading exposure."""
+    try:
+        reservation = repo.load_active_attempt_reservation(
+            conn, event["client_order_id"], event["attempt_number"],
+            event["account_fingerprint"], book_id,
+        )
+    except repo.AttemptReservationIntegrityError as exc:
+        _raise_reservation_integrity(exc)
+    if reservation is None:
+        latest = repo.load_latest_attempt_reservation(
+            conn, event["client_order_id"], event["attempt_number"],
+            event["account_fingerprint"], book_id,
+        )
+        if latest is None:
+            if event["new_state"] in (STATE_NOT_SUBMITTED, STATE_PREVIEWED):
+                return None
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_MISSING", "current attempt reservation is missing",
+            )
+        if latest["state"] == target_state:
+            return latest
+        raise ExternalPaperError(
+            "RESERVATION_STATE_CONFLICT", "terminal attempt reservation conflicts with reconciliation",
+        )
+    if reservation["state"] == _RESERVATION_STATE_SUBMITTED and target_state in (
+        _RESERVATION_STATE_RELEASED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+    ):
+        return reservation
+    expected = {
+        _RESERVATION_STATE_SUBMITTED: (
+            _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+        ),
+        _RESERVATION_STATE_RELEASED: (
+            _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+        ),
+        _RESERVATION_STATE_RECONCILIATION_REQUIRED: (_RESERVATION_STATE_RESERVED,),
+    }[target_state]
+    return _transition_attempt_reservation(
+        conn, reservation["reservation_id"], expected, target_state, now, commit=commit,
+    )
+
+
+def _reservation_target_for_broker_state(broker_state: str | None) -> str:
+    if broker_state == STATE_REJECTED:
+        return _RESERVATION_STATE_RELEASED
+    if broker_state is None or broker_state == STATE_UNKNOWN:
+        return _RESERVATION_STATE_RECONCILIATION_REQUIRED
+    return _RESERVATION_STATE_SUBMITTED
 
 
 def derive_external_order_identity(intent: dict) -> tuple[str, str]:
@@ -1023,20 +1170,24 @@ def _validate_order_response(
 
 def _record_unknown(
     conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, now,
-    runtime_request_id, error_code, attempt_number, lease: OrderLeaseHandle,
+    runtime_request_id, error_code, attempt_number, reservation_id: str, lease: OrderLeaseHandle,
 ) -> dict:
     with lease.fenced_write():
-        return _append_event(
+        event = _append_event(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             account_fingerprint=fingerprint, new_state=STATE_UNKNOWN, operator=operator, reason=reason,
             now=now, runtime_request_id=runtime_request_id, error_code=error_code,
             attempt_number=attempt_number, commit=False,
         )
+        _settle_daily_reservation(
+            conn, reservation_id=reservation_id, status=STATE_UNKNOWN, now=now, commit=False,
+        )
+        return event
 
 
 def _submit_once(
     conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, runtime,
-    config, now, attempt_number, lease: "OrderLeaseHandle",
+    config, now, attempt_number, reservation_id: str, lease: "OrderLeaseHandle",
 ) -> dict:
     runtime_request_id = f"m11_{uuid.uuid4().hex}"
     # Milestone 11.3.1 Item 4: fence immediately before the protected
@@ -1084,7 +1235,7 @@ def _submit_once(
             fingerprint=fingerprint, operator=operator,
             reason="runtime submission outcome is ambiguous; broker lookup required", now=now,
             runtime_request_id=runtime_request_id, error_code=str(code), attempt_number=attempt_number,
-            lease=lease,
+            reservation_id=reservation_id, lease=lease,
         )
         return {"status": STATE_UNKNOWN, "event": event, "error_code": str(code)}
     with lease.fenced_write():
@@ -1096,6 +1247,9 @@ def _submit_once(
         )
         repo.update_order_status(
             conn, intent["book_id"], intent["paper_order_intent_id"], new_state, commit=False,
+        )
+        _settle_daily_reservation(
+            conn, reservation_id=reservation_id, status=new_state, now=now, commit=False,
         )
     order_submitted_at = datetime.fromisoformat(str(order["submitted_at"]).replace("Z", "+00:00")).astimezone(timezone.utc)
     # Milestone 11.2 Part 12: the broker event above is already persisted —
@@ -1192,8 +1346,7 @@ def submit_external_paper_order(
             if order is None:
                 raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
             return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
-        reservation_date = now.astimezone(timezone.utc).date().isoformat()
-        _reserve_daily_notional(
+        reservation = _reserve_daily_notional(
             conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
             attempt_number=0, intent=intent, now=now,
         )
@@ -1201,11 +1354,8 @@ def submit_external_paper_order(
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
-            config=config, now=now, attempt_number=0, lease=lease,
-        )
-        _settle_daily_reservation(
-            conn, client_order_id=client_order_id, attempt_number=0, fingerprint=fingerprint,
-            reservation_date=reservation_date, status=result["status"], now=now,
+            config=config, now=now, attempt_number=0,
+            reservation_id=reservation["reservation_id"], lease=lease,
         )
         if result["status"] != STATE_UNKNOWN:
             lease.heartbeat_or_raise()
@@ -1416,6 +1566,8 @@ def retry_external_paper_order(
             or lookup.get("attempt_number") != current["attempt_number"]
             or lookup.get("payload_hash") != current["payload_hash"]
             or lookup.get("account_fingerprint") != current["account_fingerprint"]
+            or lookup.get("client_order_id") != client_order_id
+            or lookup.get("book_id") != book_id
         ):
             raise ExternalPaperError(
                 "NOT_FOUND_NOT_CONFIRMED",
@@ -1445,24 +1597,28 @@ def retry_external_paper_order(
             payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
         )
         new_attempt_number = retries + 1
-        reservation_date = now.astimezone(timezone.utc).date().isoformat()
-        prior_reservation = repo.find_attempt_reservation_by_attempt(
-            conn, client_order_id, current["attempt_number"],
-        )
-        _reserve_daily_notional(
+        try:
+            prior_reservation = repo.load_active_attempt_reservation(
+                conn, client_order_id, current["attempt_number"], fingerprint, book_id,
+            )
+        except repo.AttemptReservationIntegrityError as exc:
+            _raise_reservation_integrity(exc)
+        if prior_reservation is None:
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_MISSING", "active prior attempt reservation is required for retry",
+            )
+        reservation = _reserve_daily_notional(
             conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
             attempt_number=new_attempt_number, intent=intent, now=now,
-            supersede_reservation_id=prior_reservation["reservation_id"] if prior_reservation else None,
+            supersede_reservation_id=prior_reservation["reservation_id"],
+            supersede_attempt_number=current["attempt_number"],
         )
         lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
-            now=now, attempt_number=new_attempt_number, lease=lease,
-        )
-        _settle_daily_reservation(
-            conn, client_order_id=client_order_id, attempt_number=new_attempt_number, fingerprint=fingerprint,
-            reservation_date=reservation_date, status=result["status"], now=now,
+            now=now, attempt_number=new_attempt_number,
+            reservation_id=reservation["reservation_id"], lease=lease,
         )
         with lease.fenced_write():
             repo.consume_external_lookup(
@@ -1937,6 +2093,11 @@ def _run_reconciliation(
             "payload_hash": current["payload_hash"], "lookup_started_at": now.isoformat(),
             "lookup_completed_at": now.isoformat(),
         }, commit=False)
+        if order is None:
+            _reconcile_attempt_reservation(
+                conn, event=current, book_id=book_id,
+                target_state=_RESERVATION_STATE_RECONCILIATION_REQUIRED, now=now, commit=False,
+            )
     if order is None:
         if "UNKNOWN" not in statuses:
             statuses.append("ORDER_MISSING_AT_BROKER")
@@ -1958,18 +2119,29 @@ def _run_reconciliation(
     except ExternalPaperError:
         broker_state = None
         statuses.append("BROKER_STATE_UNKNOWN")
-    if order_valid and broker_state is not None and broker_state != current["new_state"] and broker_state in _TRANSITIONS.get(
-        current["new_state"], set()
-    ):
+    if order_valid and broker_state is not None:
         with lease.fenced_write():
-            _append_event(
-                conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
-                account_fingerprint=fingerprint, new_state=broker_state, operator="SYSTEM_RECONCILIATION",
-                reason="broker lookup synchronized external order state", now=now,
-                broker_order_id=order.get("broker_order_id"), runtime_request_id=request_id,
-                attempt_number=current["attempt_number"], commit=False,
+            if broker_state != current["new_state"] and broker_state in _TRANSITIONS.get(
+                current["new_state"], set()
+            ):
+                _append_event(
+                    conn, intent=intent, client_order_id=client_order_id, payload_hash=current["payload_hash"],
+                    account_fingerprint=fingerprint, new_state=broker_state, operator="SYSTEM_RECONCILIATION",
+                    reason="broker lookup synchronized external order state", now=now,
+                    broker_order_id=order.get("broker_order_id"), runtime_request_id=request_id,
+                    attempt_number=current["attempt_number"], commit=False,
+                )
+            _reconcile_attempt_reservation(
+                conn, event=current, book_id=book_id,
+                target_state=_reservation_target_for_broker_state(broker_state), now=now, commit=False,
             )
         current = _current_event(conn, book_id, client_order_id)
+    elif not order_valid or broker_state is None:
+        with lease.fenced_write():
+            _reconcile_attempt_reservation(
+                conn, event=current, book_id=book_id,
+                target_state=_RESERVATION_STATE_RECONCILIATION_REQUIRED, now=now, commit=False,
+            )
     if order_valid:
         fill_error_codes = {
             "MALFORMED_FILL", "FILL_QUANTITY_INVALID", "FILL_NAMESPACE_MISMATCH",
