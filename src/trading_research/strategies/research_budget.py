@@ -288,17 +288,41 @@ def reserve_research_tokens(
                     "idempotency key exists with incompatible reservation metadata",
                     code="TOKEN_ACCOUNTING_POLICY_MISMATCH",
                 )
+            # Same idempotency key does not by itself prove the same request —
+            # compare every immutable reservation field, not just kind/policy
+            # (docs/milestones/26.md A5): a caller supplying a larger output
+            # allowance, a different reasoning allowance, etc. under a key
+            # that happens to collide must never silently reuse the original
+            # reservation or reach the provider.
+            if (
+                existing["reserved_input_tokens"] != estimated_input_tokens
+                or existing["reserved_output_tokens"] != maximum_output_tokens
+                or (existing.get("reserved_reasoning_tokens") or 0) != maximum_reasoning_tokens
+            ):
+                raise TokenBudgetError(
+                    "idempotency key exists with a different immutable reservation payload",
+                    code="TOKEN_RESERVATION_PAYLOAD_MISMATCH",
+                )
             return _reservation_from_row(existing)
-        attempt_prefix = (
+        # Stable provider-attempt identity (research_run_id, symbol, provider,
+        # model) — deliberately excludes the UTC budget-date suffix so an
+        # unresolved AMBIGUOUS reservation from a prior date still blocks a
+        # retry today (docs/milestones/26.md A2: "An unresolved July 19
+        # attempt can therefore be retried on July 20 under a new
+        # reservation" was the bug). Matches on the run/symbol/provider/model
+        # rather than the specific attempt_number: an unresolved ambiguity
+        # anywhere in this research run's provider work must block every
+        # further attempt for it, not just a retry of the exact same attempt
+        # number — this is unchanged, pre-existing blocking scope.
+        provider_attempt_key = (
             f"{RESEARCH_TOKEN_RESERVATION_PREFIX}:{research_run_id}:{symbol}:{provider}:"
             f"{model_name or 'none'}:"
         )
         unresolved = next((
             row for row in list_budget_reservations(conn)
             if row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND
-            and row.get("budget_date") == budget_date.isoformat()
             and row["status"] == TOKEN_RESERVATION_AMBIGUOUS
-            and row["idempotency_key"].startswith(attempt_prefix)
+            and row["idempotency_key"].startswith(provider_attempt_key)
         ), None)
         if unresolved is not None:
             return TokenBudgetRejected(
@@ -514,7 +538,28 @@ def reconcile_ambiguous_research_tokens(
         if cursor.rowcount == 0:
             reloaded = load_budget_reservation(conn, reservation_id)
             if reloaded is not None and reloaded["status"] == target_status:
-                return False
+                # Already at the target status — only an idempotent no-op
+                # when every authoritative field of this second reconciliation
+                # matches what was actually persisted the first time
+                # (docs/milestones/26.md A6). Operator/reason text may differ
+                # freely; accounting evidence may not.
+                if target_status == TOKEN_RESERVATION_SETTLED:
+                    evidence_matches = (
+                        reloaded["consumed_input_tokens"] == actual_input_tokens
+                        and reloaded["consumed_output_tokens"] == actual_output_tokens
+                        and (reloaded.get("consumed_reasoning_tokens") or 0) == (actual_reasoning_tokens or 0)
+                        and (reloaded.get("token_accounting_policy") or None) == token_accounting_policy
+                        and (reloaded.get("provider_request_id") or None) == (provider_request_id or None)
+                    )
+                else:
+                    evidence_matches = True  # RELEASED carries no numeric accounting evidence to conflict on
+                if evidence_matches:
+                    return False
+                raise TokenBudgetError(
+                    "repeated reconciliation to the same target carries different accounting evidence "
+                    "than the first reconciliation",
+                    code="TOKEN_RECONCILIATION_EVIDENCE_CONFLICT",
+                )
             raise TokenBudgetError(
                 f"cannot reconcile token reservation from {current['status']} to {target_status}",
                 code="TOKEN_RESERVATION_STATE_CONFLICT",
@@ -533,3 +578,98 @@ def reconcile_ambiguous_research_tokens(
                 "reconciled_at": now.isoformat(),
             })
     return True
+
+
+# --- Legacy (pre-PR #35) token reservation migration (docs/milestones/26.md A4) ---
+#
+# `shadow_operations_schema.py`'s additive migration gave every pre-existing
+# `shadow_budget_reservations` row `reservation_kind = RESEARCH_COST` (the
+# column default) regardless of whether the row was actually a research-token
+# reservation. A row whose idempotency_key carries the stable
+# `research_token_budget:` prefix is unambiguously a legacy token
+# reservation — this backfills its token-specific columns without ever
+# touching a genuine cost reservation.
+
+TOKEN_MIGRATION_LEGACY_ACCOUNTING_POLICY = TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT
+
+
+@dataclass(frozen=True)
+class LegacyTokenMigrationConflict:
+    reservation_id: str
+    code: str
+
+
+@dataclass(frozen=True)
+class LegacyTokenMigrationResult:
+    migrated_reservation_ids: tuple[str, ...]
+    already_migrated_reservation_ids: tuple[str, ...]
+    conflicts: tuple[LegacyTokenMigrationConflict, ...]
+
+
+def _legacy_budget_date(idempotency_key: str, created_at_iso: str | None) -> str | None:
+    """Preferred order (docs/milestones/26.md A4): parse the legacy key's UTC
+    date suffix; otherwise derive from timezone-aware `created_at`; otherwise
+    `None` (caller fails closed)."""
+    suffix = idempotency_key.rsplit(":", 1)[-1]
+    try:
+        return date.fromisoformat(suffix).isoformat()
+    except ValueError:
+        pass
+    if not created_at_iso:
+        return None
+    try:
+        parsed = datetime.fromisoformat(created_at_iso)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc).date().isoformat()
+
+
+def migrate_legacy_token_reservations(conn, clock: Clock) -> LegacyTokenMigrationResult:
+    """One-time, idempotent, additive backfill. Never splits a legacy
+    combined `reserved_output_tokens` value (may have folded
+    `maximum_output_tokens + maximum_reasoning_tokens` together pre-PR#35) —
+    preserves it exactly and migrates to the conservative
+    `REASONING_INCLUDED_IN_OUTPUT` policy with reasoning usage at zero rather
+    than fabricating a separate reasoning count. Never alters a row whose
+    idempotency_key lacks the `research_token_budget:` prefix (cost
+    reservations)."""
+    del clock  # reserved for a future recorded migration timestamp; not persisted today
+    migrated: list[str] = []
+    already_migrated: list[str] = []
+    conflicts: list[LegacyTokenMigrationConflict] = []
+    with transaction(conn):
+        for row in list_budget_reservations(conn):
+            key = row["idempotency_key"]
+            if not key.startswith(f"{RESEARCH_TOKEN_RESERVATION_PREFIX}:"):
+                continue
+            if row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND:
+                if row.get("token_accounting_policy") is None or row.get("budget_date") is None:
+                    conflicts.append(
+                        LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_INCOMPLETE_METADATA")
+                    )
+                else:
+                    already_migrated.append(row["reservation_id"])
+                continue
+
+            budget_date_str = _legacy_budget_date(key, row.get("created_at"))
+            if budget_date_str is None:
+                conflicts.append(
+                    LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_BUDGET_DATE_UNRESOLVED")
+                )
+                continue
+            conn.execute(
+                "UPDATE shadow_budget_reservations SET reservation_kind = ?, budget_date = ?, "
+                "token_accounting_policy = ?, reserved_reasoning_tokens = 0, consumed_reasoning_tokens = 0 "
+                "WHERE reservation_id = ?",
+                (
+                    RESEARCH_TOKEN_RESERVATION_KIND, budget_date_str, TOKEN_MIGRATION_LEGACY_ACCOUNTING_POLICY,
+                    row["reservation_id"],
+                ),
+            )
+            migrated.append(row["reservation_id"])
+    return LegacyTokenMigrationResult(
+        migrated_reservation_ids=tuple(migrated), already_migrated_reservation_ids=tuple(already_migrated),
+        conflicts=tuple(conflicts),
+    )
