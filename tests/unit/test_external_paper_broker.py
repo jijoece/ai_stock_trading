@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -20,6 +21,7 @@ from trading_research.paper_books.external_broker import (
 from trading_research.paper_books.models import PaperBookOrderIntent, PaperRiskDecision, RISK_APPROVED
 from trading_research.storage import paper_books_repositories as repo
 from trading_research.storage.database import connect
+from trading_research.storage.paper_books_schema import derive_external_attempt_reservation_id
 
 
 NOW = datetime(2026, 7, 15, 20, 0, tzinfo=timezone.utc)
@@ -1981,7 +1983,9 @@ def test_concurrent_reservations_cannot_exceed_account_cap():
         )
     assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
     # The would-be-blocked reservation was never created.
-    assert repo.find_attempt_reservation_by_attempt(conn, "epb-new-order-over-cap", 0) is None
+    assert repo.load_latest_attempt_reservation(
+        conn, "epb-new-order-over-cap", 0, FINGERPRINT, "BASELINE",
+    ) is None
 
 
 def test_duplicate_client_order_id_reuses_existing_reservation():
@@ -2013,7 +2017,9 @@ def test_broker_rejection_releases_daily_reservation():
         operator="alice", reason="rejected order", runtime=runtime, config=cfg, clock=lambda: NOW,
     )
     assert result["status"] == STATE_REJECTED
-    reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    reservation = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
     assert reservation["state"] == "RELEASED"
 
 
@@ -2034,7 +2040,9 @@ def test_ambiguous_submission_marks_reservation_reconciliation_required():
         operator="alice", reason="ambiguous", runtime=runtime, config=cfg, clock=lambda: NOW,
     )
     assert result["status"] == STATE_UNKNOWN
-    reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    reservation = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
     assert reservation["state"] == "RECONCILIATION_REQUIRED"
     reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
     assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, reservation_date) == Decimal("80")
@@ -2138,7 +2146,9 @@ def test_cross_day_retry_charges_the_new_dates_cap():
         operator="alice", reason="ambiguous on day 1", runtime=runtime, config=cfg, clock=lambda: NOW,
     )
     assert result["status"] == STATE_UNKNOWN
-    old_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    old_reservation = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
     assert old_reservation["state"] == "RECONCILIATION_REQUIRED"
     assert old_reservation["reservation_date"] == NOW.astimezone(timezone.utc).date().isoformat()
 
@@ -2159,9 +2169,13 @@ def test_cross_day_retry_charges_the_new_dates_cap():
     )
     assert retried["status"] == STATE_SUBMITTED
 
-    old_reservation_after = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    old_reservation_after = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
     assert old_reservation_after["state"] == "SUPERSEDED_BY_RETRY"
-    new_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 1)
+    new_reservation = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 1, FINGERPRINT, "BASELINE",
+    )
     assert new_reservation["state"] == "SUBMITTED"
     assert new_reservation["reservation_date"] == NEXT_DAY.astimezone(timezone.utc).date().isoformat()
 
@@ -2218,7 +2232,9 @@ def test_cross_day_retry_rejected_when_new_dates_cap_exhausted():
     assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
     assert runtime.submit_calls == 1  # only the original ambiguous attempt; retry never reached the broker
     # The original ambiguous reservation was never superseded since the retry never committed.
-    old_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    old_reservation = repo.load_latest_attempt_reservation(
+        conn, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
     assert old_reservation["state"] == "RECONCILIATION_REQUIRED"
 
 
@@ -2246,6 +2262,307 @@ def test_same_day_retry_does_not_double_reserve():
     same_date = NOW.astimezone(timezone.utc).date().isoformat()
     # Superseded (attempt 0) + submitted (attempt 1) = still just $80 total notional.
     assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, same_date) == Decimal("80")
+
+
+def _prepare_confirmed_not_found_retry(conn):
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    runtime.raise_submit = False
+    return cfg, runtime, preview
+
+
+def test_retry_with_missing_prior_reservation_is_blocked():
+    conn = connect(":memory:")
+    cfg, runtime, preview = _prepare_confirmed_not_found_retry(conn)
+    conn.execute("DROP TRIGGER trg_paper_external_attempt_reservations_no_delete")
+    conn.execute(
+        "DELETE FROM paper_external_attempt_reservations WHERE client_order_id = ?",
+        (preview["client_order_id"],),
+    )
+    with pytest.raises(ExternalPaperError) as excinfo:
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry without accounting", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "ATTEMPT_RESERVATION_MISSING"
+    assert runtime.submit_calls == 1
+
+
+def test_retry_with_multiple_active_prior_reservations_is_blocked():
+    conn = connect(":memory:")
+    cfg, runtime, preview = _prepare_confirmed_not_found_retry(conn)
+    conn.execute("DROP INDEX idx_paper_external_attempt_one_active")
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": "resvn-corrupt-duplicate", "client_order_id": preview["client_order_id"],
+        "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "reservation_date": NEXT_DAY.date().isoformat(), "book_id": "BASELINE",
+        "reserved_notional_usd": Decimal("80"), "state": "RESERVED",
+        "created_at": NEXT_DAY.isoformat(), "updated_at": NEXT_DAY.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError) as excinfo:
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry with corrupt accounting", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "ATTEMPT_RESERVATION_CONFLICT"
+    assert runtime.submit_calls == 1
+
+
+def test_retry_with_mismatched_prior_scope_is_blocked():
+    conn = connect(":memory:")
+    cfg, runtime, preview = _prepare_confirmed_not_found_retry(conn)
+    conn.execute("DROP TRIGGER trg_paper_external_attempt_reservations_core_immutable")
+    conn.execute(
+        "UPDATE paper_external_attempt_reservations SET account_fingerprint = ? WHERE client_order_id = ?",
+        ("acct_ffffffffffffffffffffffffffffffff", preview["client_order_id"]),
+    )
+    with pytest.raises(ExternalPaperError) as excinfo:
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry with mismatched accounting", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "ATTEMPT_RESERVATION_MISSING"
+    assert runtime.submit_calls == 1
+
+
+# --- Milestone 26: reservation upgrade, uniqueness, and fenced transitions ---
+
+
+def _save_legacy_reservation(conn, *, state: str, notional: str = "100", client_order_id: str = "legacy-1"):
+    reservation_date = NOW.date().isoformat()
+    conn.execute(
+        "INSERT INTO paper_external_daily_reservations "
+        "(client_order_id, account_fingerprint, reservation_date, book_id, reserved_notional_usd, "
+        "state, created_at, updated_at) VALUES (?, ?, ?, 'BASELINE', ?, ?, ?, ?)",
+        (client_order_id, FINGERPRINT, reservation_date, notional, state, NOW.isoformat(), NOW.isoformat()),
+    )
+    return reservation_date
+
+
+@pytest.mark.parametrize("state", ["RESERVED", "SUBMITTED", "RECONCILIATION_REQUIRED"])
+def test_active_legacy_reservation_is_migrated_and_counts_against_cap(tmp_path, state):
+    from dataclasses import replace
+
+    db_path = tmp_path / f"legacy-{state}.sqlite3"
+    conn = connect(db_path)
+    intent = _seed(conn)
+    reservation_date = _save_legacy_reservation(conn, state=state)
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, reservation_date) == Decimal("100")
+    conn.close()
+
+    reopened = connect(db_path)
+    cfg = _config()
+    cfg = replace(cfg, external_broker=replace(cfg.external_broker, maximum_daily_notional_usd=Decimal("150")))
+    with pytest.raises(ExternalPaperError) as excinfo:
+        _reserve_daily_notional(
+            reopened, cfg, book_id="BASELINE", fingerprint=FINGERPRINT,
+            client_order_id="epb-new-after-upgrade", attempt_number=0, intent=intent, now=NOW,
+        )
+    assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
+    assert repo.sum_attempt_reservations_by_date(reopened, FINGERPRINT, reservation_date) == Decimal("100")
+
+
+def test_released_legacy_reservation_does_not_count_after_upgrade(tmp_path):
+    from dataclasses import replace
+
+    db_path = tmp_path / "legacy-released.sqlite3"
+    conn = connect(db_path)
+    intent = _seed(conn)
+    reservation_date = _save_legacy_reservation(conn, state="RELEASED")
+    conn.close()
+
+    reopened = connect(db_path)
+    cfg = _config()
+    cfg = replace(cfg, external_broker=replace(cfg.external_broker, maximum_daily_notional_usd=Decimal("150")))
+    created = _reserve_daily_notional(
+        reopened, cfg, book_id="BASELINE", fingerprint=FINGERPRINT,
+        client_order_id="epb-new-after-release", attempt_number=0, intent=intent, now=NOW,
+    )
+    assert created["state"] == "RESERVED"
+    assert repo.sum_attempt_reservations_by_date(reopened, FINGERPRINT, reservation_date) == Decimal("80")
+
+
+def test_legacy_migration_is_idempotent_and_does_not_double_count(tmp_path):
+    db_path = tmp_path / "legacy-idempotent.sqlite3"
+    conn = connect(db_path)
+    _seed(conn)
+    reservation_date = _save_legacy_reservation(conn, state="SUBMITTED")
+    conn.close()
+
+    first = connect(db_path)
+    assert repo.sum_attempt_reservations_by_date(first, FINGERPRINT, reservation_date) == Decimal("100")
+    first.close()
+    second = connect(db_path)
+    count = second.execute(
+        "SELECT COUNT(*) AS c FROM paper_external_attempt_reservations WHERE client_order_id = 'legacy-1'"
+    ).fetchone()["c"]
+    assert count == 1
+    assert repo.sum_attempt_reservations_by_date(second, FINGERPRINT, reservation_date) == Decimal("100")
+
+
+def test_legacy_row_already_represented_is_not_double_counted(tmp_path):
+    db_path = tmp_path / "legacy-represented.sqlite3"
+    conn = connect(db_path)
+    _seed(conn)
+    reservation_date = _save_legacy_reservation(conn, state="SUBMITTED")
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": derive_external_attempt_reservation_id("legacy-1", 0, FINGERPRINT, reservation_date),
+        "client_order_id": "legacy-1", "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "reservation_date": reservation_date, "book_id": "BASELINE", "reserved_notional_usd": Decimal("100"),
+        "state": "SUBMITTED", "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    conn.close()
+    reopened = connect(db_path)
+    assert repo.sum_attempt_reservations_by_date(reopened, FINGERPRINT, reservation_date) == Decimal("100")
+
+
+def test_legacy_attempt_material_mismatch_fails_schema_initialization(tmp_path):
+    db_path = tmp_path / "legacy-conflict.sqlite3"
+    conn = connect(db_path)
+    _seed(conn)
+    reservation_date = _save_legacy_reservation(conn, state="SUBMITTED")
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": derive_external_attempt_reservation_id("legacy-1", 0, FINGERPRINT, reservation_date),
+        "client_order_id": "legacy-1", "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "reservation_date": reservation_date, "book_id": "BASELINE", "reserved_notional_usd": Decimal("99"),
+        "state": "SUBMITTED", "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    conn.close()
+    with pytest.raises(sqlite3.IntegrityError, match="LEGACY_ATTEMPT_RESERVATION_CONFLICT"):
+        connect(db_path)
+
+
+def test_database_enforces_one_active_reservation_per_attempt():
+    conn = connect(":memory:")
+    _seed(conn)
+    base = {
+        "client_order_id": "lineage-1", "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "book_id": "BASELINE", "reserved_notional_usd": Decimal("80"), "state": "RESERVED",
+        "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    }
+    repo.save_attempt_reservation(conn, {
+        **base, "reservation_id": "resvn-lineage-day-1", "reservation_date": NOW.date().isoformat(),
+    })
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.save_attempt_reservation(conn, {
+            **base, "reservation_id": "resvn-lineage-day-2",
+            "reservation_date": (NOW + timedelta(days=1)).date().isoformat(),
+        })
+
+
+def test_duplicate_active_rows_fail_schema_initialization_with_bounded_error(tmp_path):
+    db_path = tmp_path / "duplicate-active.sqlite3"
+    conn = connect(db_path)
+    _seed(conn)
+    conn.execute("DROP INDEX idx_paper_external_attempt_one_active")
+    base = {
+        "client_order_id": "lineage-duplicate", "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "book_id": "BASELINE", "reserved_notional_usd": Decimal("80"), "state": "RESERVED",
+        "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    }
+    repo.save_attempt_reservation(conn, {
+        **base, "reservation_id": "resvn-duplicate-1", "reservation_date": NOW.date().isoformat(),
+    })
+    repo.save_attempt_reservation(conn, {
+        **base, "reservation_id": "resvn-duplicate-2",
+        "reservation_date": (NOW + timedelta(days=1)).date().isoformat(),
+    })
+    conn.close()
+    with pytest.raises(sqlite3.IntegrityError, match="ATTEMPT_RESERVATION_CONFLICT"):
+        connect(db_path)
+
+
+def test_prior_date_reserved_row_is_reused_for_same_unstarted_attempt():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    first = _reserve_daily_notional(
+        conn, _config(), book_id="BASELINE", fingerprint=FINGERPRINT,
+        client_order_id="epb-restart", attempt_number=0, intent=intent, now=NOW,
+    )
+    second = _reserve_daily_notional(
+        conn, _config(), book_id="BASELINE", fingerprint=FINGERPRINT,
+        client_order_id="epb-restart", attempt_number=0, intent=intent, now=NEXT_DAY,
+    )
+    assert second["reservation_id"] == first["reservation_id"]
+    assert second["reservation_date"] == NOW.date().isoformat()
+    assert len(repo.list_attempt_reservations_for_attempt(
+        conn, "epb-restart", 0, FINGERPRINT, "BASELINE",
+    )) == 1
+
+
+def test_same_day_reservation_payload_mismatch_fails_closed():
+    conn = connect(":memory:")
+    intent = _seed(conn)
+    reservation_date = NOW.date().isoformat()
+    client_order_id = "epb-payload-mismatch"
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": derive_external_attempt_reservation_id(client_order_id, 0, FINGERPRINT, reservation_date),
+        "client_order_id": client_order_id, "attempt_number": 0, "account_fingerprint": FINGERPRINT,
+        "reservation_date": reservation_date, "book_id": "BASELINE", "reserved_notional_usd": Decimal("79"),
+        "state": "RESERVED", "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    with pytest.raises(ExternalPaperError) as excinfo:
+        _reserve_daily_notional(
+            conn, _config(), book_id="BASELINE", fingerprint=FINGERPRINT,
+            client_order_id=client_order_id, attempt_number=0, intent=intent, now=NOW,
+        )
+    assert excinfo.value.code == "ATTEMPT_RESERVATION_PAYLOAD_MISMATCH"
+
+
+def test_conditional_attempt_reservation_state_machine_and_stale_writer(tmp_path):
+    db_path = tmp_path / "reservation-state.sqlite3"
+    conn = connect(db_path)
+    _seed(conn)
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": "resvn-state-machine", "client_order_id": "state-machine", "attempt_number": 0,
+        "account_fingerprint": FINGERPRINT, "reservation_date": NOW.date().isoformat(), "book_id": "BASELINE",
+        "reserved_notional_usd": Decimal("80"), "state": "RESERVED",
+        "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    stale = connect(db_path)
+    repo.transition_attempt_reservation_state(
+        conn, "resvn-state-machine", ("RESERVED",), "RECONCILIATION_REQUIRED", NOW.isoformat(),
+    )
+    repo.transition_attempt_reservation_state(
+        conn, "resvn-state-machine", ("RECONCILIATION_REQUIRED",), "SUPERSEDED_BY_RETRY", NOW.isoformat(),
+    )
+    with pytest.raises(repo.AttemptReservationIntegrityError) as excinfo:
+        repo.transition_attempt_reservation_state(
+            stale, "resvn-state-machine", ("RECONCILIATION_REQUIRED",), "RELEASED", NOW.isoformat(),
+        )
+    assert excinfo.value.code == "RESERVATION_STATE_CONFLICT"
+    with pytest.raises(repo.AttemptReservationIntegrityError):
+        repo.transition_attempt_reservation_state(
+            conn, "resvn-state-machine", ("RESERVED", "RECONCILIATION_REQUIRED"),
+            "SUBMITTED", NOW.isoformat(),
+        )
+
+
+def test_submitted_reservation_cannot_be_released():
+    conn = connect(":memory:")
+    _seed(conn)
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": "resvn-submitted-terminal", "client_order_id": "submitted-terminal",
+        "attempt_number": 0, "account_fingerprint": FINGERPRINT, "reservation_date": NOW.date().isoformat(),
+        "book_id": "BASELINE", "reserved_notional_usd": Decimal("80"), "state": "SUBMITTED",
+        "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
+    })
+    with pytest.raises(repo.AttemptReservationIntegrityError) as excinfo:
+        repo.transition_attempt_reservation_state(
+            conn, "resvn-submitted-terminal", ("RESERVED", "RECONCILIATION_REQUIRED"),
+            "RELEASED", NOW.isoformat(),
+        )
+    assert excinfo.value.code == "RESERVATION_STATE_CONFLICT"
 
 
 def test_activation_with_existing_baseline_and_same_fingerprint_is_idempotent():

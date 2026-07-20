@@ -20,7 +20,7 @@ reservation with no explaining event, and never a blind assumption that
 submission succeeded."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -32,6 +32,7 @@ from trading_research.paper_books.config import (
 )
 from trading_research.paper_books.external_broker import (
     QUEUE_STATUS_AWAITING_SUBMISSION, STATE_SUBMISSION_REQUESTED,
+    _reserve_daily_notional,
     activate_external_reconciliation_baseline, derive_external_queue_status,
     preview_external_paper_order, submit_external_paper_order,
 )
@@ -224,4 +225,18 @@ def test_crash_before_reservation_commit_leaves_zero_effects(tmp_path, monkeypat
     event = repo.load_latest_external_order_event_for_intent(restarted, "BASELINE", "intent-1")
     assert event is None or event["new_state"] != STATE_SUBMISSION_REQUESTED
     assert crash_runtime.submit_calls == 0  # broker was never reached at all
+    reservation = repo.load_active_attempt_reservation(
+        restarted, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )
+    assert reservation["state"] == "RESERVED"
+    reused = _reserve_daily_notional(
+        restarted, cfg, book_id="BASELINE", fingerprint=FINGERPRINT,
+        client_order_id=preview["client_order_id"], attempt_number=0,
+        intent=repo.load_order_intent(restarted, "BASELINE", "intent-1"),
+        now=NOW + timedelta(days=1),
+    )
+    assert reused["reservation_id"] == reservation["reservation_id"]
+    assert len(repo.list_attempt_reservations_for_attempt(
+        restarted, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
+    )) == 1
     restarted.close()
