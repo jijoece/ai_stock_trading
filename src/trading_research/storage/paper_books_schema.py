@@ -910,6 +910,8 @@ CREATE TABLE IF NOT EXISTS paper_book_safety_events (
 -- (deterministically derived per order), so it alone is the primary key; a
 -- duplicate submission for the same client_order_id reuses this row instead
 -- of creating a second reservation.
+-- DEPRECATED (Milestone 25 Part A2): legacy table kept for backward compatibility,
+-- replaced by paper_external_attempt_reservations with attempt-level identity.
 CREATE TABLE IF NOT EXISTS paper_external_daily_reservations (
     client_order_id TEXT PRIMARY KEY,
     account_fingerprint TEXT NOT NULL,
@@ -917,6 +919,26 @@ CREATE TABLE IF NOT EXISTS paper_external_daily_reservations (
     book_id TEXT NOT NULL REFERENCES paper_books(book_id),
     reserved_notional_usd TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('RESERVED', 'SUBMITTED', 'RELEASED', 'RECONCILIATION_REQUIRED')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Milestone 25 Part A2: attempt-scoped external-paper daily notional
+-- reservation. Each submission attempt gets its own reservation identity
+-- combining (client_order_id, attempt_number, account_fingerprint, reservation_date).
+-- Supports cross-day retries where an old ambiguous reservation from July 19 may be
+-- superseded by a NOT_FOUND lookup and a new reservation for July 20. A reservation
+-- in any unresolved state (RESERVED, RECONCILIATION_REQUIRED) continues counting
+-- against its reservation_date cap even if later retried on a different date.
+CREATE TABLE IF NOT EXISTS paper_external_attempt_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    client_order_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    account_fingerprint TEXT NOT NULL,
+    reservation_date TEXT NOT NULL,
+    book_id TEXT NOT NULL REFERENCES paper_books(book_id),
+    reserved_notional_usd TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('RESERVED', 'SUBMITTED', 'RELEASED', 'RECONCILIATION_REQUIRED', 'SUPERSEDED_BY_RETRY')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1064,6 +1086,12 @@ CREATE INDEX IF NOT EXISTS idx_safety_events_book
     ON paper_book_safety_events(book_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_paper_external_daily_reservations_scope
     ON paper_external_daily_reservations(account_fingerprint, reservation_date, state);
+CREATE INDEX IF NOT EXISTS idx_paper_external_attempt_reservations_scope
+    ON paper_external_attempt_reservations(account_fingerprint, reservation_date, state);
+CREATE INDEX IF NOT EXISTS idx_paper_external_attempt_reservations_client_attempt
+    ON paper_external_attempt_reservations(client_order_id, attempt_number);
+CREATE INDEX IF NOT EXISTS idx_paper_external_attempt_reservations_id
+    ON paper_external_attempt_reservations(reservation_id);
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -1388,6 +1416,20 @@ BEGIN SELECT RAISE(ABORT, 'paper_external_daily_reservations core fields are imm
 CREATE TRIGGER IF NOT EXISTS trg_paper_external_daily_reservations_no_delete
 BEFORE DELETE ON paper_external_daily_reservations
 BEGIN SELECT RAISE(ABORT, 'paper_external_daily_reservations rows are never deleted'); END;
+
+-- Milestone 25 Part A7: immutability for attempt-scoped reservations.
+-- Only state/updated_at may change (RESERVED -> SUBMITTED/RELEASED/RECONCILIATION_REQUIRED/SUPERSEDED_BY_RETRY);
+-- every other field is frozen once the reservation is created.
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_attempt_reservations_core_immutable
+BEFORE UPDATE ON paper_external_attempt_reservations
+WHEN NEW.reservation_id != OLD.reservation_id OR NEW.client_order_id != OLD.client_order_id
+    OR NEW.attempt_number != OLD.attempt_number OR NEW.account_fingerprint != OLD.account_fingerprint
+    OR NEW.reservation_date != OLD.reservation_date OR NEW.book_id != OLD.book_id
+    OR NEW.reserved_notional_usd != OLD.reserved_notional_usd OR NEW.created_at != OLD.created_at
+BEGIN SELECT RAISE(ABORT, 'paper_external_attempt_reservations core fields are immutable — only state/updated_at may change'); END;
+CREATE TRIGGER IF NOT EXISTS trg_paper_external_attempt_reservations_no_delete
+BEFORE DELETE ON paper_external_attempt_reservations
+BEGIN SELECT RAISE(ABORT, 'paper_external_attempt_reservations rows are never deleted'); END;
 """
 
 # Milestone 9.2: additive, nullable columns on the pre-existing

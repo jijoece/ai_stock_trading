@@ -1895,7 +1895,7 @@ def test_daily_notional_cap_is_account_wide_across_books():
 
     reserved = _reserve_daily_notional(
         conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id="epb-baseline-100",
-        intent=intent_b, now=NOW,
+        attempt_number=0, intent=intent_b, now=NOW,
     )
     assert reserved["state"] == "RESERVED"
 
@@ -1904,7 +1904,7 @@ def test_daily_notional_cap_is_account_wide_across_books():
     with pytest.raises(ExternalPaperError) as excinfo:
         _reserve_daily_notional(
             conn, cfg, book_id="ENHANCED", fingerprint=FINGERPRINT, client_order_id="epb-enhanced-51",
-            intent=intent_e, now=NOW,
+            attempt_number=0, intent=intent_e, now=NOW,
         )
     assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
 
@@ -1966,8 +1966,10 @@ def test_concurrent_reservations_cannot_exceed_account_cap():
     reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
     # A reservation committed by a concurrent process/book for the same
     # account/day, just before this one's atomic check-and-reserve runs.
-    repo.save_external_daily_reservation(conn, {
-        "client_order_id": "epb-competing-concurrent-reservation", "account_fingerprint": FINGERPRINT,
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": "resvn_competing-concurrent-reservation",
+        "client_order_id": "epb-competing-concurrent-reservation", "attempt_number": 0,
+        "account_fingerprint": FINGERPRINT,
         "reservation_date": reservation_date, "book_id": "ENHANCED",
         "reserved_notional_usd": Decimal("60"), "state": "RESERVED",
         "created_at": NOW.isoformat(), "updated_at": NOW.isoformat(),
@@ -1975,11 +1977,11 @@ def test_concurrent_reservations_cannot_exceed_account_cap():
     with pytest.raises(ExternalPaperError) as excinfo:
         _reserve_daily_notional(
             conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id="epb-new-order-over-cap",
-            intent=intent, now=NOW,
+            attempt_number=0, intent=intent, now=NOW,
         )
     assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
     # The would-be-blocked reservation was never created.
-    assert repo.load_external_daily_reservation(conn, "epb-new-order-over-cap") is None
+    assert repo.find_attempt_reservation_by_attempt(conn, "epb-new-order-over-cap", 0) is None
 
 
 def test_duplicate_client_order_id_reuses_existing_reservation():
@@ -1989,16 +1991,16 @@ def test_duplicate_client_order_id_reuses_existing_reservation():
     client_order_id, _ = derive_external_order_identity({**intent, "_external_config_hash": cfg.config_hash})
     first = _reserve_daily_notional(
         conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id=client_order_id,
-        intent=intent, now=NOW,
+        attempt_number=0, intent=intent, now=NOW,
     )
     second = _reserve_daily_notional(
         conn, cfg, book_id="BASELINE", fingerprint=FINGERPRINT, client_order_id=client_order_id,
-        intent=intent, now=NOW,
+        attempt_number=0, intent=intent, now=NOW,
     )
     assert first["client_order_id"] == second["client_order_id"]
     assert Decimal(str(first["reserved_notional_usd"])) == Decimal(str(second["reserved_notional_usd"])) == Decimal("80")
     reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
-    assert repo.sum_external_daily_reserved_notional(conn, FINGERPRINT, reservation_date) == Decimal("80")
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, reservation_date) == Decimal("80")
 
 
 def test_broker_rejection_releases_daily_reservation():
@@ -2011,7 +2013,7 @@ def test_broker_rejection_releases_daily_reservation():
         operator="alice", reason="rejected order", runtime=runtime, config=cfg, clock=lambda: NOW,
     )
     assert result["status"] == STATE_REJECTED
-    reservation = repo.load_external_daily_reservation(conn, preview["client_order_id"])
+    reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
     assert reservation["state"] == "RELEASED"
 
 
@@ -2032,10 +2034,10 @@ def test_ambiguous_submission_marks_reservation_reconciliation_required():
         operator="alice", reason="ambiguous", runtime=runtime, config=cfg, clock=lambda: NOW,
     )
     assert result["status"] == STATE_UNKNOWN
-    reservation = repo.load_external_daily_reservation(conn, preview["client_order_id"])
+    reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
     assert reservation["state"] == "RECONCILIATION_REQUIRED"
     reservation_date = NOW.astimezone(timezone.utc).date().isoformat()
-    assert repo.sum_external_daily_reserved_notional(conn, FINGERPRINT, reservation_date) == Decimal("80")
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, reservation_date) == Decimal("80")
 
 
 def test_submission_without_baseline_fails_closed():
@@ -2111,3 +2113,183 @@ def test_baseline_account_fingerprint_mismatch_fails_closed():
         )
     assert excinfo.value.code == "ACCOUNT_FINGERPRINT_MISMATCH"
     assert runtime.submit_calls == 0
+
+
+# --- Milestone 25 Part A: cross-day external-paper reservation safety ---
+
+NEXT_DAY = NOW + timedelta(days=1)
+
+
+def test_cross_day_retry_charges_the_new_dates_cap():
+    """A1/A9: an order becomes ambiguous on July 15 (RECONCILIATION_REQUIRED
+    reservation dated July 15); the next day, authoritative NOT_FOUND is
+    confirmed and the retry is charged against July 16's cap, not reused
+    from the stale July 15 reservation."""
+    from dataclasses import replace
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    cfg = replace(cfg, risk=replace(cfg.risk, reject_stale_market_price_seconds=200_000))
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous on day 1", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    old_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    assert old_reservation["state"] == "RECONCILIATION_REQUIRED"
+    assert old_reservation["reservation_date"] == NOW.astimezone(timezone.utc).date().isoformat()
+
+    missing = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NEXT_DAY,
+    )
+    assert missing["status"] == "ORDER_MISSING_AT_BROKER"
+    runtime.raise_submit = False
+    from trading_research.paper_books.external_broker import refresh_retry_preview
+    refresh_retry_preview(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="original preview expired overnight", config=cfg, clock=lambda: NEXT_DAY,
+    )
+    retried = retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="cross-day retry", runtime=runtime, config=cfg, clock=lambda: NEXT_DAY,
+    )
+    assert retried["status"] == STATE_SUBMITTED
+
+    old_reservation_after = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    assert old_reservation_after["state"] == "SUPERSEDED_BY_RETRY"
+    new_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 1)
+    assert new_reservation["state"] == "SUBMITTED"
+    assert new_reservation["reservation_date"] == NEXT_DAY.astimezone(timezone.utc).date().isoformat()
+
+    old_date = NOW.astimezone(timezone.utc).date().isoformat()
+    new_date = NEXT_DAY.astimezone(timezone.utc).date().isoformat()
+    # July 15's cap no longer counts the superseded reservation.
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, old_date) == Decimal("0")
+    # July 16's cap is charged for the retry.
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, new_date) == Decimal("80")
+
+
+def test_cross_day_retry_rejected_when_new_dates_cap_exhausted():
+    """A9: if the current day's cap is already exhausted by other activity,
+    a cross-day retry is rejected and the broker submit is never called."""
+    from dataclasses import replace
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg = _config()
+    cfg = replace(cfg, risk=replace(cfg.risk, reject_stale_market_price_seconds=200_000))
+    # maximum_daily_notional_usd must stay >= maximum_order_notional_usd ($100).
+    cfg = replace(cfg, external_broker=replace(cfg.external_broker, maximum_daily_notional_usd=Decimal("100")))
+    runtime = FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous on day 1", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NEXT_DAY,
+    )
+    # A separate, unrelated reservation exhausts July 16's $100 cap first.
+    new_date = NEXT_DAY.astimezone(timezone.utc).date().isoformat()
+    repo.save_attempt_reservation(conn, {
+        "reservation_id": "resvn_competing-day2", "client_order_id": "epb-competing-day2",
+        "attempt_number": 0, "account_fingerprint": FINGERPRINT, "reservation_date": new_date,
+        "book_id": "BASELINE", "reserved_notional_usd": Decimal("100"), "state": "RESERVED",
+        "created_at": NEXT_DAY.isoformat(), "updated_at": NEXT_DAY.isoformat(),
+    })
+    runtime.raise_submit = False
+    from trading_research.paper_books.external_broker import refresh_retry_preview
+    refresh_retry_preview(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="original preview expired overnight", config=cfg, clock=lambda: NEXT_DAY,
+    )
+    with pytest.raises(ExternalPaperError) as excinfo:
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="blocked by exhausted cap", runtime=runtime, config=cfg, clock=lambda: NEXT_DAY,
+        )
+    assert excinfo.value.code == "EXTERNAL_DAILY_NOTIONAL_LIMIT"
+    assert runtime.submit_calls == 1  # only the original ambiguous attempt; retry never reached the broker
+    # The original ambiguous reservation was never superseded since the retry never committed.
+    old_reservation = repo.find_attempt_reservation_by_attempt(conn, preview["client_order_id"], 0)
+    assert old_reservation["state"] == "RECONCILIATION_REQUIRED"
+
+
+def test_same_day_retry_does_not_double_reserve():
+    """A6: a same-day retry against the same attempt identity reuses the
+    current attempt's reservation instead of reserving twice."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    runtime.raise_submit = True
+    preview = _preview(conn, runtime, cfg)
+    submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous same day", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    runtime.raise_submit = False
+    retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="same-day retry", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    same_date = NOW.astimezone(timezone.utc).date().isoformat()
+    # Superseded (attempt 0) + submitted (attempt 1) = still just $80 total notional.
+    assert repo.sum_attempt_reservations_by_date(conn, FINGERPRINT, same_date) == Decimal("80")
+
+
+def test_activation_with_existing_baseline_and_same_fingerprint_is_idempotent():
+    """A8: reactivating a book whose baseline already exists, with the
+    currently configured account unchanged, always re-verifies the account
+    first and then returns the existing baseline unchanged."""
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg, runtime = _config(), FakeRuntime()
+    first = _activate_baseline(conn, runtime, cfg)
+    second = _activate_baseline(conn, runtime, cfg)
+    assert first["account_fingerprint"] == second["account_fingerprint"] == FINGERPRINT
+    assert first["snapshot_timestamp"] == second["snapshot_timestamp"]
+
+
+def test_activation_with_existing_baseline_and_changed_fingerprint_fails_closed():
+    """A8: reactivating a book whose configured paper account fingerprint no
+    longer matches the previously activated baseline must fail closed with
+    ACCOUNT_FINGERPRINT_MISMATCH rather than silently returning the stale
+    baseline or overwriting it."""
+    class _DifferentAccountRuntime(FakeRuntime):
+        def account_check(self, book_id):
+            result = super().account_check(book_id)
+            result["account_fingerprint"] = "acct_deadbeefdeadbeefdeadbeefdeadbeef"
+            return result
+
+        def get_external_positions(self, book_id):
+            return {"provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+                    "account_fingerprint": "acct_deadbeefdeadbeefdeadbeefdeadbeef", "positions": []}
+
+        def get_external_account_snapshot(self, book_id):
+            return {"provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+                    "account_fingerprint": "acct_deadbeefdeadbeefdeadbeefdeadbeef", "cash": "100000"}
+
+    conn = connect(":memory:")
+    _seed(conn)
+    cfg = _config()
+    _activate_baseline(conn, FakeRuntime(), cfg)
+    with pytest.raises(ExternalPaperError) as excinfo:
+        activate_external_reconciliation_baseline(
+            conn, book_id="BASELINE", operator="alice", runtime=_DifferentAccountRuntime(), config=cfg,
+            clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "ACCOUNT_FINGERPRINT_MISMATCH"
+    # The original baseline was neither overwritten nor duplicated.
+    baseline = repo.load_external_reconciliation_baseline(conn, "BASELINE")
+    assert baseline["account_fingerprint"] == FINGERPRINT
