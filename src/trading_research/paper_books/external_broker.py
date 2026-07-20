@@ -176,33 +176,69 @@ _RESERVATION_STATE_RESERVED = "RESERVED"
 _RESERVATION_STATE_SUBMITTED = "SUBMITTED"
 _RESERVATION_STATE_RELEASED = "RELEASED"
 _RESERVATION_STATE_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+_RESERVATION_STATE_SUPERSEDED_BY_RETRY = "SUPERSEDED_BY_RETRY"
+
+
+def _derive_reservation_id(client_order_id: str, attempt_number: int, account_fingerprint: str, reservation_date: str) -> str:
+    """Milestone 25 Part A2: deterministic reservation identity combining
+    attempt number, account fingerprint, and date to support cross-day retries."""
+    immutable = {
+        "client_order_id": client_order_id,
+        "attempt_number": attempt_number,
+        "account_fingerprint": account_fingerprint,
+        "reservation_date": reservation_date,
+    }
+    return _digest("resvn_", immutable, 40)
 
 
 def _reserve_daily_notional(
     conn: sqlite3.Connection, cfg: PaperBooksConfiguration, *, book_id: str, fingerprint: str,
-    client_order_id: str, intent: dict, now: datetime,
+    client_order_id: str, attempt_number: int, intent: dict, now: datetime,
+    supersede_reservation_id: str | None = None,
 ) -> dict:
-    """Milestone 24 Part A1/A2: atomic, account-wide external-paper daily
-    notional budget. Scoped by (account_fingerprint, UTC date) rather than
-    book_id, so the same Alpaca paper account cannot exceed
-    `external_broker.maximum_daily_notional_usd` by spreading submissions
-    across more than one local book (today exactly one book maps to one
-    external account, but this does not rely on that invariant).
+    """Milestone 25 Part A2/A3: atomic, account-wide external-paper daily
+    notional budget with attempt-scoped identity. Scoped by
+    (account_fingerprint, UTC date, attempt_number) so each retry gets its
+    own reservation identity. Cross-day retries are supported: when a retry
+    occurs on a different date, a new reservation is created against that
+    date's cap.
+
+    When `supersede_reservation_id` is given (a cross-day retry with
+    confirmed authoritative NOT_FOUND evidence for the prior ambiguous
+    attempt), that prior reservation is atomically transitioned to
+    SUPERSEDED_BY_RETRY in the *same* transaction as the new reservation is
+    created — never released-then-committed-then-reserved, so a crash
+    between the two operations cannot lose budget accounting (Part A5). A
+    prior reservation already RELEASED or SUPERSEDED is left untouched
+    (idempotent replay); one still SUBMITTED is never touched here (only an
+    unresolved RESERVED/RECONCILIATION_REQUIRED prior attempt may be
+    superseded — a submitted attempt's own reconciliation path owns it).
 
     Runs its own `BEGIN IMMEDIATE` .. `COMMIT` — never nested inside the
     caller's order-scope-lease `fenced_write` — so the read-then-write
     check-and-reserve is atomic even when two books/processes race to
-    reserve against the same account/day. A duplicate call for the same
-    `client_order_id` (a replay/retry) reuses the existing reservation
-    rather than creating or being blocked by a second one.
+    reserve against the same account/day. A same-date/same-attempt replay
+    reuses the existing reservation; a cross-day retry creates a new
+    reservation.
     """
     reservation_date = now.astimezone(timezone.utc).date().isoformat()
     notional = Decimal(intent["quantity"]) * Decimal(intent["limit_price"])
+    reservation_id = _derive_reservation_id(client_order_id, attempt_number, fingerprint, reservation_date)
+
     with transaction(conn):
-        existing = repo.load_external_daily_reservation(conn, client_order_id)
+        existing = repo.load_attempt_reservation(conn, reservation_id)
         if existing is not None:
             return existing
-        already_reserved = repo.sum_external_daily_reserved_notional(conn, fingerprint, reservation_date)
+        if supersede_reservation_id is not None:
+            prior = repo.load_attempt_reservation(conn, supersede_reservation_id)
+            if prior is not None and prior["state"] in (
+                _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+            ):
+                repo.update_attempt_reservation_state(
+                    conn, supersede_reservation_id, _RESERVATION_STATE_SUPERSEDED_BY_RETRY,
+                    now.isoformat(), commit=False,
+                )
+        already_reserved = repo.sum_attempt_reservations_by_date(conn, fingerprint, reservation_date)
         if already_reserved + notional > cfg.external_broker.maximum_daily_notional_usd:
             raise ExternalPaperError(
                 "EXTERNAL_DAILY_NOTIONAL_LIMIT",
@@ -211,32 +247,38 @@ def _reserve_daily_notional(
                 f"{cfg.external_broker.maximum_daily_notional_usd} for account {fingerprint}",
             )
         record = {
-            "client_order_id": client_order_id, "account_fingerprint": fingerprint,
+            "reservation_id": reservation_id, "client_order_id": client_order_id,
+            "attempt_number": attempt_number, "account_fingerprint": fingerprint,
             "reservation_date": reservation_date, "book_id": book_id,
             "reserved_notional_usd": notional, "state": _RESERVATION_STATE_RESERVED,
             "created_at": now.isoformat(), "updated_at": now.isoformat(),
         }
-        repo.save_external_daily_reservation(conn, record, commit=False)
+        repo.save_attempt_reservation(conn, record, commit=False)
         return record
 
 
-def _settle_daily_reservation(conn: sqlite3.Connection, *, client_order_id: str, status: str, now: datetime) -> None:
-    """Milestone 24 Part A2: resolves a reservation once the broker outcome
-    of its submission attempt is known. An ambiguous outcome (STATE_UNKNOWN
-    — the runtime call itself raised, so acceptance is unproven) retains the
-    reservation's hold on the daily budget and marks it RECONCILIATION_
-    REQUIRED rather than releasing it, so a blind concurrent resubmission
-    for a *different* order cannot slip under the cap while this one's fate
-    is still unknown. A definite non-executing terminal outcome (REJECTED/
-    CANCELLED/EXPIRED) releases the hold. Any other outcome means the
-    broker accepted the order, so the reservation settles to SUBMITTED."""
+def _settle_daily_reservation(
+    conn: sqlite3.Connection, *, client_order_id: str, attempt_number: int, fingerprint: str,
+    reservation_date: str, status: str, now: datetime,
+) -> None:
+    """Milestone 25 Part A2/A3: resolves an attempt-scoped reservation once
+    the broker outcome of its submission attempt is known. An ambiguous
+    outcome (STATE_UNKNOWN — the runtime call itself raised, so acceptance
+    is unproven) retains the reservation's hold on the daily budget and
+    marks it RECONCILIATION_REQUIRED rather than releasing it, so a blind
+    concurrent resubmission for a *different* order cannot slip under the
+    cap while this one's fate is still unknown. A definite non-executing
+    terminal outcome (REJECTED/CANCELLED/EXPIRED) releases the hold. Any
+    other outcome means the broker accepted the order, so the reservation
+    settles to SUBMITTED."""
     if status == STATE_UNKNOWN:
         new_state = _RESERVATION_STATE_RECONCILIATION_REQUIRED
     elif status in (STATE_REJECTED, STATE_CANCELLED, STATE_EXPIRED):
         new_state = _RESERVATION_STATE_RELEASED
     else:
         new_state = _RESERVATION_STATE_SUBMITTED
-    repo.update_external_daily_reservation_state(conn, client_order_id, new_state, now.isoformat())
+    reservation_id = _derive_reservation_id(client_order_id, attempt_number, fingerprint, reservation_date)
+    repo.update_attempt_reservation_state(conn, reservation_id, new_state, now.isoformat())
 
 
 def derive_external_order_identity(intent: dict) -> tuple[str, str]:
@@ -468,12 +510,29 @@ def activate_external_reconciliation_baseline(
     point cannot be trusted as a clean starting reference — this refuses to
     create a baseline and surfaces `BASELINE_REQUIRES_OPERATOR_REVIEW`
     instead.
+
+    Milestone 25 Part A8: the read-only paper-account verification always
+    runs *first*, even when a baseline already exists, so a changed-
+    credentials reactivation can never silently return a baseline captured
+    against a different account. If the currently configured account's
+    fingerprint matches the existing baseline, the call is idempotent and
+    returns it unchanged; if it differs, this fails closed with
+    ACCOUNT_FINGERPRINT_MISMATCH rather than overwriting or creating a
+    second baseline for the new account.
     """
     now = _now(clock)
     operator = _bounded(operator, "operator", 128)
     _require_external_config(config, book_id)
+    account = _account_check(runtime, book_id)
+    fingerprint = account["account_fingerprint"]
     existing = repo.load_external_reconciliation_baseline(conn, book_id)
     if existing is not None:
+        if existing["account_fingerprint"] != fingerprint:
+            raise ExternalPaperError(
+                "ACCOUNT_FINGERPRINT_MISMATCH",
+                "the currently configured paper account does not match the account this book's "
+                "reconciliation baseline was activated against",
+            )
         return existing
     if repo.list_external_order_events(conn, book_id=book_id):
         raise ExternalPaperError(
@@ -481,8 +540,6 @@ def activate_external_reconciliation_baseline(
             "external order/submission activity already exists for this book with no baseline on file — "
             "an operator must review broker/local state manually before a baseline can be captured",
         )
-    account = _account_check(runtime, book_id)
-    fingerprint = account["account_fingerprint"]
     _verify_fingerprint_history(conn, book_id, fingerprint)
     try:
         broker_positions_payload = runtime.get_external_positions(book_id)
@@ -1135,9 +1192,10 @@ def submit_external_paper_order(
             if order is None:
                 raise ExternalPaperError("ORDER_MISSING_AT_BROKER", "existing external order was not found at broker")
             return {"status": current["new_state"], "event": current, "order": order, "duplicate_submit": False}
+        reservation_date = now.astimezone(timezone.utc).date().isoformat()
         _reserve_daily_notional(
             conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
-            intent=intent, now=now,
+            attempt_number=0, intent=intent, now=now,
         )
         lease.heartbeat_or_raise()
         result = _submit_once(
@@ -1145,7 +1203,10 @@ def submit_external_paper_order(
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime,
             config=config, now=now, attempt_number=0, lease=lease,
         )
-        _settle_daily_reservation(conn, client_order_id=client_order_id, status=result["status"], now=now)
+        _settle_daily_reservation(
+            conn, client_order_id=client_order_id, attempt_number=0, fingerprint=fingerprint,
+            reservation_date=reservation_date, status=result["status"], now=now,
+        )
         if result["status"] != STATE_UNKNOWN:
             lease.heartbeat_or_raise()
             result["reconciliation"] = _reconcile_locked(
@@ -1383,17 +1444,26 @@ def retry_external_paper_order(
             conn, preview_id=preview["preview_id"], intent=intent, client_order_id=client_order_id,
             payload_hash=payload_hash, fingerprint=fingerprint, now=now, config=config,
         )
+        new_attempt_number = retries + 1
+        reservation_date = now.astimezone(timezone.utc).date().isoformat()
+        prior_reservation = repo.find_attempt_reservation_by_attempt(
+            conn, client_order_id, current["attempt_number"],
+        )
         _reserve_daily_notional(
             conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
-            intent=intent, now=now,
+            attempt_number=new_attempt_number, intent=intent, now=now,
+            supersede_reservation_id=prior_reservation["reservation_id"] if prior_reservation else None,
         )
         lease.heartbeat_or_raise()
         result = _submit_once(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
             fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
-            now=now, attempt_number=retries + 1, lease=lease,
+            now=now, attempt_number=new_attempt_number, lease=lease,
         )
-        _settle_daily_reservation(conn, client_order_id=client_order_id, status=result["status"], now=now)
+        _settle_daily_reservation(
+            conn, client_order_id=client_order_id, attempt_number=new_attempt_number, fingerprint=fingerprint,
+            reservation_date=reservation_date, status=result["status"], now=now,
+        )
         with lease.fenced_write():
             repo.consume_external_lookup(
                 conn, lookup["lookup_id"], result["event"]["external_order_event_id"], commit=False,
