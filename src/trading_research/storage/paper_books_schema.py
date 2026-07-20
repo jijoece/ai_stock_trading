@@ -13,6 +13,10 @@ the persistence boundary" convention — never REAL.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
+
 PAPER_BOOKS_SCHEMA_VERSION = 1
 
 PAPER_BOOKS_DDL = """
@@ -1094,6 +1098,11 @@ CREATE INDEX IF NOT EXISTS idx_paper_external_attempt_reservations_client_attemp
     ON paper_external_attempt_reservations(client_order_id, attempt_number);
 CREATE INDEX IF NOT EXISTS idx_paper_external_attempt_reservations_id
     ON paper_external_attempt_reservations(reservation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_external_attempt_one_active
+    ON paper_external_attempt_reservations(
+        client_order_id, attempt_number, account_fingerprint, book_id
+    )
+    WHERE state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED');
 """
 
 # Immutability guarantees (Step 11 "historical lots are immutable", Step 8
@@ -1554,9 +1563,129 @@ def _upgrade_triggers(conn) -> None:
             )
 
 
+_ACTIVE_EXTERNAL_RESERVATION_STATES = (
+    "RESERVED", "RECONCILIATION_REQUIRED", "SUBMITTED",
+)
+
+
+def derive_external_attempt_reservation_id(
+    client_order_id: str,
+    attempt_number: int,
+    account_fingerprint: str,
+    reservation_date: str,
+) -> str:
+    """Return the canonical identity shared by migration and runtime code."""
+    immutable = {
+        "client_order_id": client_order_id,
+        "attempt_number": attempt_number,
+        "account_fingerprint": account_fingerprint,
+        "reservation_date": reservation_date,
+    }
+    encoded = json.dumps(immutable, sort_keys=True, separators=(",", ":")).encode()
+    return f"resvn_{hashlib.sha256(encoded).hexdigest()[:40]}"
+
+
+def _backfill_active_legacy_external_reservations(conn) -> None:
+    """Copy active pre-attempt reservations exactly once and fail closed."""
+    legacy_rows = conn.execute(
+        "SELECT * FROM paper_external_daily_reservations "
+        "WHERE state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED') "
+        "ORDER BY client_order_id LIMIT 100000"
+    ).fetchall()
+    for legacy in legacy_rows:
+        reservation_id = derive_external_attempt_reservation_id(
+            legacy["client_order_id"], 0, legacy["account_fingerprint"], legacy["reservation_date"],
+        )
+        lineage_rows = conn.execute(
+            "SELECT reservation_id FROM paper_external_attempt_reservations "
+            "WHERE client_order_id = ? AND attempt_number = 0 AND account_fingerprint = ? AND book_id = ? "
+            "AND state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED') LIMIT 2",
+            (legacy["client_order_id"], legacy["account_fingerprint"], legacy["book_id"]),
+        ).fetchall()
+        if any(row["reservation_id"] != reservation_id for row in lineage_rows):
+            raise sqlite3.IntegrityError("LEGACY_ATTEMPT_RESERVATION_CONFLICT: active lineage differs")
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_external_attempt_reservations "
+            "(reservation_id, client_order_id, attempt_number, account_fingerprint, reservation_date, "
+            "book_id, reserved_notional_usd, state, created_at, updated_at) "
+            "VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                reservation_id, legacy["client_order_id"], legacy["account_fingerprint"],
+                legacy["reservation_date"], legacy["book_id"], legacy["reserved_notional_usd"],
+                legacy["state"], legacy["created_at"], legacy["updated_at"],
+            ),
+        )
+        existing = conn.execute(
+            "SELECT * FROM paper_external_attempt_reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        immutable_matches = existing is not None and (
+            existing["client_order_id"] == legacy["client_order_id"]
+            and existing["attempt_number"] == 0
+            and existing["account_fingerprint"] == legacy["account_fingerprint"]
+            and existing["reservation_date"] == legacy["reservation_date"]
+            and existing["book_id"] == legacy["book_id"]
+            and existing["reserved_notional_usd"] == legacy["reserved_notional_usd"]
+        )
+        state_is_active = existing is not None and existing["state"] in _ACTIVE_EXTERNAL_RESERVATION_STATES
+        if not immutable_matches or not state_is_active:
+            raise sqlite3.IntegrityError("LEGACY_ATTEMPT_RESERVATION_CONFLICT: material row mismatch")
+
+
+def _enforce_one_active_external_attempt_reservation(conn) -> None:
+    duplicate = conn.execute(
+        "SELECT 1 FROM paper_external_attempt_reservations "
+        "WHERE state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED') "
+        "GROUP BY client_order_id, attempt_number, account_fingerprint, book_id "
+        "HAVING COUNT(*) > 1 LIMIT 1"
+    ).fetchone()
+    if duplicate is not None:
+        raise sqlite3.IntegrityError("ATTEMPT_RESERVATION_CONFLICT: multiple active lineage rows")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_external_attempt_one_active "
+        "ON paper_external_attempt_reservations("
+        "client_order_id, attempt_number, account_fingerprint, book_id) "
+        "WHERE state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED')"
+    )
+
+
+def _external_reservation_migration_needed(conn) -> bool:
+    index_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_paper_external_attempt_one_active'"
+    ).fetchone()
+    if index_exists is None:
+        return True
+    unmigrated = conn.execute(
+        "SELECT 1 FROM paper_external_daily_reservations AS legacy "
+        "WHERE legacy.state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED') "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM paper_external_attempt_reservations AS attempt "
+        "WHERE attempt.client_order_id = legacy.client_order_id "
+        "AND attempt.attempt_number = 0 "
+        "AND attempt.account_fingerprint = legacy.account_fingerprint "
+        "AND attempt.reservation_date = legacy.reservation_date "
+        "AND attempt.book_id = legacy.book_id "
+        "AND attempt.reserved_notional_usd = legacy.reserved_notional_usd "
+        "AND attempt.state IN ('RESERVED', 'RECONCILIATION_REQUIRED', 'SUBMITTED')"
+        ") LIMIT 1"
+    ).fetchone()
+    return unmigrated is not None
+
+
 def apply_paper_books_schema(conn) -> None:
     conn.executescript(PAPER_BOOKS_DDL)
     _ensure_columns(conn)
+    if _external_reservation_migration_needed(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _backfill_active_legacy_external_reservations(conn)
+            _enforce_one_active_external_attempt_reservation(conn)
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
     conn.executescript(PAPER_BOOKS_INDEXES)
     _upgrade_triggers(conn)
     conn.executescript(PAPER_BOOKS_TRIGGERS)
