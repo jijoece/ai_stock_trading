@@ -1713,6 +1713,86 @@ def update_external_daily_reservation_state(
     _commit_if(conn, commit)
 
 
+def load_attempt_reservation(
+    conn: sqlite3.Connection, reservation_id: str,
+) -> dict | None:
+    """Milestone 25 Part A2: load an attempt-scoped reservation by its
+    deterministic identity (client_order_id, attempt_number, account_fingerprint,
+    reservation_date)."""
+    row = conn.execute(
+        "SELECT * FROM paper_external_attempt_reservations WHERE reservation_id = ?", (reservation_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def find_attempt_reservation_by_attempt(
+    conn: sqlite3.Connection, client_order_id: str, attempt_number: int,
+) -> dict | None:
+    """Milestone 25 Part A3: locate the (unique in practice) reservation
+    for one prior submission attempt, regardless of its reservation_date —
+    used to resolve a stale cross-day ambiguous reservation before a retry
+    reserves against the current date."""
+    row = conn.execute(
+        "SELECT * FROM paper_external_attempt_reservations "
+        "WHERE client_order_id = ? AND attempt_number = ? ORDER BY created_at LIMIT 1",
+        (client_order_id, attempt_number),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def sum_attempt_reservations_by_date(
+    conn: sqlite3.Connection, account_fingerprint: str, reservation_date: str,
+    *, exclude_reservation_id: str | None = None,
+) -> Decimal:
+    """Milestone 25 Part A3: sum every non-released, non-superseded attempt
+    reservation for this account/date. Includes RESERVED, SUBMITTED, and
+    RECONCILIATION_REQUIRED (an ambiguous outcome may still have reached
+    the broker). Excludes RELEASED and SUPERSEDED_BY_RETRY."""
+    query = (
+        "SELECT reserved_notional_usd FROM paper_external_attempt_reservations "
+        "WHERE account_fingerprint = ? AND reservation_date = ? "
+        "AND state NOT IN ('RELEASED', 'SUPERSEDED_BY_RETRY')"
+    )
+    params: list[object] = [account_fingerprint, reservation_date]
+    if exclude_reservation_id is not None:
+        query += " AND reservation_id != ?"
+        params.append(exclude_reservation_id)
+    total = Decimal("0")
+    for row in conn.execute(query, params).fetchall():
+        total += Decimal(row["reserved_notional_usd"])
+    return total
+
+
+def save_attempt_reservation(
+    conn: sqlite3.Connection, record: dict, *, commit: bool = True,
+) -> bool:
+    """Milestone 25 Part A2: insert a new attempt-scoped reservation.
+    Primary key is reservation_id (deterministic hash of
+    client_order_id, attempt_number, account_fingerprint, reservation_date)."""
+    cursor = conn.execute(
+        "INSERT INTO paper_external_attempt_reservations "
+        "(reservation_id, client_order_id, attempt_number, account_fingerprint, "
+        "reservation_date, book_id, reserved_notional_usd, state, created_at, updated_at) "
+        "VALUES (:reservation_id, :client_order_id, :attempt_number, :account_fingerprint, "
+        ":reservation_date, :book_id, :reserved_notional_usd, :state, :created_at, :updated_at)",
+        {**record, "reserved_notional_usd": str(record["reserved_notional_usd"])},
+    )
+    _commit_if(conn, commit)
+    return cursor.rowcount > 0
+
+
+def update_attempt_reservation_state(
+    conn: sqlite3.Connection, reservation_id: str, new_state: str, updated_at: str, *, commit: bool = True,
+) -> None:
+    """Milestone 25 Part A3: transition an attempt reservation's state.
+    Only state and updated_at may change; all other fields are immutable."""
+    conn.execute(
+        "UPDATE paper_external_attempt_reservations SET state = ?, updated_at = ? WHERE reservation_id = ?",
+        (new_state, updated_at, reservation_id),
+    )
+    _commit_if(conn, commit)
+
+
 def enqueue_external_submission(
     conn: sqlite3.Connection, *, queue_id: str, book_id: str, paper_order_intent_id: str,
     source: str, created_at: str,
