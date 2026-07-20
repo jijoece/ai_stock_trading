@@ -491,6 +491,53 @@ def test_provider_unavailable_releases_reservation(tmp_path):
     assert reservation["status"] == "RELEASED"
 
 
+def test_token_budget_required_without_controller_fails_closed(tmp_path):
+    provider = ScriptedResearchProvider({})  # any call would be a test failure
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo,
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=None,
+        token_budget_required=True,
+    )
+    assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
+    assert result.incomplete_reasons == ("TOKEN_BUDGET_CONTROLLER_REQUIRED",)
+    assert provider.calls == []
+
+
+def test_token_cap_disabled_keeps_legacy_direct_path(tmp_path):
+    provider = _happy_provider()
+    repo = FakeResearchRepository()
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=repo, configuration=_config(), clock=lambda: NOW,
+        run_mode="scripted", token_budget_controller=None, token_budget_required=False,
+    )
+    assert result.status == RUN_STATUS_COMPLETED
+    assert [c.role for c in provider.calls] == ["fundamental", "technical", "manager"]
+
+
+def test_reasoning_separate_missing_usage_becomes_ambiguous(tmp_path):
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(
+            kind="response", payload=ANALYST_REPORT_PAYLOAD,
+            usage_overrides={"token_accounting_policy": TOKEN_ACCOUNTING_REASONING_SEPARATE},
+            # Deliberately no reasoning_output_tokens override — stays None.
+        ),
+    })
+    conn, controller = _token_controller(tmp_path, policy=TOKEN_ACCOUNTING_REASONING_SEPARATE)
+    result = analyze_with_research_committee(
+        _snapshot(), provider=provider, provider_name="scripted", model_name="test-model",
+        prompt_registry=PromptRegistry(), research_repository=FakeResearchRepository(),
+        configuration=_config(roles=("fundamental",), max_attempts_per_role=1), clock=lambda: NOW,
+        run_mode="scripted", require_decision=False, token_budget_controller=controller,
+    )
+    assert result.status == RUN_STATUS_ANALYSIS_INCOMPLETE
+    [reservation] = list_budget_reservations(conn)
+    assert reservation["status"] == "AMBIGUOUS"
+
+
 def test_timeout_becomes_ambiguous_and_blocks_automatic_retry(tmp_path):
     provider = ScriptedResearchProvider({
         ("fundamental", 1): ScriptedStep(kind="timeout"),
