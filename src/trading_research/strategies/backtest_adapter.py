@@ -17,7 +17,7 @@ from ..backtesting.configuration import BacktestConfiguration
 from ..backtesting.data_provider import HistoricalDataProvider
 from ..backtesting.engine import run_backtest
 from ..backtesting.models import BacktestError, BacktestResult, EntrySignal
-from .contracts import StrategySignal, StrategyStatus, derive_canonical_strategy_signal_id
+from .contracts import StrategySignal, StrategyStatus, derive_strategy_signal_content_id
 from .strategy_metrics import StrategyBacktestMetrics, compute_strategy_metrics
 
 # The shared engine caps quantity by risk-fraction and available cash
@@ -36,9 +36,9 @@ def strategy_signal_to_entry_signal(
     limit_price = signal.limit_reference or signal.entry_reference
     if limit_price is None:
         raise BacktestError("signal is missing both limit_reference and entry_reference")
-    # Milestone 24 Part B7: the same canonical signal ID used by the
+    # Milestone 25 Part B10: the same content-identity ID used by the
     # execution boundary — never a second, independently-derived ID.
-    signal_id = derive_canonical_strategy_signal_id(signal)
+    signal_id = derive_strategy_signal_content_id(signal)
     return EntrySignal(
         signal_id=signal_id, symbol=signal.symbol,
         generated_after_session=signal.data_as_of.date(),
