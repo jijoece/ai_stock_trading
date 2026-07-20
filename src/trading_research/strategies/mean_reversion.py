@@ -73,7 +73,30 @@ class MeanReversionStrategy:
                 ("missing_long_trend_history",), {}, data_as_of=data_as_of,
             )
 
-        severe_risk_flags = market_data.catalyst.sec_filing_risk_flags if market_data.catalyst else ()
+        # Milestone 25 Part B3: a missing catalyst snapshot must never be
+        # interpreted as zero SEC risk flags — that silently treats unknown
+        # risk as no risk. Require the snapshot and its freshness to exist
+        # and not be from the future; only then may its (possibly empty)
+        # flags be trusted.
+        if market_data.catalyst is None:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("missing_catalyst_risk_data",), {}, data_as_of=data_as_of,
+            )
+        catalyst_freshness = market_data.catalyst.freshness
+        if catalyst_freshness is None:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("missing_catalyst_risk_freshness",), {}, data_as_of=data_as_of,
+            )
+        if catalyst_freshness.as_of > context.now:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("future_catalyst_risk_data",), {}, data_as_of=data_as_of,
+            )
+        assert data_as_of is not None
+        data_as_of = max(data_as_of, catalyst_freshness.as_of)
+        severe_risk_flags = market_data.catalyst.sec_filing_risk_flags
 
         zscore_ok = zscore <= cfg.zscore_entry_threshold
         rsi_ok = rsi <= cfg.maximum_entry_rsi

@@ -1,4 +1,4 @@
-from trading_research.models.trading_models import TechnicalFactorInput
+from trading_research.models.trading_models import DataFreshness, TechnicalFactorInput
 from trading_research.strategies.config import load_strategy_config
 from trading_research.strategies.contracts import StrategyContext, StrategyMarketData, StrategyStatus
 from trading_research.strategies.momentum_breakout import MomentumBreakoutStrategy
@@ -11,6 +11,13 @@ STRATEGY = MomentumBreakoutStrategy(CONFIG)
 
 def _context(screening_result=None) -> StrategyContext:
     return StrategyContext(now=NOW, screening_result=screening_result or passing_screening_result())
+
+
+def _technical(relative_strength: float = 1.0) -> TechnicalFactorInput:
+    return TechnicalFactorInput(
+        symbol="TEST", relative_strength=relative_strength,
+        freshness=DataFreshness(source="fixture", as_of=NOW),
+    )
 
 
 def _flat_then_breakout_closes() -> list[float]:
@@ -26,7 +33,7 @@ def test_valid_breakout_is_eligible():
     bars = build_bars(closes, volumes=volumes)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.ELIGIBLE
@@ -41,7 +48,7 @@ def test_no_breakout_is_not_eligible():
     bars = build_bars(closes, volumes=[1_000_000] * 80)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
@@ -54,7 +61,7 @@ def test_low_volume_breakout_is_not_eligible():
     bars = build_bars(closes, volumes=volumes)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
@@ -68,7 +75,7 @@ def test_excessively_extended_breakout_is_not_eligible():
     bars = build_bars(base, volumes=volumes)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
@@ -82,7 +89,7 @@ def test_negative_trend_is_not_eligible():
     bars = build_bars(base, volumes=volumes)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.NOT_ELIGIBLE
@@ -111,14 +118,49 @@ def test_data_as_of_is_derived_from_latest_bar_availability():
     closes = _flat_then_breakout_closes()
     volumes = [1_000_000] * (len(closes) - 1) + [3_000_000]
     bars = build_bars(closes, volumes=volumes)
+    technical = TechnicalFactorInput(
+        symbol="TEST", relative_strength=1.0,
+        freshness=DataFreshness(source="fixture", as_of=bars[-1].available_at),
+    )
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=technical,
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.ELIGIBLE
     assert signal.data_as_of == bars[-1].available_at
     assert signal.data_as_of != NOW
+
+
+def test_missing_technical_freshness_is_incomplete():
+    closes = _flat_then_breakout_closes()
+    volumes = [1_000_000] * (len(closes) - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(
+        symbol="TEST", bars=bars,
+        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+    )
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.INCOMPLETE
+    assert "missing_technical_freshness" in signal.reason_codes
+
+
+def test_future_technical_freshness_is_incomplete():
+    from datetime import timedelta
+
+    closes = _flat_then_breakout_closes()
+    volumes = [1_000_000] * (len(closes) - 1) + [3_000_000]
+    bars = build_bars(closes, volumes=volumes)
+    market_data = StrategyMarketData(
+        symbol="TEST", bars=bars,
+        technical=TechnicalFactorInput(
+            symbol="TEST", relative_strength=1.0,
+            freshness=DataFreshness(source="fixture", as_of=NOW + timedelta(hours=1)),
+        ),
+    )
+    signal = STRATEGY.evaluate("TEST", market_data, _context())
+    assert signal.status == StrategyStatus.INCOMPLETE
+    assert "future_technical_freshness" in signal.reason_codes
 
 
 def test_future_available_bar_is_rejected():
@@ -134,7 +176,7 @@ def test_future_available_bar_is_rejected():
     bars = bars[:-1] + (future_bar,)
     market_data = StrategyMarketData(
         symbol="TEST", bars=bars,
-        technical=TechnicalFactorInput(symbol="TEST", relative_strength=1.0),
+        technical=_technical(),
     )
     signal = STRATEGY.evaluate("TEST", market_data, _context())
     assert signal.status == StrategyStatus.INCOMPLETE

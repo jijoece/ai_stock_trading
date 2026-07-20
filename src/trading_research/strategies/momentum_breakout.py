@@ -67,6 +67,23 @@ class MomentumBreakoutStrategy:
                 symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
                 ("missing_relative_strength",), {}, data_as_of=data_as_of,
             )
+        # Milestone 25 Part B2: relative_strength has no timestamp of its
+        # own — an untimestamped value can never be treated as point-in-time
+        # safe, so its freshness snapshot must exist and not be from the
+        # future.
+        technical_freshness = market_data.technical.freshness if market_data.technical else None
+        if technical_freshness is None:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("missing_technical_freshness",), {}, data_as_of=data_as_of,
+            )
+        if technical_freshness.as_of > context.now:
+            return self._signal(
+                symbol, context.now, StrategyStatus.INCOMPLETE, 0.0,
+                ("future_technical_freshness",), {}, data_as_of=data_as_of,
+            )
+        assert data_as_of is not None
+        data_as_of = max(data_as_of, technical_freshness.as_of)
 
         breakout_confirmed = latest_close > breakout_level
         volume_confirmed = vol_ratio >= cfg.minimum_volume_ratio
