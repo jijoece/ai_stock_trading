@@ -996,6 +996,8 @@ CREATE TABLE IF NOT EXISTS backtest_fills (
     slippage TEXT NOT NULL,
     market_date TEXT NOT NULL,
     exit_reason TEXT,
+    fill_sequence INTEGER,
+    position_id TEXT,
     PRIMARY KEY (backtest_run_id, fill_id)
 );
 
@@ -1488,6 +1490,10 @@ _PAPER_BOOKS_COLUMN_UPGRADES = {
     # a takeover can be rejected even if it still believes it holds the lease.
     "paper_external_order_leases": {
         "generation": "INTEGER NOT NULL DEFAULT 1",
+    },
+    "backtest_fills": {
+        "fill_sequence": "INTEGER",
+        "position_id": "TEXT",
     },
 }
 

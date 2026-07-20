@@ -23,11 +23,12 @@ from .models import (
 )
 from .reports import build_report
 
-BACKTEST_CODE_VERSION = "advanced-risk-backtest-v1"
+BACKTEST_CODE_VERSION = "advanced-risk-backtest-v2-fill-sequence"
 
 
 @dataclass
 class _Position:
+    position_id: str
     symbol: str
     quantity: Decimal
     original_quantity: Decimal
@@ -112,7 +113,8 @@ def _sell(
         fill_id=_fill_id(order_id, "SELL", market_date, quantity), order_id=order_id,
         symbol=position.symbol, side="SELL", quantity=quantity, fill_price=slipped,
         fees=config.fee_per_order, slippage=(price - slipped) * quantity,
-        market_date=market_date, exit_reason=reason,
+        market_date=market_date, exit_reason=reason, fill_sequence=len(fills) + 1,
+        position_id=position.position_id,
     ))
     position.quantity -= quantity
     return cash, realized_pnl
@@ -341,14 +343,15 @@ def run_backtest(
             cost = quantity * fill_price + config.fee_per_order
             cash -= cost
             order_id = f"bt-order-{signal.signal_id}"
+            fill_id = _fill_id(order_id, "BUY", current_date, quantity)
             fills.append(BacktestFill(
-                fill_id=_fill_id(order_id, "BUY", current_date, quantity), order_id=order_id,
+                fill_id=fill_id, order_id=order_id,
                 symbol=signal.symbol, side="BUY", quantity=quantity, fill_price=fill_price,
                 fees=config.fee_per_order, slippage=(fill_price - base_fill) * quantity,
-                market_date=current_date,
+                market_date=current_date, fill_sequence=len(fills) + 1, position_id=fill_id,
             ))
             positions[signal.symbol] = _Position(
-                symbol=signal.symbol, quantity=quantity, original_quantity=quantity,
+                position_id=fill_id, symbol=signal.symbol, quantity=quantity, original_quantity=quantity,
                 entry_price=fill_price, entry_date=current_date,
                 entry_session_index=session_index[current_date], entry_atr=atr,
                 stop=stop, target=target, highest=fill_price,
@@ -448,11 +451,12 @@ def _persist_result(
         for fill in result.fills:
             conn.execute(
                 "INSERT OR IGNORE INTO backtest_fills "
-                "(backtest_run_id, fill_id, order_id, symbol, side, quantity, fill_price, fees, slippage, market_date, exit_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(backtest_run_id, fill_id, order_id, symbol, side, quantity, fill_price, fees, slippage, "
+                "market_date, exit_reason, fill_sequence, position_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (result.backtest_run_id, fill.fill_id, fill.order_id, fill.symbol, fill.side,
                  str(fill.quantity), str(fill.fill_price), str(fill.fees), str(fill.slippage),
-                 fill.market_date.isoformat(), fill.exit_reason),
+                 fill.market_date.isoformat(), fill.exit_reason, fill.fill_sequence, fill.position_id),
             )
         conn.execute(
             "INSERT OR IGNORE INTO backtest_metrics (backtest_run_id, metrics_json, created_at) VALUES (?, ?, ?)",

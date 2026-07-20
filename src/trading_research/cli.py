@@ -1426,7 +1426,10 @@ def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, sy
             evidence_providers=registry, research_provider=DeterministicResearchProvider(),
             research_provider_name="deterministic", research_model_name="deterministic-v1",
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
-            prompt_registry=PromptRegistry(), portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            prompt_registry=PromptRegistry(), portfolio=PortfolioState.from_position_snapshots(
+                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
+                as_of=as_of, maximum_price_age_seconds=0,
+            ),
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
         )
 
@@ -1489,7 +1492,10 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
             evidence_providers=registry, research_provider=DeterministicResearchProvider(),
             research_provider_name="deterministic", research_model_name="deterministic-v1",
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
-            prompt_registry=PromptRegistry(), portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            prompt_registry=PromptRegistry(), portfolio=PortfolioState.from_position_snapshots(
+                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
+                as_of=as_of, maximum_price_age_seconds=0,
+            ),
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
         )
 
@@ -1835,7 +1841,10 @@ def run_due_shadow_cycle_cli(
             research_provider_name=research_provider_name, research_model_name=research_model_name,
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
             prompt_registry=PromptRegistry(),
-            portfolio=PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=as_of),
+            portfolio=PortfolioState.from_position_snapshots(
+                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
+                as_of=as_of, maximum_price_age_seconds=0,
+            ),
             paper_submitter=None, git_sha=_git_sha(),
         )
 

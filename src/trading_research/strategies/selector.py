@@ -45,7 +45,9 @@ def _sort_key(signal: StrategySignal) -> tuple[float, int, float]:
     return (-signal.signal_strength, quality_rank, freshness_rank)
 
 
-def _symbol_has_allocation_room(symbol: str, portfolio: PortfolioState | None, config: ShortlistConfig) -> bool:
+def _symbol_allocation_decision(
+    symbol: str, portfolio: PortfolioState | None, config: ShortlistConfig,
+) -> tuple[bool, str | None]:
     """Milestone 24 Part C6: real, deterministic, per-symbol pre-research
     filter — replaces the previous gate, which only checked whether total
     portfolio exposure was below 100% and so let an already-maxed-out
@@ -55,10 +57,26 @@ def _symbol_has_allocation_room(symbol: str, portfolio: PortfolioState | None, c
     consume a research token. Advisory only — final risk validation remains
     authoritative."""
     if portfolio is None:
-        return True
-    current = portfolio.symbol_exposure_fraction.get(symbol, 0.0)
+        return True, None
+    if (
+        portfolio.account_equity is None
+        or portfolio.account_equity <= 0
+        or not portfolio.symbol_exposure_complete
+    ):
+        return False, "symbol_exposure_unknown"
+    if symbol in portfolio.existing_positions and symbol not in portfolio.symbol_exposure_fraction:
+        return False, "symbol_exposure_unknown"
+    # A complete snapshot proves a symbol absent from existing_positions is
+    # genuinely unheld, so only that case may use a known zero.
+    current = portfolio.symbol_exposure_fraction.get(symbol)
+    if current is None:
+        if symbol in portfolio.existing_positions:
+            return False, "symbol_exposure_unknown"
+        current = 0.0
     remaining = config.maximum_symbol_allocation_fraction - current
-    return remaining >= config.minimum_candidate_allocation_fraction
+    return remaining >= config.minimum_candidate_allocation_fraction, (
+        None if remaining >= config.minimum_candidate_allocation_fraction else "symbol_allocation_cap_reached"
+    )
 
 
 def select_shortlist(
@@ -91,9 +109,10 @@ def select_shortlist(
             excluded.append(ShortlistEntry(symbol, signals_tuple, best_strength, False,
                                             "combined_shortlist_cap_reached"))
             continue
-        if not _symbol_has_allocation_room(symbol, portfolio, config):
+        has_room, allocation_reason = _symbol_allocation_decision(symbol, portfolio, config)
+        if not has_room:
             excluded.append(ShortlistEntry(symbol, signals_tuple, best_strength, False,
-                                            "symbol_allocation_cap_reached"))
+                                            allocation_reason or "symbol_exposure_unknown"))
             continue
         entries.append(ShortlistEntry(symbol, signals_tuple, best_strength, True, "shortlisted"))
 

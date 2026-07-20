@@ -71,6 +71,15 @@ class BacktestFill:
     slippage: Decimal
     market_date: date
     exit_reason: str | None = None
+    # Monotonic engine execution order. None is reserved for legacy rows;
+    # metric reconstruction then preserves the supplied tuple order.
+    fill_sequence: int | None = None
+    # Opening fill identity carried through every exit of the same lot.
+    position_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.fill_sequence is not None and self.fill_sequence < 1:
+            raise BacktestError("fill_sequence must be positive when present")
 
 
 @dataclass(frozen=True)

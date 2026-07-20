@@ -2,7 +2,7 @@ import ast
 from datetime import timedelta
 from decimal import Decimal
 
-from trading_research.models.trading_models import PortfolioState
+from trading_research.models.trading_models import PortfolioPositionSnapshot, PortfolioState
 from trading_research.strategies.config import load_strategy_config
 from trading_research.strategies.contracts import StrategySignal, StrategyStatus
 from trading_research.strategies.selector import select_shortlist
@@ -74,6 +74,7 @@ def test_symbol_at_allocation_cap_is_excluded():
     portfolio = PortfolioState(
         account_equity=Decimal("10000"), settled_cash=Decimal("100"),
         symbol_exposure_fraction={"AAA": SHORTLIST_CONFIG.maximum_symbol_allocation_fraction},
+        symbol_exposure_complete=True,
     )
     signals = {"momentum_breakout": (_signal("AAA", 0.9),)}
     result = select_shortlist(signals, SHORTLIST_CONFIG, portfolio=portfolio)
@@ -85,10 +86,84 @@ def test_symbol_with_allocation_room_is_included():
     portfolio = PortfolioState(
         account_equity=Decimal("10000"), settled_cash=Decimal("100"),
         symbol_exposure_fraction={"AAA": 0.0},
+        symbol_exposure_complete=True,
     )
     signals = {"momentum_breakout": (_signal("AAA", 0.9),)}
     result = select_shortlist(signals, SHORTLIST_CONFIG, portfolio=portfolio)
     assert result.symbols == ("AAA",)
+
+
+def test_complete_snapshot_proves_unheld_symbol_has_known_zero_exposure():
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("10000"),
+        existing_positions={}, symbol_exposure_fraction={}, symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, SHORTLIST_CONFIG, portfolio)
+    assert result.symbols == ("AAA",)
+
+
+def test_held_symbol_missing_from_complete_exposure_map_is_unknown():
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        existing_positions={"AAA": 10}, symbol_exposure_fraction={},
+        symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, SHORTLIST_CONFIG, portfolio)
+    assert result.entries == ()
+    assert result.excluded[0].reason == "symbol_exposure_unknown"
+
+
+def test_incomplete_exposure_snapshot_is_excluded_before_research():
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.0}, symbol_exposure_complete=False, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, SHORTLIST_CONFIG, portfolio)
+    assert result.entries == ()
+    assert result.excluded[0].reason == "symbol_exposure_unknown"
+
+
+def test_missing_account_equity_is_not_favorable_zero_exposure():
+    portfolio = PortfolioState(
+        account_equity=None, settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.0}, symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, SHORTLIST_CONFIG, portfolio)
+    assert result.entries == ()
+    assert result.excluded[0].reason == "symbol_exposure_unknown"
+
+
+def test_portfolio_builder_populates_point_in_time_symbol_exposure():
+    portfolio = PortfolioState.from_position_snapshots(
+        account_equity=Decimal("10000"), settled_cash=Decimal("5000"),
+        positions={
+            "AAA": PortfolioPositionSnapshot(
+                quantity=5, market_price=Decimal("100"), price_as_of=NOW - timedelta(seconds=30),
+            ),
+        },
+        as_of=NOW, maximum_price_age_seconds=60,
+    )
+    assert portfolio.symbol_exposure_complete is True
+    assert portfolio.symbol_exposure_fraction == {"AAA": 0.05}
+    assert portfolio.portfolio_exposure_fraction == 0.05
+
+
+def test_stale_or_missing_position_price_keeps_exposure_incomplete():
+    for position in (
+        PortfolioPositionSnapshot(quantity=5, market_price=None, price_as_of=NOW),
+        PortfolioPositionSnapshot(
+            quantity=5, market_price=Decimal("100"), price_as_of=NOW - timedelta(seconds=61),
+        ),
+    ):
+        portfolio = PortfolioState.from_position_snapshots(
+            account_equity=Decimal("10000"), settled_cash=Decimal("5000"), positions={"AAA": position},
+            as_of=NOW, maximum_price_age_seconds=60,
+        )
+        assert portfolio.symbol_exposure_complete is False
+        result = select_shortlist(
+            {"momentum_breakout": (_signal("AAA", 0.9),)}, SHORTLIST_CONFIG, portfolio,
+        )
+        assert result.excluded[0].reason == "symbol_exposure_unknown"
 
 
 def test_freshness_tie_break_prefers_newer_data_as_of():

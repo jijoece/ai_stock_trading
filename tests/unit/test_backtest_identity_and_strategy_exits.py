@@ -64,6 +64,61 @@ def test_identical_signal_sets_replay_idempotently(tmp_path):
     assert rows[0] == 1
 
 
+def test_fill_sequence_is_deterministic_and_persisted(tmp_path):
+    bars = _bars()
+    provider = FixtureHistoricalDataProvider({"AAPL": bars})
+    config = _config(bars)
+    signal = EntrySignal(
+        signal_id="a", symbol="AAPL", generated_after_session=bars[1].session_date,
+        limit_price=Decimal("104"), quantity_hint=Decimal("10"),
+        initial_stop_reference=Decimal("90"), target_reference=Decimal("200"),
+        maximum_holding_sessions=1,
+    )
+    first = run_backtest(configuration=config, data_provider=provider, signals=(signal,))
+    second = run_backtest(configuration=config, data_provider=provider, signals=(signal,))
+    assert [fill.fill_sequence for fill in first.fills] == list(range(1, len(first.fills) + 1))
+    assert [fill.fill_sequence for fill in second.fills] == [fill.fill_sequence for fill in first.fills]
+
+    conn = connect(tmp_path / "sequence.sqlite3")
+    persisted = run_backtest(configuration=config, data_provider=provider, signals=(signal,), conn=conn)
+    rows = conn.execute(
+        "SELECT fill_id, fill_sequence, position_id FROM backtest_fills "
+        "WHERE backtest_run_id = ? ORDER BY fill_sequence",
+        (persisted.backtest_run_id,),
+    ).fetchall()
+    assert [row["fill_sequence"] for row in rows] == list(range(1, len(rows) + 1))
+    assert all(row["position_id"] for row in rows)
+
+
+def test_same_session_exit_precedes_reentry_and_preserves_position_identity():
+    bars = _bars()
+    provider = FixtureHistoricalDataProvider({"AAPL": bars})
+    config = _config(bars)
+    old_signal = EntrySignal(
+        signal_id="old", symbol="AAPL", generated_after_session=bars[2].session_date,
+        limit_price=Decimal("105"), quantity_hint=Decimal("10"),
+        initial_stop_reference=Decimal("90"), target_reference=Decimal("200"),
+        maximum_holding_sessions=1,
+    )
+    new_signal = EntrySignal(
+        signal_id="new", symbol="AAPL", generated_after_session=bars[3].session_date,
+        limit_price=Decimal("106"), quantity_hint=Decimal("5"),
+        initial_stop_reference=Decimal("90"), target_reference=Decimal("200"),
+        maximum_holding_sessions=10,
+    )
+    result = run_backtest(
+        configuration=config, data_provider=provider, signals=(old_signal, new_signal),
+    )
+    old_buy = next(fill for fill in result.fills if fill.order_id == "bt-order-old" and fill.side == "BUY")
+    old_sell = next(fill for fill in result.fills if fill.side == "SELL" and fill.position_id == old_buy.position_id)
+    new_buy = next(fill for fill in result.fills if fill.order_id == "bt-order-new" and fill.side == "BUY")
+    assert old_sell.market_date == new_buy.market_date
+    assert old_sell.fill_sequence < new_buy.fill_sequence
+    assert old_sell.position_id == old_buy.fill_id
+    assert new_buy.position_id == new_buy.fill_id
+    assert new_buy.position_id != old_buy.position_id
+
+
 def test_run_id_collision_with_different_input_hash_fails_closed(tmp_path):
     bars = _bars()
     provider = FixtureHistoricalDataProvider({"AAPL": bars})
