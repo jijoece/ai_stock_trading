@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..storage.shadow_operations_repositories import load_budget_reservation
 from ..strategies.research_budget import (
+    TOKEN_ACCOUNTING_REASONING_SEPARATE,
     TOKEN_RESERVATION_AMBIGUOUS,
     TOKEN_RESERVATION_RESERVED,
     Clock,
@@ -37,17 +39,24 @@ class PersistentResearchTokenBudgetController:
         )
 
     def invoke(self, provider: Any, request: Any, *, provider_name: str | None = None) -> Any:
-        reservation = reserve_research_tokens(
-            self.conn, research_run_id=request.research_run_id, symbol=request.snapshot.symbol,
-            provider=provider_name or getattr(provider, "provider_name", provider.__class__.__name__),
-            model_name=request.model_name,
-            estimated_input_tokens=self._conservative_input_allowance(request),
-            maximum_output_tokens=request.max_output_tokens,
-            maximum_reasoning_tokens=self.maximum_reasoning_tokens,
-            daily_token_cap=self.daily_token_cap, clock=self.clock,
-            token_accounting_policy=self.token_accounting_policy,
-            research_attempt_identity=f"{request.role}:{request.attempt_number}",
-        )
+        try:
+            reservation = reserve_research_tokens(
+                self.conn, research_run_id=request.research_run_id, symbol=request.snapshot.symbol,
+                provider=provider_name or getattr(provider, "provider_name", provider.__class__.__name__),
+                model_name=request.model_name,
+                estimated_input_tokens=self._conservative_input_allowance(request),
+                maximum_output_tokens=request.max_output_tokens,
+                maximum_reasoning_tokens=self.maximum_reasoning_tokens,
+                daily_token_cap=self.daily_token_cap, clock=self.clock,
+                token_accounting_policy=self.token_accounting_policy,
+                research_attempt_identity=f"{request.role}:{request.attempt_number}",
+            )
+        except TokenBudgetError as exc:
+            # A reused idempotency key with incompatible immutable metadata
+            # (payload mismatch, accounting-policy mismatch) must fail closed
+            # without ever reaching the provider (docs/milestones/26.md A5) —
+            # never let this propagate as an uncaught crash.
+            raise ProviderUnavailableError(str(exc), stage="BUDGET_GATED", code=exc.code, retryable=False) from exc
         if isinstance(reservation, TokenBudgetRejected):
             raise ProviderUnavailableError(
                 reservation.reason, stage="BUDGET_GATED", code=reservation.code, retryable=False,
@@ -83,6 +92,16 @@ class PersistentResearchTokenBudgetController:
                 "provider returned no authoritative token usage",
                 code="TOKEN_USAGE_EVIDENCE_REQUIRED", retryable=False,
             )
+        if usage.token_accounting_policy == TOKEN_ACCOUNTING_REASONING_SEPARATE and usage.reasoning_output_tokens is None:
+            # A missing separate reasoning count must never become a
+            # fabricated zero under REASONING_SEPARATE accounting
+            # (docs/milestones/26.md A3) — the reservation stays counted
+            # against the cap pending operator reconciliation.
+            mark_research_tokens_ambiguous(self.conn, reservation.reservation_id)
+            raise ProviderUnavailableError(
+                "REASONING_SEPARATE accounting requires authoritative reasoning-token usage",
+                code="TOKEN_USAGE_EVIDENCE_REQUIRED", retryable=False,
+            )
         try:
             settle_research_tokens(
                 self.conn, reservation.reservation_id,
@@ -92,6 +111,13 @@ class PersistentResearchTokenBudgetController:
                 provider_request_id=usage.provider_request_id, clock=self.clock,
             )
         except TokenBudgetError:
-            mark_research_tokens_ambiguous(self.conn, reservation.reservation_id)
+            # A settlement conflict can mean another process already settled
+            # this reservation (terminal SETTLED state) rather than a
+            # transient persistence failure. Reload and only ever attempt
+            # RESERVED -> AMBIGUOUS; never SETTLED -> AMBIGUOUS
+            # (docs/milestones/26.md A7).
+            reloaded = load_budget_reservation(self.conn, reservation.reservation_id)
+            if reloaded is not None and reloaded["status"] == TOKEN_RESERVATION_RESERVED:
+                mark_research_tokens_ambiguous(self.conn, reservation.reservation_id)
             raise
         return response
