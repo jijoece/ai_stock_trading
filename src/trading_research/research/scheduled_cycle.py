@@ -337,6 +337,7 @@ def run_scheduled_research_cycle(
     clock: Callable[[], datetime],
     git_sha: str,
     attempt_controller_factory: Callable[[str], Any] | None = None,
+    token_budget_controller_factory: Callable[[str], Any] | None = None,
 ) -> ResearchCycleResult:
     """`paper_submitter`, when supplied, is a callable `(recommendation_id) ->
     PaperExecutionOutcome` — kept injectable so this module never imports the
@@ -349,7 +350,14 @@ def run_scheduled_research_cycle(
     once per symbol so a fresh instance (with its own per-symbol role-index
     counter) is used for the committee call — this module never imports
     `shadow`; a shadow-budget-aware factory is injected by the caller (see
-    `shadow/scheduler.py`)."""
+    `shadow/scheduler.py`).
+
+    `token_budget_controller_factory` (docs/milestones/26.md A1, default `None`):
+    an optional zero-arg-per-symbol callable `(symbol) -> ResearchTokenBudgetController`,
+    invoked once per symbol and passed into `analyze_with_research_committee` for every
+    fresh research invocation. When `research_configuration.daily_token_cap` is set but
+    no factory is supplied, every fresh call fails closed with
+    `TOKEN_BUDGET_CONTROLLER_REQUIRED` rather than calling the provider directly."""
     bounded_symbols = tuple(symbols[: configuration.max_candidates_per_cycle])
     cycle_id = derive_cycle_id(configuration.universe_id, as_of, configuration.config_hash)
 
@@ -386,6 +394,9 @@ def run_scheduled_research_cycle(
                     research_repository=research_repository, prompt_registry=prompt_registry, portfolio=portfolio,
                     paper_submitter=paper_submitter, clock=clock, git_sha=git_sha,
                     attempt_controller=attempt_controller_factory(symbol) if attempt_controller_factory is not None else None,
+                    token_budget_controller=(
+                        token_budget_controller_factory(symbol) if token_budget_controller_factory is not None else None
+                    ),
                 )
         except Exception as exc:  # per-symbol failure isolation — never loses the whole cycle
             result = SymbolCycleResult(symbol=symbol, status=SYMBOL_STATUS_FAILED, failure_reason=str(exc))
@@ -421,6 +432,7 @@ def _run_symbol(
     prompt_registry: PromptRegistry, portfolio: PortfolioState | None,
     paper_submitter: Callable[[str], Any] | None, clock: Callable[[], datetime], git_sha: str,
     attempt_controller: Any | None = None,
+    token_budget_controller: Any | None = None,
 ) -> SymbolCycleResult:
     candidate_run_id = _candidate_run_id(cycle_id, symbol)
     idempotency_key = f"{cycle_id}:{symbol}:baseline"
@@ -518,6 +530,8 @@ def _run_symbol(
             model_name=research_model_name, prompt_registry=prompt_registry,
             research_repository=research_repository, configuration=research_configuration,
             clock=clock, run_mode=research_provider_name, attempt_controller=attempt_controller,
+            token_budget_controller=token_budget_controller,
+            token_budget_required=research_configuration.daily_token_cap is not None,
         )
         orchestration_status = orchestration_result.status
         decision = orchestration_result.decision

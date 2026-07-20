@@ -17,7 +17,7 @@ import yaml
 from ..config import REPO_ROOT
 from ..hashing import hash_config
 from .errors import UnknownOverlayActionError, UnknownProviderError, UnknownRoleError
-from .models import OVERLAY_ACTIONS
+from .models import OVERLAY_ACTIONS, TOKEN_ACCOUNTING_NOT_APPLICABLE, TOKEN_ACCOUNTING_POLICIES
 
 DEFAULT_RESEARCH_CONFIG_PATH = REPO_ROOT / "config" / "research.yaml"
 
@@ -96,6 +96,15 @@ class ResearchConfiguration:
     raw: dict
     claude_code: ClaudeCodeYamlConfiguration | None = None
     codex: CodexYamlConfiguration | None = None
+    # Operational token-budget enforcement (PR A, docs/milestones/26.md). `None`
+    # (the default, matching every pre-existing research.yaml) means no daily
+    # token cap is configured — fresh provider calls keep using the legacy
+    # direct-invocation path. Setting a cap requires a token-budget controller
+    # to be supplied for every fresh call (fail-closed, never a silent
+    # fallback to direct invocation).
+    daily_token_cap: int | None = None
+    token_budget_maximum_reasoning_tokens: int = 0
+    token_budget_accounting_policy: str = TOKEN_ACCOUNTING_NOT_APPLICABLE
 
     def analyst_roles(self) -> tuple[str, ...]:
         return tuple(r for r in self.roles if r != MANAGER_ROLE)
@@ -179,7 +188,7 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
     if not isinstance(overlay, dict):
         raise ResearchConfigError("research config missing top-level 'overlay' section")
 
-    allowed_top_level = {"version", "research", "claude_code", "codex", "roles", "overlay"}
+    allowed_top_level = {"version", "research", "claude_code", "codex", "roles", "overlay", "token_budget"}
     unknown_top_level = set(raw) - allowed_top_level
     if unknown_top_level:
         raise ResearchConfigError(f"research config has unknown top-level keys: {sorted(unknown_top_level)}")
@@ -292,6 +301,33 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
         except (TypeError, ValueError) as exc:
             raise ResearchConfigError(f"invalid codex config value: {exc}") from exc
 
+    daily_token_cap: int | None = None
+    token_budget_maximum_reasoning_tokens = 0
+    token_budget_accounting_policy = TOKEN_ACCOUNTING_NOT_APPLICABLE
+    token_budget_section = raw.get("token_budget")
+    if token_budget_section is not None:
+        if not isinstance(token_budget_section, dict):
+            raise ResearchConfigError("token_budget must be a mapping")
+        required_token_budget_keys = {"daily_token_cap", "maximum_reasoning_tokens", "token_accounting_policy"}
+        missing_token_budget = required_token_budget_keys - set(token_budget_section)
+        unknown_token_budget = set(token_budget_section) - required_token_budget_keys
+        if missing_token_budget:
+            raise ResearchConfigError(f"token_budget config missing keys: {sorted(missing_token_budget)}")
+        if unknown_token_budget:
+            raise ResearchConfigError(f"token_budget config has unknown keys: {sorted(unknown_token_budget)}")
+        cap_value = token_budget_section["daily_token_cap"]
+        if cap_value is not None:
+            if type(cap_value) is not int or cap_value < 0:
+                raise ResearchConfigError("token_budget.daily_token_cap must be null or an integer >= 0")
+            daily_token_cap = cap_value
+        token_budget_maximum_reasoning_tokens = int(token_budget_section["maximum_reasoning_tokens"])
+        token_budget_accounting_policy = str(token_budget_section["token_accounting_policy"])
+        if token_budget_accounting_policy not in TOKEN_ACCOUNTING_POLICIES:
+            raise ResearchConfigError(
+                f"token_budget.token_accounting_policy {token_budget_accounting_policy!r} is not one of "
+                f"{TOKEN_ACCOUNTING_POLICIES} — fails closed"
+            )
+
     return ResearchConfiguration(
         version=raw.get("version", 1),
         enabled=_strict_bool(research_section["enabled"], "research.enabled"),
@@ -318,4 +354,7 @@ def load_research_config(path: str | Path | None = None) -> ResearchConfiguratio
         raw=raw,
         claude_code=claude_code_config,
         codex=codex_config,
+        daily_token_cap=daily_token_cap,
+        token_budget_maximum_reasoning_tokens=token_budget_maximum_reasoning_tokens,
+        token_budget_accounting_policy=token_budget_accounting_policy,
     )
