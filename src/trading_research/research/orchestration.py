@@ -169,6 +169,18 @@ class ResearchAttemptController(Protocol):
     def after_attempt(self, request: AttemptControlRequest, attempt: "ResearchAttemptRecord") -> None: ...
 
 
+class ResearchTokenBudgetController(Protocol):
+    """Optional provider-call wrapper activated when a daily token cap exists.
+
+    The orchestrator owns use of this boundary, so a configured cap cannot
+    be bypassed by a caller forgetting to reserve a particular role/retry.
+    """
+
+    def invoke(
+        self, provider: ResearchModelProvider, request: ResearchModelRequest, *, provider_name: str,
+    ) -> Any: ...
+
+
 @dataclass(frozen=True)
 class OrchestrationResult:
     research_run_id: str
@@ -350,6 +362,7 @@ def _run_role_with_retries(
     clock: Callable[[], datetime],
     role_reports_for_manager: tuple[RoleResearchReport, ...] = (),
     attempt_controller: "ResearchAttemptController | None" = None,
+    token_budget_controller: "ResearchTokenBudgetController | None" = None,
 ) -> tuple[RoleResearchReport | ResearchDecision | None, list[ResearchAttemptRecord], list[ResearchValidationFailure]]:
     attempts: list[ResearchAttemptRecord] = []
     all_failures: list[ResearchValidationFailure] = []
@@ -430,7 +443,11 @@ def _run_role_with_retries(
 
         provider_attempt_count += 1
         try:
-            response = provider.generate_structured(request)
+            response = (
+                token_budget_controller.invoke(provider, request, provider_name=provider_name)
+                if token_budget_controller is not None
+                else provider.generate_structured(request)
+            )
         except ProviderUnavailableError as exc:
             attempt_failures = [_failure_from_exc(
                 exc, research_run_id=research_run_id, attempt_id=attempt_id, role=role,
@@ -684,6 +701,7 @@ def analyze_with_research_committee(
     run_mode: str,
     require_decision: bool = True,
     attempt_controller: "ResearchAttemptController | None" = None,
+    token_budget_controller: "ResearchTokenBudgetController | None" = None,
 ) -> OrchestrationResult:
     """`attempt_controller` (docs/milestone-7.1.md Step 12, default `None` =
     every prior milestone's exact behavior): an optional
@@ -782,6 +800,7 @@ def analyze_with_research_committee(
             role=role, research_run_id=research_run_id, snapshot=snapshot, provider=provider,
             provider_name=provider_name, model_name=model_name, prompt_registry=prompt_registry,
             configuration=configuration, clock=clock, attempt_controller=attempt_controller,
+            token_budget_controller=token_budget_controller,
         )
         all_attempts.extend(attempts)
         all_failures.extend(failures)
@@ -871,7 +890,7 @@ def analyze_with_research_committee(
         role=MANAGER_ROLE, research_run_id=research_run_id, snapshot=snapshot, provider=provider,
         provider_name=provider_name, model_name=model_name, prompt_registry=prompt_registry,
         configuration=configuration, clock=clock, role_reports_for_manager=tuple(valid_reports),
-        attempt_controller=attempt_controller,
+        attempt_controller=attempt_controller, token_budget_controller=token_budget_controller,
     )
     all_attempts.extend(manager_attempts)
     all_failures.extend(manager_failures)

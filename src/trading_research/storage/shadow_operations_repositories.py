@@ -112,6 +112,36 @@ def list_budget_reservations(conn: sqlite3.Connection, *, status: str | None = N
     return [dict(r) for r in rows]
 
 
+def insert_token_budget_reconciliation(conn: sqlite3.Connection, reconciliation: dict) -> None:
+    """Append one operator-authored resolution of an ambiguous token charge."""
+    conn.execute(
+        "INSERT INTO shadow_token_budget_reconciliations "
+        "(reconciliation_id, reservation_id, from_status, to_status, operator, reason, "
+        "reconciliation_source, provider_request_id, actual_input_tokens, actual_output_tokens, "
+        "actual_reasoning_tokens, token_accounting_policy, reconciled_at) "
+        "VALUES (:reconciliation_id, :reservation_id, :from_status, :to_status, :operator, :reason, "
+        ":reconciliation_source, :provider_request_id, :actual_input_tokens, :actual_output_tokens, "
+        ":actual_reasoning_tokens, :token_accounting_policy, :reconciled_at)",
+        reconciliation,
+    )
+
+
+def list_token_budget_reconciliations(
+    conn: sqlite3.Connection, *, reservation_id: str | None = None,
+) -> list[dict]:
+    if reservation_id is None:
+        rows = conn.execute(
+            "SELECT * FROM shadow_token_budget_reconciliations ORDER BY reconciled_at, reconciliation_id"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM shadow_token_budget_reconciliations WHERE reservation_id = ? "
+            "ORDER BY reconciled_at, reconciliation_id",
+            (reservation_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 # --- shadow_budget_usage --------------------------------------------------------
 
 

@@ -180,6 +180,8 @@ class ScriptedResearchProvider:
             latency_ms=overrides.get("latency_ms", 10),
             provider_request_id=overrides.get("provider_request_id", f"scripted-{request.role}-{request.attempt_number}"),
             retry_count=request.attempt_number - 1, success=True,
+            reasoning_output_tokens=overrides.get("reasoning_output_tokens"),
+            token_accounting_policy=overrides.get("token_accounting_policy", "NOT_APPLICABLE"),
         )
         return ResearchModelResponse(
             role=request.role, provider="scripted", model_name=request.model_name,
