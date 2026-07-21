@@ -232,6 +232,7 @@ def _reserve_daily_notional(
     client_order_id: str, attempt_number: int, intent: dict, now: datetime,
     supersede_reservation_id: str | None = None,
     supersede_attempt_number: int | None = None,
+    commit: bool = True,
 ) -> dict:
     """Milestone 25 Part A2/A3: atomic, account-wide external-paper daily
     notional budget with attempt-scoped identity. Scoped by
@@ -251,97 +252,127 @@ def _reserve_daily_notional(
     unresolved RESERVED/RECONCILIATION_REQUIRED prior attempt may be
     superseded — a submitted attempt's own reconciliation path owns it).
 
-    Runs its own `BEGIN IMMEDIATE` .. `COMMIT` — never nested inside the
-    caller's order-scope-lease `fenced_write` — so the read-then-write
-    check-and-reserve is atomic even when two books/processes race to
-    reserve against the same account/day. A same-date/same-attempt replay
-    reuses the existing reservation; a cross-day retry creates a new
-    reservation.
+    With `commit=True` (the default, used by ordinary first-attempt
+    submission), this owns its own `BEGIN IMMEDIATE` .. `COMMIT` — never
+    nested inside the caller's order-scope-lease `fenced_write` — so the
+    read-then-write check-and-reserve is atomic even when two
+    books/processes race to reserve against the same account/day.
+
+    With `commit=False` (docs/milestones/27.md B1: retry preparation), the
+    caller already holds an open lease-fenced transaction and this
+    participates in it directly (the repository-wide `commit=False`
+    convention — see `storage/transactions.py`) instead of nesting a second
+    `BEGIN IMMEDIATE`, so the supersede-and-create rollover is part of the
+    same atomic unit as the next-attempt checkpoint event and lookup
+    consumption. A same-date/same-attempt replay reuses the existing
+    reservation; a cross-day retry creates a new reservation.
     """
+    if commit:
+        with transaction(conn):
+            return _reserve_daily_notional_locked(
+                conn, cfg, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
+                attempt_number=attempt_number, intent=intent, now=now,
+                supersede_reservation_id=supersede_reservation_id,
+                supersede_attempt_number=supersede_attempt_number,
+            )
+    return _reserve_daily_notional_locked(
+        conn, cfg, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
+        attempt_number=attempt_number, intent=intent, now=now,
+        supersede_reservation_id=supersede_reservation_id, supersede_attempt_number=supersede_attempt_number,
+    )
+
+
+def _reserve_daily_notional_locked(
+    conn: sqlite3.Connection, cfg: PaperBooksConfiguration, *, book_id: str, fingerprint: str,
+    client_order_id: str, attempt_number: int, intent: dict, now: datetime,
+    supersede_reservation_id: str | None = None,
+    supersede_attempt_number: int | None = None,
+) -> dict:
+    """Body of `_reserve_daily_notional`; assumes the caller already holds
+    an open write transaction on `conn`."""
     reservation_date = now.astimezone(timezone.utc).date().isoformat()
     notional = Decimal(intent["quantity"]) * Decimal(intent["limit_price"])
     reservation_id = _derive_reservation_id(client_order_id, attempt_number, fingerprint, reservation_date)
 
-    with transaction(conn):
-        existing = repo.load_attempt_reservation(conn, reservation_id)
-        if existing is not None:
-            _validate_attempt_reservation_payload(
-                existing, client_order_id=client_order_id, attempt_number=attempt_number,
-                fingerprint=fingerprint, book_id=book_id, notional=notional,
-                reservation_date=reservation_date,
-            )
-            return existing
-        try:
-            active = repo.load_active_attempt_reservation(
-                conn, client_order_id, attempt_number, fingerprint, book_id,
-            )
-        except repo.AttemptReservationIntegrityError as exc:
-            _raise_reservation_integrity(exc)
-        if active is not None:
-            _validate_attempt_reservation_payload(
-                active, client_order_id=client_order_id, attempt_number=attempt_number,
-                fingerprint=fingerprint, book_id=book_id, notional=notional,
-            )
-            if (
-                active["reservation_date"] != reservation_date
-                and active["state"] != _RESERVATION_STATE_RESERVED
-            ):
-                raise ExternalPaperError(
-                    "ATTEMPT_RESERVATION_CONFLICT",
-                    "only an unstarted reserved attempt may carry forward across dates",
-                )
-            return active
-        if supersede_reservation_id is not None:
-            prior = repo.load_attempt_reservation(conn, supersede_reservation_id)
-            if prior is None:
-                raise ExternalPaperError(
-                    "ATTEMPT_RESERVATION_MISSING", "prior attempt reservation is required for retry",
-                )
-            if supersede_attempt_number is None:
-                raise ExternalPaperError(
-                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt number is required for retry",
-                )
-            try:
-                prior_notional = Decimal(prior["reserved_notional_usd"])
-            except (InvalidOperation, KeyError, TypeError) as exc:
-                raise ExternalPaperError(
-                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation is malformed",
-                ) from exc
-            if (
-                prior.get("client_order_id") != client_order_id
-                or prior.get("attempt_number") != supersede_attempt_number
-                or prior.get("account_fingerprint") != fingerprint
-                or prior.get("book_id") != book_id
-                or prior_notional != notional
-                or prior.get("state") not in (
-                    _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
-                )
-            ):
-                raise ExternalPaperError(
-                    "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation scope or state differs",
-                )
-            _transition_attempt_reservation(
-                conn, supersede_reservation_id,
-                (_RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED),
-                _RESERVATION_STATE_SUPERSEDED_BY_RETRY, now, commit=False,
-            )
-        already_reserved = repo.sum_attempt_reservations_by_date(conn, fingerprint, reservation_date)
-        if already_reserved + notional > cfg.external_broker.maximum_daily_notional_usd:
+    existing = repo.load_attempt_reservation(conn, reservation_id)
+    if existing is not None:
+        _validate_attempt_reservation_payload(
+            existing, client_order_id=client_order_id, attempt_number=attempt_number,
+            fingerprint=fingerprint, book_id=book_id, notional=notional,
+            reservation_date=reservation_date,
+        )
+        return existing
+    try:
+        active = repo.load_active_attempt_reservation(
+            conn, client_order_id, attempt_number, fingerprint, book_id,
+        )
+    except repo.AttemptReservationIntegrityError as exc:
+        _raise_reservation_integrity(exc)
+    if active is not None:
+        _validate_attempt_reservation_payload(
+            active, client_order_id=client_order_id, attempt_number=attempt_number,
+            fingerprint=fingerprint, book_id=book_id, notional=notional,
+        )
+        if (
+            active["reservation_date"] != reservation_date
+            and active["state"] != _RESERVATION_STATE_RESERVED
+        ):
             raise ExternalPaperError(
-                "EXTERNAL_DAILY_NOTIONAL_LIMIT",
-                f"today's reserved/submitted external notional {already_reserved} plus this order {notional} "
-                f"would exceed external_broker.maximum_daily_notional_usd "
-                f"{cfg.external_broker.maximum_daily_notional_usd} for account {fingerprint}",
+                "ATTEMPT_RESERVATION_CONFLICT",
+                "only an unstarted reserved attempt may carry forward across dates",
             )
-        record = {
-            "reservation_id": reservation_id, "client_order_id": client_order_id,
-            "attempt_number": attempt_number, "account_fingerprint": fingerprint,
-            "reservation_date": reservation_date, "book_id": book_id,
-            "reserved_notional_usd": notional, "state": _RESERVATION_STATE_RESERVED,
-            "created_at": now.isoformat(), "updated_at": now.isoformat(),
-        }
-        repo.save_attempt_reservation(conn, record, commit=False)
-        return record
+        return active
+    if supersede_reservation_id is not None:
+        prior = repo.load_attempt_reservation(conn, supersede_reservation_id)
+        if prior is None:
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_MISSING", "prior attempt reservation is required for retry",
+            )
+        if supersede_attempt_number is None:
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_CONFLICT", "prior attempt number is required for retry",
+            )
+        try:
+            prior_notional = Decimal(prior["reserved_notional_usd"])
+        except (InvalidOperation, KeyError, TypeError) as exc:
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation is malformed",
+            ) from exc
+        if (
+            prior.get("client_order_id") != client_order_id
+            or prior.get("attempt_number") != supersede_attempt_number
+            or prior.get("account_fingerprint") != fingerprint
+            or prior.get("book_id") != book_id
+            or prior_notional != notional
+            or prior.get("state") not in (
+                _RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED,
+            )
+        ):
+            raise ExternalPaperError(
+                "ATTEMPT_RESERVATION_CONFLICT", "prior attempt reservation scope or state differs",
+            )
+        _transition_attempt_reservation(
+            conn, supersede_reservation_id,
+            (_RESERVATION_STATE_RESERVED, _RESERVATION_STATE_RECONCILIATION_REQUIRED),
+            _RESERVATION_STATE_SUPERSEDED_BY_RETRY, now, commit=False,
+        )
+    already_reserved = repo.sum_attempt_reservations_by_date(conn, fingerprint, reservation_date)
+    if already_reserved + notional > cfg.external_broker.maximum_daily_notional_usd:
+        raise ExternalPaperError(
+            "EXTERNAL_DAILY_NOTIONAL_LIMIT",
+            f"today's reserved/submitted external notional {already_reserved} plus this order {notional} "
+            f"would exceed external_broker.maximum_daily_notional_usd "
+            f"{cfg.external_broker.maximum_daily_notional_usd} for account {fingerprint}",
+        )
+    record = {
+        "reservation_id": reservation_id, "client_order_id": client_order_id,
+        "attempt_number": attempt_number, "account_fingerprint": fingerprint,
+        "reservation_date": reservation_date, "book_id": book_id,
+        "reserved_notional_usd": notional, "state": _RESERVATION_STATE_RESERVED,
+        "created_at": now.isoformat(), "updated_at": now.isoformat(),
+    }
+    repo.save_attempt_reservation(conn, record, commit=False)
+    return record
 
 
 def _settle_daily_reservation(
@@ -1185,6 +1216,36 @@ def _record_unknown(
         return event
 
 
+def _checkpoint_submission_request_locked(
+    conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, now,
+    attempt_number, runtime_request_id,
+) -> dict:
+    """Order-level cash/share hold plus the durable SUBMISSION_REQUESTED
+    checkpoint event. Assumes the caller already holds an open lease-fenced
+    transaction (docs/milestones/27.md B1) -- never opens its own and never
+    makes a broker/network call. Shared by the ordinary first-attempt submit
+    path (`_submit_once`, its own single-statement `lease.fenced_write()`)
+    and the retry-preparation path (`_prepare_external_retry_attempt`, which
+    runs this alongside the daily-notional reservation rollover and lookup
+    consumption inside one transaction)."""
+    if intent["side"] == "BUY":
+        cash_ledger.reserve_for_order(
+            conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
+            commit=False,
+        )
+    else:
+        positions.reserve_shares_for_sell(
+            conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], client_order_id,
+            Decimal(intent["quantity"]), now, commit=False,
+        )
+    return _append_event(
+        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+        account_fingerprint=fingerprint, new_state=STATE_SUBMISSION_REQUESTED, operator=operator,
+        reason=reason, now=now, runtime_request_id=runtime_request_id, attempt_number=attempt_number,
+        commit=False,
+    )
+
+
 def _submit_once(
     conn, *, intent, client_order_id, payload_hash, fingerprint, operator, reason, runtime,
     config, now, attempt_number, reservation_id: str, lease: "OrderLeaseHandle",
@@ -1208,22 +1269,29 @@ def _submit_once(
     # so the manual compensating release this block used to need on a raised
     # exception is no longer necessary (rollback already reverses it).
     with lease.fenced_write():
-        if intent["side"] == "BUY":
-            cash_ledger.reserve_for_order(
-                conn, intent["book_id"], intent["paper_order_intent_id"], Decimal(intent["notional_usd"]), now,
-                commit=False,
-            )
-        else:
-            positions.reserve_shares_for_sell(
-                conn, intent["book_id"], intent["symbol"], intent["paper_order_intent_id"], client_order_id,
-                Decimal(intent["quantity"]), now, commit=False,
-            )
-        _append_event(
+        _checkpoint_submission_request_locked(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-            account_fingerprint=fingerprint, new_state=STATE_SUBMISSION_REQUESTED, operator=operator,
-            reason=reason, now=now, runtime_request_id=runtime_request_id, attempt_number=attempt_number,
-            commit=False,
+            fingerprint=fingerprint, operator=operator, reason=reason, now=now,
+            attempt_number=attempt_number, runtime_request_id=runtime_request_id,
         )
+    return _submit_checkpointed_attempt(
+        conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+        fingerprint=fingerprint, operator=operator, runtime=runtime, config=config, now=now,
+        attempt_number=attempt_number, reservation_id=reservation_id, lease=lease,
+        runtime_request_id=runtime_request_id,
+    )
+
+
+def _submit_checkpointed_attempt(
+    conn, *, intent, client_order_id, payload_hash, fingerprint, operator, runtime,
+    config, now, attempt_number, reservation_id: str, lease: "OrderLeaseHandle", runtime_request_id: str,
+) -> dict:
+    """Everything from the broker call onward, assuming a
+    SUBMISSION_REQUESTED checkpoint (reservation + event) for this exact
+    `runtime_request_id` is already durably committed. No transaction is
+    open on entry -- the broker/network call below must never run inside
+    one (docs/milestones/27.md B1: "No network or broker call may happen
+    inside the transaction")."""
     try:
         order = runtime.submit_limit_order(_payload(intent, client_order_id, payload_hash, fingerprint, now))
         _validate_order_response(order, intent, client_order_id, fingerprint, now)
@@ -1543,6 +1611,52 @@ def apply_external_fills(
     return applied
 
 
+def _prepare_external_retry_attempt(
+    conn: sqlite3.Connection, *, config: PaperBooksConfiguration, book_id: str, intent: dict,
+    client_order_id: str, payload_hash: str, fingerprint: str, operator: str, reason: str, now: datetime,
+    new_attempt_number: int, prior_attempt_number: int, prior_reservation_id: str, lookup: dict,
+    lease: "OrderLeaseHandle",
+) -> dict:
+    """Milestone 27 B1: prepares every piece of durable retry state as one
+    lease-fenced transaction, strictly before any broker call --
+
+        supersede prior reservation
+        create next-attempt reservation
+        append next-attempt SUBMISSION_REQUESTED event
+        bind/consume the authoritative NOT_FOUND lookup that authorized this retry
+
+    A crash after this transaction commits but before `runtime.submit_limit_order`
+    leaves a valid, durable prepared state: the prior reservation is
+    SUPERSEDED_BY_RETRY, the new one is RESERVED, the current event is
+    SUBMISSION_REQUESTED for `new_attempt_number`, and the lookup is
+    consumed -- exactly the state `recover_stranded_submission` already
+    knows how to resolve via authoritative broker lookup (B2). A crash or
+    validation failure partway through (including an insufficient new-day
+    notional cap, B3) rolls back every part together: no orphaned
+    reservation, no event with nothing superseded, no lookup consumed
+    without a matching prepared attempt, and the broker is never called
+    (`_reserve_daily_notional`'s own validations run inside this same
+    transaction, before any mutation is retained).
+    """
+    runtime_request_id = f"m11_{uuid.uuid4().hex}"
+    with lease.fenced_write():
+        reservation = _reserve_daily_notional(
+            conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
+            attempt_number=new_attempt_number, intent=intent, now=now,
+            supersede_reservation_id=prior_reservation_id, supersede_attempt_number=prior_attempt_number,
+            commit=False,
+        )
+        event = _checkpoint_submission_request_locked(
+            conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
+            fingerprint=fingerprint, operator=operator, reason=reason, now=now,
+            attempt_number=new_attempt_number, runtime_request_id=runtime_request_id,
+        )
+        repo.consume_external_lookup(
+            conn, lookup["lookup_id"], event["external_order_event_id"], commit=False,
+        )
+    return {"reservation": reservation, "event": event, "runtime_request_id": runtime_request_id}
+
+
 def retry_external_paper_order(
     conn: sqlite3.Connection, *, book_id: str, paper_order_intent_id: str, operator: str, reason: str,
     runtime: ExternalPaperRuntime, config: PaperBooksConfiguration, clock=None,
@@ -1607,23 +1721,24 @@ def retry_external_paper_order(
             raise ExternalPaperError(
                 "ATTEMPT_RESERVATION_MISSING", "active prior attempt reservation is required for retry",
             )
-        reservation = _reserve_daily_notional(
-            conn, config, book_id=book_id, fingerprint=fingerprint, client_order_id=client_order_id,
-            attempt_number=new_attempt_number, intent=intent, now=now,
-            supersede_reservation_id=prior_reservation["reservation_id"],
-            supersede_attempt_number=current["attempt_number"],
+        # Milestone 27 B1: reservation rollover, the next-attempt
+        # SUBMISSION_REQUESTED checkpoint, and lookup consumption are one
+        # atomic preparation transaction, committed before any broker call
+        # -- see `_prepare_external_retry_attempt`.
+        prepared = _prepare_external_retry_attempt(
+            conn, config=config, book_id=book_id, intent=intent, client_order_id=client_order_id,
+            payload_hash=payload_hash, fingerprint=fingerprint, operator=operator, reason=reason, now=now,
+            new_attempt_number=new_attempt_number, prior_attempt_number=current["attempt_number"],
+            prior_reservation_id=prior_reservation["reservation_id"], lookup=lookup, lease=lease,
         )
         lease.heartbeat_or_raise()
-        result = _submit_once(
+        result = _submit_checkpointed_attempt(
             conn, intent=intent, client_order_id=client_order_id, payload_hash=payload_hash,
-            fingerprint=fingerprint, operator=operator, reason=reason, runtime=runtime, config=config,
+            fingerprint=fingerprint, operator=operator, runtime=runtime, config=config,
             now=now, attempt_number=new_attempt_number,
-            reservation_id=reservation["reservation_id"], lease=lease,
+            reservation_id=prepared["reservation"]["reservation_id"], lease=lease,
+            runtime_request_id=prepared["runtime_request_id"],
         )
-        with lease.fenced_write():
-            repo.consume_external_lookup(
-                conn, lookup["lookup_id"], result["event"]["external_order_event_id"], commit=False,
-            )
         if result["status"] != STATE_UNKNOWN:
             result["reconciliation"] = _reconcile_locked(
                 conn, book_id=book_id, client_order_id=client_order_id,
