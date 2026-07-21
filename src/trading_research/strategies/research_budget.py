@@ -120,11 +120,15 @@ TOKEN_ACCOUNTING_POLICIES = (
 )
 
 TOKEN_RESERVATION_RESERVED = "RESERVED"
+TOKEN_RESERVATION_IN_FLIGHT = "IN_FLIGHT"
 TOKEN_RESERVATION_SETTLED = "SETTLED"
 TOKEN_RESERVATION_RELEASED = "RELEASED"
 TOKEN_RESERVATION_AMBIGUOUS = "AMBIGUOUS"
 
-_LIVE_TOKEN_STATUSES = (TOKEN_RESERVATION_RESERVED, TOKEN_RESERVATION_SETTLED, TOKEN_RESERVATION_AMBIGUOUS)
+_LIVE_TOKEN_STATUSES = (
+    TOKEN_RESERVATION_RESERVED, TOKEN_RESERVATION_IN_FLIGHT,
+    TOKEN_RESERVATION_SETTLED, TOKEN_RESERVATION_AMBIGUOUS,
+)
 
 Clock = Callable[[], datetime]
 
@@ -367,12 +371,18 @@ def reserve_research_tokens(
 def _transition_reservation(
     conn, reservation_id: str, *, from_status: str, to_status: str,
     extra_sql: str = "", extra_params: tuple[Any, ...] = (), compatible: Callable[[dict], bool] | None = None,
+    claim_owner: str | None = None, claim_generation: int | None = None,
 ) -> bool:
+    fencing_sql = ""
+    fencing_params: tuple[Any, ...] = ()
+    if claim_owner is not None:
+        fencing_sql = " AND claim_owner = ? AND claim_generation = ?"
+        fencing_params = (claim_owner, claim_generation)
     with transaction(conn):
         cursor = conn.execute(
             f"UPDATE shadow_budget_reservations SET status = ?{extra_sql} "
-            "WHERE reservation_id = ? AND status = ? AND reservation_kind = ?",
-            (to_status, *extra_params, reservation_id, from_status, RESEARCH_TOKEN_RESERVATION_KIND),
+            f"WHERE reservation_id = ? AND status = ? AND reservation_kind = ?{fencing_sql}",
+            (to_status, *extra_params, reservation_id, from_status, RESEARCH_TOKEN_RESERVATION_KIND, *fencing_params),
         )
         if cursor.rowcount == 1:
             return True
@@ -387,6 +397,84 @@ def _transition_reservation(
         )
 
 
+@dataclass(frozen=True)
+class ClaimResult:
+    """Outcome of `claim_research_token_attempt`. `status` is one of
+    `CLAIMED`, `ALREADY_IN_FLIGHT`, `STATE_CONFLICT`."""
+
+    status: str
+    reservation_id: str
+    claim_owner: str | None = None
+    claim_generation: int | None = None
+
+
+def claim_research_token_attempt(
+    conn, reservation_id: str, owner_id: str, now: datetime, expires_at: datetime,
+) -> ClaimResult:
+    """Atomically claims exclusive provider-invocation rights for one
+    reservation (docs/milestones/27.md A1): `RESERVED -> IN_FLIGHT` via a
+    single conditional `UPDATE` inside `BEGIN IMMEDIATE`. Only the caller
+    that flips exactly one row may invoke the provider. `owner_id` must be a
+    bounded, generated identifier (never a machine username, credential, or
+    raw process environment value)."""
+    if not owner_id:
+        raise TokenBudgetError("owner_id must be non-empty")
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE shadow_budget_reservations SET status = ?, claim_owner = ?, "
+            "claim_generation = claim_generation + 1, claimed_at = ?, claim_expires_at = ? "
+            "WHERE reservation_id = ? AND status = ? AND reservation_kind = ?",
+            (
+                TOKEN_RESERVATION_IN_FLIGHT, owner_id, now.isoformat(), expires_at.isoformat(),
+                reservation_id, TOKEN_RESERVATION_RESERVED, RESEARCH_TOKEN_RESERVATION_KIND,
+            ),
+        )
+        if cursor.rowcount == 1:
+            claimed = load_budget_reservation(conn, reservation_id)
+            assert claimed is not None
+            return ClaimResult(
+                status="CLAIMED", reservation_id=reservation_id,
+                claim_owner=owner_id, claim_generation=claimed["claim_generation"],
+            )
+        current = load_budget_reservation(conn, reservation_id)
+        if current is None or current.get("reservation_kind") != RESEARCH_TOKEN_RESERVATION_KIND:
+            raise TokenBudgetError(f"no such token reservation {reservation_id!r}")
+        if current["status"] == TOKEN_RESERVATION_IN_FLIGHT:
+            return ClaimResult(status="ALREADY_IN_FLIGHT", reservation_id=reservation_id)
+        return ClaimResult(status="STATE_CONFLICT", reservation_id=reservation_id)
+
+
+def recover_expired_token_claims(conn, *, now: datetime) -> tuple[str, ...]:
+    """Maintenance/recovery operation (docs/milestones/27.md A1 "Claim
+    expiration"): transitions every `IN_FLIGHT` reservation whose claim
+    lease has expired to `AMBIGUOUS`. An expired claim does not prove the
+    provider was never called -- transmission may have occurred -- so this
+    never resumes or retries the attempt automatically; it only frees the
+    reservation for operator reconciliation. Uses the same expected-state
+    (`IN_FLIGHT`) and claim-generation check as every other fenced
+    transition, so a claim owner that renews/settles concurrently is never
+    overwritten."""
+    recovered: list[str] = []
+    with transaction(conn):
+        expired = conn.execute(
+            "SELECT reservation_id, claim_owner, claim_generation FROM shadow_budget_reservations "
+            "WHERE status = ? AND reservation_kind = ? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?",
+            (TOKEN_RESERVATION_IN_FLIGHT, RESEARCH_TOKEN_RESERVATION_KIND, now.isoformat()),
+        ).fetchall()
+        for row in expired:
+            cursor = conn.execute(
+                "UPDATE shadow_budget_reservations SET status = ? "
+                "WHERE reservation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ?",
+                (
+                    TOKEN_RESERVATION_AMBIGUOUS, row["reservation_id"], TOKEN_RESERVATION_IN_FLIGHT,
+                    row["claim_owner"], row["claim_generation"],
+                ),
+            )
+            if cursor.rowcount == 1:
+                recovered.append(row["reservation_id"])
+    return tuple(recovered)
+
+
 def settle_research_tokens(
     conn, reservation_id: str, *, actual_input_tokens: int, actual_output_tokens: int,
     actual_reasoning_tokens: int = 0,
@@ -394,8 +482,19 @@ def settle_research_tokens(
     provider_request_id: str | None = None,
     clock: Clock,
     _from_status: str = TOKEN_RESERVATION_RESERVED,
+    claim_owner: str | None = None,
+    claim_generation: int | None = None,
 ) -> bool:
-    """Settle to authoritative usage while preserving the original estimate."""
+    """Settle to authoritative usage while preserving the original estimate.
+
+    When `claim_owner`/`claim_generation` are supplied (the production
+    `PersistentResearchTokenBudgetController` path -- docs/milestones/27.md
+    A1), the transition is fenced: it requires `IN_FLIGHT` plus an exact
+    claim match, so a stale worker whose lease already expired and was
+    recovered to `AMBIGUOUS` by another owner can never settle over it.
+    Callers that never claim (direct RESERVED -> SETTLED, e.g. cost
+    reservations or pre-claim test coverage) keep the original unfenced
+    behavior."""
     actual_input_tokens = _require_nonnegative_int(actual_input_tokens, "actual_input_tokens")
     actual_output_tokens = _require_nonnegative_int(actual_output_tokens, "actual_output_tokens")
     actual_reasoning_tokens = _require_nonnegative_int(actual_reasoning_tokens, "actual_reasoning_tokens")
@@ -424,34 +523,51 @@ def settle_research_tokens(
             and (current.get("provider_request_id") or None) == (provider_request_id or None)
         )
 
+    from_status = TOKEN_RESERVATION_IN_FLIGHT if claim_owner is not None else _from_status
     return _transition_reservation(
-        conn, reservation_id, from_status=_from_status, to_status=TOKEN_RESERVATION_SETTLED,
+        conn, reservation_id, from_status=from_status, to_status=TOKEN_RESERVATION_SETTLED,
         extra_sql=", consumed_input_tokens = ?, consumed_output_tokens = ?, consumed_reasoning_tokens = ?, "
                   "token_accounting_policy = ?, provider_request_id = ?, emergency_margin_breached = ?, settled_at = ?",
         extra_params=(actual_input_tokens, actual_output_tokens, actual_reasoning_tokens, policy,
                       provider_request_id, breached, now.isoformat()),
-        compatible=_compatible,
+        compatible=_compatible, claim_owner=claim_owner, claim_generation=claim_generation,
     )
 
 
-def release_research_tokens(conn, reservation_id: str, clock: Clock) -> bool:
+def release_research_tokens(
+    conn, reservation_id: str, clock: Clock, *,
+    claim_owner: str | None = None, claim_generation: int | None = None,
+) -> bool:
     """Releases a reservation that was never used (e.g. the cycle failed
-    before any call was made)."""
+    before any call was made). With `claim_owner`/`claim_generation` set,
+    releases a fenced `IN_FLIGHT` claim instead -- used only when the
+    provider adapter proves the request was never transmitted
+    (docs/milestones/27.md A1 "Provider exceptions")."""
     now = clock()
+    from_status = TOKEN_RESERVATION_IN_FLIGHT if claim_owner is not None else TOKEN_RESERVATION_RESERVED
     return _transition_reservation(
-        conn, reservation_id, from_status=TOKEN_RESERVATION_RESERVED, to_status=TOKEN_RESERVATION_RELEASED,
+        conn, reservation_id, from_status=from_status, to_status=TOKEN_RESERVATION_RELEASED,
         extra_sql=", settled_at = ?", extra_params=(now.isoformat(),),
         compatible=lambda row: row["status"] == TOKEN_RESERVATION_RELEASED,
+        claim_owner=claim_owner, claim_generation=claim_generation,
     )
 
 
-def mark_research_tokens_ambiguous(conn, reservation_id: str) -> bool:
+def mark_research_tokens_ambiguous(
+    conn, reservation_id: str, *, claim_owner: str | None = None, claim_generation: int | None = None,
+) -> bool:
     """Marks a reservation AMBIGUOUS when the provider outcome is unclear —
     it stays counted against the daily cap (never blindly released or
-    retried) until an operator reconciles it."""
+    retried) until an operator reconciles it. With `claim_owner`/
+    `claim_generation` set, this is a fenced `IN_FLIGHT -> AMBIGUOUS`
+    transition (docs/milestones/27.md A1): a stale worker whose claim
+    already expired and was recovered by another owner gets rejected here
+    instead of clobbering the recovered state."""
+    from_status = TOKEN_RESERVATION_IN_FLIGHT if claim_owner is not None else TOKEN_RESERVATION_RESERVED
     return _transition_reservation(
-        conn, reservation_id, from_status=TOKEN_RESERVATION_RESERVED, to_status=TOKEN_RESERVATION_AMBIGUOUS,
+        conn, reservation_id, from_status=from_status, to_status=TOKEN_RESERVATION_AMBIGUOUS,
         compatible=lambda row: row["status"] == TOKEN_RESERVATION_AMBIGUOUS,
+        claim_owner=claim_owner, claim_generation=claim_generation,
     )
 
 
@@ -626,50 +742,92 @@ def _legacy_budget_date(idempotency_key: str, created_at_iso: str | None) -> str
     return parsed.astimezone(timezone.utc).date().isoformat()
 
 
-def migrate_legacy_token_reservations(conn, clock: Clock) -> LegacyTokenMigrationResult:
-    """One-time, idempotent, additive backfill. Never splits a legacy
-    combined `reserved_output_tokens` value (may have folded
-    `maximum_output_tokens + maximum_reasoning_tokens` together pre-PR#35) —
-    preserves it exactly and migrates to the conservative
-    `REASONING_INCLUDED_IN_OUTPUT` policy with reasoning usage at zero rather
-    than fabricating a separate reasoning count. Never alters a row whose
-    idempotency_key lacks the `research_token_budget:` prefix (cost
+class LegacyTokenMigrationError(TokenBudgetError):
+    """Raised instead of returning a result when any legacy candidate fails
+    validation (docs/milestones/27.md A2): a partial migration that reports
+    some rows migrated while others are silently left conflicted would let
+    startup continue with unresolved metadata. `conflicts` never carries raw
+    row contents -- only the reservation id and the bounded conflict code."""
+
+    def __init__(self, conflicts: tuple[LegacyTokenMigrationConflict, ...]) -> None:
+        super().__init__(
+            f"{len(conflicts)} legacy token reservation(s) failed migration validation",
+            code="TOKEN_MIGRATION_CONFLICT",
+        )
+        self.conflicts = conflicts
+
+
+def migrate_legacy_token_reservations_locked(conn) -> LegacyTokenMigrationResult:
+    """Body of the legacy migration (docs/milestones/26.md A4,
+    docs/milestones/27.md A2). Assumes the caller already holds an open
+    write transaction on `conn` (the repository-wide `commit=False`
+    convention -- see `storage/transactions.py`) so it can participate in
+    `storage/schema_version.py::apply_pending_schema_migrations`'s own
+    transaction instead of nesting a second `BEGIN IMMEDIATE`.
+
+    Two-phase and fail-closed: phase one only inspects and validates every
+    legacy candidate row; if any conflict exists, it raises
+    `LegacyTokenMigrationError` without mutating a single row (docs/milestones/27.md
+    A2: "Do not return successful migration results containing unresolved
+    conflicts"). Phase two mutates only once every candidate is known-valid.
+
+    Never splits a legacy combined `reserved_output_tokens` value (may have
+    folded `maximum_output_tokens + maximum_reasoning_tokens` together
+    pre-PR#35) — preserves it exactly and migrates to the conservative
+    `REASONING_INCLUDED_IN_OUTPUT` policy with reasoning usage at zero
+    rather than fabricating a separate reasoning count. Never alters a row
+    whose idempotency_key lacks the `research_token_budget:` prefix (cost
     reservations)."""
-    del clock  # reserved for a future recorded migration timestamp; not persisted today
-    migrated: list[str] = []
     already_migrated: list[str] = []
     conflicts: list[LegacyTokenMigrationConflict] = []
-    with transaction(conn):
-        for row in list_budget_reservations(conn):
-            key = row["idempotency_key"]
-            if not key.startswith(f"{RESEARCH_TOKEN_RESERVATION_PREFIX}:"):
-                continue
-            if row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND:
-                if row.get("token_accounting_policy") is None or row.get("budget_date") is None:
-                    conflicts.append(
-                        LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_INCOMPLETE_METADATA")
-                    )
-                else:
-                    already_migrated.append(row["reservation_id"])
-                continue
-
-            budget_date_str = _legacy_budget_date(key, row.get("created_at"))
-            if budget_date_str is None:
+    candidates: list[tuple[str, str]] = []
+    for row in list_budget_reservations(conn):
+        key = row["idempotency_key"]
+        if not key.startswith(f"{RESEARCH_TOKEN_RESERVATION_PREFIX}:"):
+            continue
+        if row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND:
+            if row.get("token_accounting_policy") is None or row.get("budget_date") is None:
                 conflicts.append(
-                    LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_BUDGET_DATE_UNRESOLVED")
+                    LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_INCOMPLETE_METADATA")
                 )
-                continue
-            conn.execute(
-                "UPDATE shadow_budget_reservations SET reservation_kind = ?, budget_date = ?, "
-                "token_accounting_policy = ?, reserved_reasoning_tokens = 0, consumed_reasoning_tokens = 0 "
-                "WHERE reservation_id = ?",
-                (
-                    RESEARCH_TOKEN_RESERVATION_KIND, budget_date_str, TOKEN_MIGRATION_LEGACY_ACCOUNTING_POLICY,
-                    row["reservation_id"],
-                ),
+            else:
+                already_migrated.append(row["reservation_id"])
+            continue
+
+        budget_date_str = _legacy_budget_date(key, row.get("created_at"))
+        if budget_date_str is None:
+            conflicts.append(
+                LegacyTokenMigrationConflict(row["reservation_id"], "TOKEN_MIGRATION_BUDGET_DATE_UNRESOLVED")
             )
-            migrated.append(row["reservation_id"])
+            continue
+        candidates.append((row["reservation_id"], budget_date_str))
+
+    if conflicts:
+        raise LegacyTokenMigrationError(tuple(conflicts))
+
+    migrated: list[str] = []
+    for reservation_id, budget_date_str in candidates:
+        conn.execute(
+            "UPDATE shadow_budget_reservations SET reservation_kind = ?, budget_date = ?, "
+            "token_accounting_policy = ?, reserved_reasoning_tokens = 0, consumed_reasoning_tokens = 0 "
+            "WHERE reservation_id = ?",
+            (
+                RESEARCH_TOKEN_RESERVATION_KIND, budget_date_str, TOKEN_MIGRATION_LEGACY_ACCOUNTING_POLICY,
+                reservation_id,
+            ),
+        )
+        migrated.append(reservation_id)
     return LegacyTokenMigrationResult(
         migrated_reservation_ids=tuple(migrated), already_migrated_reservation_ids=tuple(already_migrated),
-        conflicts=tuple(conflicts),
+        conflicts=(),
     )
+
+
+def migrate_legacy_token_reservations(conn, clock: Clock) -> LegacyTokenMigrationResult:
+    """Standalone entry point for manual/test invocation: owns its own
+    transaction around `migrate_legacy_token_reservations_locked`. Database
+    startup instead calls the `_locked` body directly from inside
+    `storage/schema_version.py`'s own migration transaction."""
+    del clock  # reserved for a future recorded migration timestamp; not persisted today
+    with transaction(conn):
+        return migrate_legacy_token_reservations_locked(conn)

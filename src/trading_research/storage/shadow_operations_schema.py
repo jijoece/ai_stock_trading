@@ -214,6 +214,13 @@ def apply_shadow_operations_schema(conn) -> None:
         "consumed_reasoning_tokens": "INTEGER",
         "token_accounting_policy": "TEXT",
         "provider_request_id": "TEXT",
+        # Milestone 27 A1: fenced provider-attempt claim. `claim_generation`
+        # defaults to 0 (unclaimed) so an atomic `claim_generation = claim_generation
+        # + 1` in `claim_research_token_attempt` never operates on a NULL.
+        "claim_owner": "TEXT",
+        "claim_generation": "INTEGER NOT NULL DEFAULT 0",
+        "claimed_at": "TEXT",
+        "claim_expires_at": "TEXT",
     }
     for column_name, declaration in additive_columns.items():
         if column_name not in existing_columns:

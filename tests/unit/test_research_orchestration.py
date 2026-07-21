@@ -1,14 +1,16 @@
 """Category F: orchestrator tests (docs/milestone-5.md Step 20.F)."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
 from trading_research.research.configuration import ResearchConfiguration
 from trading_research.research.deterministic_provider import ScriptedResearchProvider, ScriptedStep
-from trading_research.research.errors import ManagerNotConfiguredError
+from trading_research.research.errors import ManagerNotConfiguredError, ProviderUnavailableError
 from trading_research.research.fixtures import build_fixture_snapshot
 from trading_research.research.orchestration import (
     RUN_STATUS_ANALYSIS_INCOMPLETE,
@@ -21,6 +23,7 @@ from trading_research.research.prompt_registry import PromptRegistry
 from trading_research.research.models import (
     TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT,
     TOKEN_ACCOUNTING_REASONING_SEPARATE,
+    ResearchModelRequest,
 )
 from trading_research.storage.database import connect
 from trading_research.storage.shadow_operations_repositories import list_budget_reservations
@@ -554,3 +557,65 @@ def test_timeout_becomes_ambiguous_and_blocks_automatic_retry(tmp_path):
     assert len(provider.calls) == 1
     [reservation] = list_budget_reservations(conn)
     assert reservation["status"] == "AMBIGUOUS"
+
+
+def _claim_race_request(research_run_id="run-claim-race"):
+    return ResearchModelRequest(
+        role="fundamental", research_run_id=research_run_id, snapshot=_snapshot(),
+        system_prompt="sys", user_prompt="user", json_schema={}, model_name="test-model",
+        max_output_tokens=500, temperature=0.0, prompt_name="p", prompt_version="v1",
+        prompt_hash="h" * 8, system_prompt_hash="s" * 8, schema_version="1", attempt_number=1,
+    )
+
+
+def test_two_concurrent_controller_invocations_result_in_exactly_one_provider_call(tmp_path):
+    """docs/milestones/27.md A1/A3 "Concurrent provider invocation": two
+    workers race the identical idempotency key (same research_run_id,
+    symbol, provider, model, attempt). A single reservation must authorize
+    exactly one provider call -- the loser must be rejected with
+    TOKEN_ATTEMPT_ALREADY_IN_FLIGHT before ever reaching the provider."""
+    db_path = tmp_path / "controller-claim-race.sqlite3"
+    connect(db_path).close()
+    provider = ScriptedResearchProvider({
+        ("fundamental", 1): ScriptedStep(
+            kind="response", payload=ANALYST_REPORT_PAYLOAD,
+            usage_overrides={"token_accounting_policy": TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT},
+        ),
+    })
+    request = _claim_race_request()
+    barrier = Barrier(2)
+
+    def run():
+        conn = connect(db_path)
+        controller = PersistentResearchTokenBudgetController(
+            conn=conn, daily_token_cap=100_000, maximum_reasoning_tokens=100,
+            token_accounting_policy=TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT, clock=lambda: NOW,
+        )
+        barrier.wait()
+        try:
+            controller.invoke(provider, request, provider_name="scripted")
+            return ("ok", None)
+        except ProviderUnavailableError as exc:
+            return ("error", exc.code)
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [future.result() for future in (pool.submit(run), pool.submit(run))]
+
+    assert len(provider.calls) == 1
+    assert sum(outcome == ("ok", None) for outcome in outcomes) == 1
+    # The loser is rejected by the fenced claim before it can ever call the
+    # provider. Depending on how far the winner has progressed by the time
+    # the loser's own reserve/claim runs, the loser observes either a still
+    # `IN_FLIGHT` reservation (TOKEN_ATTEMPT_ALREADY_IN_FLIGHT) or an
+    # already-`SETTLED` one (TOKEN_RESERVATION_STATE_CONFLICT) -- both are
+    # correct fail-closed outcomes; what matters is exactly one provider
+    # call happened.
+    [error_outcome] = [outcome for outcome in outcomes if outcome[0] == "error"]
+    assert error_outcome[1] in ("TOKEN_ATTEMPT_ALREADY_IN_FLIGHT", "TOKEN_RESERVATION_STATE_CONFLICT")
+
+    final_conn = connect(db_path)
+    reservations = list_budget_reservations(final_conn)
+    assert len(reservations) == 1
+    assert reservations[0]["status"] == "SETTLED"
