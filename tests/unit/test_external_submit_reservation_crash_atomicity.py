@@ -31,10 +31,12 @@ from trading_research.paper_books.config import (
     PaperBooksConfiguration, RiskSection, ScheduledIntegrationSection, ValuationSection,
 )
 from trading_research.paper_books.external_broker import (
-    QUEUE_STATUS_AWAITING_SUBMISSION, STATE_SUBMISSION_REQUESTED,
+    QUEUE_STATUS_AWAITING_SUBMISSION, STATE_SUBMISSION_REQUESTED, STATE_UNKNOWN,
+    ExternalPaperError,
     _reserve_daily_notional,
-    activate_external_reconciliation_baseline, derive_external_queue_status,
-    preview_external_paper_order, submit_external_paper_order,
+    activate_external_reconciliation_baseline, derive_external_order_identity, derive_external_queue_status,
+    preview_external_paper_order, reconcile_external_paper_order, retry_external_paper_order,
+    submit_external_paper_order,
 )
 from trading_research.paper_books.models import PaperBookOrderIntent, PaperRiskDecision, RISK_APPROVED
 from trading_research.storage import paper_books_repositories as repo
@@ -240,3 +242,227 @@ def test_crash_before_reservation_commit_leaves_zero_effects(tmp_path, monkeypat
         restarted, preview["client_order_id"], 0, FINGERPRINT, "BASELINE",
     )) == 1
     restarted.close()
+
+
+# --- Milestone 27 B1/B4: retry-preparation transaction rollback -------------
+
+
+class _RetryFaultRuntime:
+    """Controllable runtime for retry-preparation fault injection: the
+    original submit is made ambiguous (`raise_submit`), the follow-up
+    reconciliation lookup is an authoritative NOT_FOUND (no broker order
+    exists), and `submit_limit_order` for any later retry attempt is counted
+    so tests can prove the broker was never reached when preparation itself
+    fails."""
+
+    def __init__(self):
+        self.submit_calls = 0
+        self.raise_submit = False
+
+    def account_check(self, book_id):
+        return {
+            "provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+            "account_fingerprint": FINGERPRINT, "paper_endpoint_verified": True,
+        }
+
+    def preview_limit_order(self, payload):
+        return {
+            "provider": "alpaca_paper", "environment": "paper", "book_id": payload["book_id"],
+            "client_order_id": payload["client_order_id"], "account_fingerprint": FINGERPRINT,
+            "result": "APPROVED", "reasons": [],
+        }
+
+    def submit_limit_order(self, payload):
+        self.submit_calls += 1
+        if self.raise_submit:
+            raise RuntimeError("submission outcome is ambiguous")
+        return {
+            "provider": "alpaca_paper", "environment": "paper", "account_fingerprint": FINGERPRINT,
+            "book_id": payload["book_id"], "client_order_id": payload["client_order_id"],
+            "broker_order_id": "bo-1", "symbol": payload["symbol"], "side": payload["side"],
+            "quantity": str(payload["quantity"]), "limit_price": payload["limit_price"],
+            "time_in_force": "DAY", "status": "ACCEPTED", "submitted_at": NOW.isoformat(),
+            "updated_at": NOW.isoformat(), "filled_quantity": "0", "average_fill_price": None,
+            "rejection_code": None,
+        }
+
+    def get_order_by_client_order_id(self, book_id, client_order_id):
+        return None  # authoritative NOT_FOUND: no broker order was ever created
+
+    def cancel_external_order(self, book_id, client_order_id, account_fingerprint):
+        raise NotImplementedError
+
+    def list_order_fills(self, book_id, client_order_id):
+        return []
+
+    def get_external_positions(self, book_id):
+        return {"book_id": book_id, "account_fingerprint": FINGERPRINT, "positions": []}
+
+    def get_external_account_snapshot(self, book_id):
+        return {
+            "provider": "alpaca_paper", "environment": "paper", "book_id": book_id,
+            "account_fingerprint": FINGERPRINT, "cash": "100000", "equity": "100000",
+            "buying_power": "100000", "currency": "USD", "as_of": NOW.isoformat(),
+        }
+
+    def list_recent_external_orders(self, book_id, *, limit=50):
+        return []
+
+
+def _prepare_confirmed_not_found_retry(db_path, cfg):
+    """Attempt 0: ambiguous submit, then authoritative NOT_FOUND
+    reconciliation -- the exact preconditions `retry_external_paper_order`
+    requires. Returns the still-open connection, the client_order_id, and
+    the retry runtime (fresh, `raise_submit=False`) for the caller's own
+    fault-injected retry attempt."""
+    conn = connect(db_path)
+    _seed(conn)
+    runtime = _RetryFaultRuntime()
+    activate_external_reconciliation_baseline(
+        conn, book_id="BASELINE", operator="alice", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    preview = preview_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    runtime.raise_submit = True
+    result = submit_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", preview_id=preview["preview_id"],
+        operator="alice", reason="ambiguous", runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert result["status"] == STATE_UNKNOWN
+    lookup_result = reconcile_external_paper_order(
+        conn, book_id="BASELINE", runtime=runtime, config=cfg,
+        client_order_id=preview["client_order_id"], clock=lambda: NOW,
+    )
+    assert lookup_result["status"] == "ORDER_MISSING_AT_BROKER"
+    # A fresh runtime instance for the retry itself, so its own
+    # `submit_calls` counter starts at zero and isolates whether *this*
+    # retry attempt ever reached the broker from the original ambiguous
+    # attempt's own (already-counted) call.
+    retry_runtime = _RetryFaultRuntime()
+    return conn, preview["client_order_id"], retry_runtime
+
+
+def _assert_retry_preparation_fully_rolled_back(conn, client_order_id, retry_runtime):
+    """Shared assertions for every fault-injection scenario below
+    (docs/milestones/27.md B4 "Transaction rollback"): the prior
+    reservation is unchanged, no new reservation or event exists, the
+    lookup remains unconsumed, and the broker was never called."""
+    prior_reservation = repo.load_active_attempt_reservation(conn, client_order_id, 0, FINGERPRINT, "BASELINE")
+    assert prior_reservation is not None and prior_reservation["state"] == "RECONCILIATION_REQUIRED"
+    new_reservation = repo.load_active_attempt_reservation(conn, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert new_reservation is None
+    current = repo.load_latest_external_order_event(conn, "BASELINE", client_order_id)
+    assert current["new_state"] == STATE_UNKNOWN
+    assert current["attempt_number"] == 0
+    lookup = repo.load_latest_external_lookup(conn, "BASELINE", client_order_id)
+    assert lookup["consumed_by_retry_event_id"] is None
+    assert retry_runtime.submit_calls == 0
+
+
+def test_retry_rollback_on_reservation_supersede_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_rollback_supersede.sqlite3"
+    conn, client_order_id, retry_runtime = _prepare_confirmed_not_found_retry(db_path, _config())
+    conn.close()
+
+    import trading_research.storage.paper_books_repositories as repo_module
+
+    def _fail_transition(*args, **kwargs):
+        raise RuntimeError("simulated failure during reservation supersede")
+
+    monkeypatch.setattr(repo_module, "transition_attempt_reservation_state", _fail_transition)
+    conn = connect(db_path)
+    with pytest.raises(RuntimeError):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry", runtime=retry_runtime, config=_config(), clock=lambda: NOW,
+        )
+    monkeypatch.undo()
+    _assert_retry_preparation_fully_rolled_back(conn, client_order_id, retry_runtime)
+    conn.close()
+
+
+def test_retry_rollback_on_new_reservation_creation_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_rollback_create.sqlite3"
+    conn, client_order_id, retry_runtime = _prepare_confirmed_not_found_retry(db_path, _config())
+    conn.close()
+
+    import trading_research.storage.paper_books_repositories as repo_module
+
+    def _fail_save(*args, **kwargs):
+        raise RuntimeError("simulated failure during new reservation creation")
+
+    monkeypatch.setattr(repo_module, "save_attempt_reservation", _fail_save)
+    conn = connect(db_path)
+    with pytest.raises(RuntimeError):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry", runtime=retry_runtime, config=_config(), clock=lambda: NOW,
+        )
+    monkeypatch.undo()
+    _assert_retry_preparation_fully_rolled_back(conn, client_order_id, retry_runtime)
+    conn.close()
+
+
+def test_retry_rollback_on_event_append_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_rollback_event.sqlite3"
+    conn, client_order_id, retry_runtime = _prepare_confirmed_not_found_retry(db_path, _config())
+    conn.close()
+
+    import trading_research.storage.paper_books_repositories as repo_module
+
+    def _fail_save_event(*args, **kwargs):
+        raise RuntimeError("simulated failure during SUBMISSION_REQUESTED event append")
+
+    monkeypatch.setattr(repo_module, "save_external_order_event", _fail_save_event)
+    conn = connect(db_path)
+    with pytest.raises(RuntimeError):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry", runtime=retry_runtime, config=_config(), clock=lambda: NOW,
+        )
+    monkeypatch.undo()
+    _assert_retry_preparation_fully_rolled_back(conn, client_order_id, retry_runtime)
+    conn.close()
+
+
+def test_retry_rollback_on_lookup_consumption_failure(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_rollback_lookup.sqlite3"
+    conn, client_order_id, retry_runtime = _prepare_confirmed_not_found_retry(db_path, _config())
+    conn.close()
+
+    import trading_research.storage.paper_books_repositories as repo_module
+
+    def _fail_consume(*args, **kwargs):
+        raise RuntimeError("simulated failure during lookup consumption")
+
+    monkeypatch.setattr(repo_module, "consume_external_lookup", _fail_consume)
+    conn = connect(db_path)
+    with pytest.raises(RuntimeError):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry", runtime=retry_runtime, config=_config(), clock=lambda: NOW,
+        )
+    monkeypatch.undo()
+    _assert_retry_preparation_fully_rolled_back(conn, client_order_id, retry_runtime)
+    conn.close()
+
+
+def test_retry_preparation_commits_atomically_with_reservation_rollover(tmp_path):
+    """docs/milestones/27.md B1: reservation rollover, the next-attempt
+    checkpoint event, and lookup consumption commit together, strictly
+    before the broker is ever called."""
+    db_path = tmp_path / "retry_prepare_atomic.sqlite3"
+    conn, client_order_id, retry_runtime = _prepare_confirmed_not_found_retry(db_path, _config())
+    result = retry_external_paper_order(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+        reason="retry", runtime=retry_runtime, config=_config(), clock=lambda: NOW,
+    )
+    assert retry_runtime.submit_calls == 1
+    prior_reservation = repo.load_latest_attempt_reservation(conn, client_order_id, 0, FINGERPRINT, "BASELINE")
+    assert prior_reservation["state"] == "SUPERSEDED_BY_RETRY"
+    new_reservation = repo.load_active_attempt_reservation(conn, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert new_reservation is not None
+    assert result["status"] in ("SUBMITTED", STATE_UNKNOWN)
+    conn.close()
