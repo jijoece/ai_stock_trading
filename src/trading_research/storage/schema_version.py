@@ -222,6 +222,23 @@ def _migration_5_operational_integrity_telemetry(conn: sqlite3.Connection) -> No
     )
 
 
+def _migration_12_research_token_budget_legacy_migration(conn: sqlite3.Connection) -> None:
+    """Milestone 27 A2: run the semantic legacy research-token migration
+    (`strategies/research_budget.py::migrate_legacy_token_reservations_locked`)
+    automatically during normal `connect()` instead of only via manual/test
+    invocation. Runs inside this function's own `_MIGRATIONS`-driven
+    transaction (`apply_pending_schema_migrations`), so it uses the
+    transaction-participating `_locked` body rather than
+    `migrate_legacy_token_reservations` (which would try to open a second,
+    already-active `BEGIN IMMEDIATE`). A migration conflict raises and rolls
+    back this migration only -- no partial rows migrated, and startup
+    (`connect()`) fails closed until an operator resolves it; every earlier
+    migration in this ledger stays applied."""
+    from ..strategies.research_budget import migrate_legacy_token_reservations_locked
+
+    migrate_legacy_token_reservations_locked(conn)
+
+
 def _migration_10_advanced_risk_controls(conn: sqlite3.Connection) -> None:
     """Milestone 13 additive tables are applied by paper_books_schema first.
 
@@ -287,6 +304,10 @@ _MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
     11: (
         "add exact scheduler ownership to research attempts (Milestone 12.1.2)",
         _migration_11_research_attempt_scheduler_ownership,
+    ),
+    12: (
+        "run the legacy research-token reservation migration automatically (Milestone 27 A2)",
+        _migration_12_research_token_budget_legacy_migration,
     ),
 }
 
