@@ -1329,6 +1329,58 @@ def _build_evidence_provider_registry(provider_mode: str, *, cfg, conn=None) -> 
     return registry, tuple(used_providers)
 
 
+# docs/milestones/26.md B2: freshness thresholds for the authoritative
+# real-mode portfolio snapshot. Narrowly scoped constants rather than a new
+# config surface — the local ledger has no live mark price at all today, so
+# these only bound the account/positions query itself, not held-position
+# prices (see `LedgerPortfolioAccountSnapshotProvider`'s own docstring).
+PORTFOLIO_MAXIMUM_ACCOUNT_AGE_SECONDS = 300
+PORTFOLIO_MAXIMUM_POSITIONS_AGE_SECONDS = 300
+PORTFOLIO_MAXIMUM_POSITION_PRICE_AGE_SECONDS = 300
+
+
+def _build_portfolio_state(provider_mode: str, conn, as_of):
+    """Build the one authoritative `PortfolioState` for a research cycle
+    (docs/milestones/26.md B3/B7) — called once per cycle and reused for
+    every candidate symbol by `run_scheduled_research_cycle`, never
+    fetched or synthesized per-symbol.
+
+    Fixture mode uses an explicit, clearly-labeled fixture snapshot. Real
+    mode reads the local paper-book ledger, the one authoritative portfolio
+    source already present in this repository; when it cannot prove a
+    verified, complete, fresh snapshot, the resulting `PortfolioState` has
+    `symbol_exposure_complete=False` rather than a fabricated account —
+    `strategies/selector.py` already excludes candidates on that signal.
+    """
+    from .evidence_providers.portfolio_context import (
+        LedgerPortfolioAccountSnapshotProvider,
+        fixture_portfolio_account_snapshot,
+    )
+    from .models.trading_models import build_portfolio_state
+    from .paper.ledger import PaperLedger
+    from .research.scheduled_cycle import PROVIDER_MODE_FIXTURE
+
+    if provider_mode == PROVIDER_MODE_FIXTURE:
+        snapshot = fixture_portfolio_account_snapshot(as_of)
+    else:
+        try:
+            snapshot = LedgerPortfolioAccountSnapshotProvider(PaperLedger(conn)).fetch(as_of)
+        except Exception:
+            # No authoritative portfolio source available (docs/milestones/26.md
+            # B3) — fail closed to an unverified snapshot, never a fabricated
+            # account. `build_portfolio_state` below turns this into
+            # `symbol_exposure_complete=False`.
+            from .evidence_providers.portfolio_context import unverified_portfolio_account_snapshot
+
+            snapshot = unverified_portfolio_account_snapshot()
+    return build_portfolio_state(
+        snapshot, as_of=as_of,
+        maximum_account_age_seconds=PORTFOLIO_MAXIMUM_ACCOUNT_AGE_SECONDS,
+        maximum_positions_age_seconds=PORTFOLIO_MAXIMUM_POSITIONS_AGE_SECONDS,
+        maximum_position_price_age_seconds=PORTFOLIO_MAXIMUM_POSITION_PRICE_AGE_SECONDS,
+    )
+
+
 def provider_health_cli(db_path: Path) -> dict:
     """`provider-health` CLI command (Milestone 6; concentration fields added Milestone
     6.1 Step 18)."""
@@ -1448,9 +1500,12 @@ def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, sy
 
     with session(db_path) as conn:
         from .universe.tickers import default_universe
-        from .models.trading_models import PortfolioState
 
         registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=load_config(), conn=conn)
+        # docs/milestones/26.md B3/B7: built once per cycle from the
+        # authoritative source for `provider_mode` and reused for every
+        # candidate symbol — never a fabricated $100,000 account.
+        portfolio = _build_portfolio_state(provider_mode, conn, as_of)
         result = run_scheduled_research_cycle(
             as_of=as_of, symbols=candidate_symbols, configuration=cycle_config, conn=conn,
             cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
@@ -1458,10 +1513,7 @@ def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, sy
             evidence_providers=registry, research_provider=DeterministicResearchProvider(),
             research_provider_name="deterministic", research_model_name="deterministic-v1",
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
-            prompt_registry=PromptRegistry(), portfolio=PortfolioState.from_position_snapshots(
-                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
-                as_of=as_of, maximum_price_age_seconds=0,
-            ),
+            prompt_registry=PromptRegistry(), portfolio=portfolio,
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
             token_budget_controller_factory=_build_token_budget_controller_factory(research_config, conn),
         )
@@ -1491,7 +1543,6 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
     from .analysis.screener import load_screening_config
     from .evidence_providers.config import load_evidence_provider_config
     from .evidence_providers.health import ProviderCoveragePolicy, coverage_policy_from_configuration
-    from .models.trading_models import PortfolioState
     from .research.configuration import load_research_config
     from .research.deterministic_provider import DeterministicResearchProvider
     from .research.prompt_registry import PromptRegistry
@@ -1518,6 +1569,12 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
         )
         registry, _used = _build_evidence_provider_registry(provider_mode, cfg=load_config(), conn=conn)
         research_config = load_research_config()
+        # docs/milestones/26.md B3/B7: resuming re-uses the *original*
+        # cycle's `as_of` — if that point in time is no longer provable
+        # against the live ledger (e.g. resumed long after the cycle
+        # started), the snapshot degrades to incomplete rather than
+        # fabricating today's account as the historical one.
+        portfolio = _build_portfolio_state(provider_mode, conn, as_of)
 
         result = run_scheduled_research_cycle(
             as_of=as_of, symbols=symbols, configuration=cycle_config, conn=conn, cycle_repository=repo,
@@ -1525,10 +1582,7 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
             evidence_providers=registry, research_provider=DeterministicResearchProvider(),
             research_provider_name="deterministic", research_model_name="deterministic-v1",
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
-            prompt_registry=PromptRegistry(), portfolio=PortfolioState.from_position_snapshots(
-                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
-                as_of=as_of, maximum_price_age_seconds=0,
-            ),
+            prompt_registry=PromptRegistry(), portfolio=portfolio,
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
             token_budget_controller_factory=_build_token_budget_controller_factory(research_config, conn),
         )
@@ -1696,14 +1750,12 @@ def run_due_shadow_cycle_cli(
     but ONLY after every preflight below passes. `real` is never selected
     from credential presence alone; it requires this explicit flag.
     """
-    from decimal import Decimal
     from datetime import timezone as _tz
 
     from .analysis.scorer import load_scoring_config
     from .analysis.screener import load_screening_config
     from .evidence_providers.config import load_evidence_provider_config
     from .evidence_providers.health import ProviderCoveragePolicy, coverage_policy_from_configuration
-    from .models.trading_models import PortfolioState
     from .research.configuration import load_research_config
     from .research.deterministic_provider import DeterministicResearchProvider
     from .research.prompt_registry import PromptRegistry
@@ -1875,10 +1927,10 @@ def run_due_shadow_cycle_cli(
             research_provider_name=research_provider_name, research_model_name=research_model_name,
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
             prompt_registry=PromptRegistry(),
-            portfolio=PortfolioState.from_position_snapshots(
-                account_equity=Decimal("100000"), settled_cash=Decimal("100000"), positions={},
-                as_of=as_of, maximum_price_age_seconds=0,
-            ),
+            # docs/milestones/26.md B3/B7: built once per due cycle from the
+            # authoritative source for `provider_mode` and reused for every
+            # candidate symbol — never a fabricated $100,000 account.
+            portfolio=_build_portfolio_state(provider_mode, conn, as_of),
             paper_submitter=None, git_sha=_git_sha(),
         )
 

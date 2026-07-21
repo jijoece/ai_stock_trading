@@ -142,6 +142,26 @@ class PortfolioPositionSnapshot:
 
 
 @dataclass(frozen=True)
+class PortfolioAccountSnapshot:
+    """Explicit, completeness-aware account/positions read (docs/milestones/26.md
+    B1). An empty `positions` dict is ambiguous on its own — it can mean a
+    verified-empty account or a query that never ran — so every field a
+    caller needs to prove which one occurred is carried explicitly rather
+    than inferred from dict emptiness."""
+
+    account_equity: Decimal | None
+    settled_cash: Decimal | None
+    account_as_of: datetime | None
+    positions: dict[str, "PortfolioPositionSnapshot"]
+    positions_as_of: datetime | None
+    account_identity: str | None
+    account_verified: bool
+    account_query_complete: bool
+    positions_query_complete: bool
+    source: str  # "fixture" | "paper_ledger" | "broker_read_only" | "unknown"
+
+
+@dataclass(frozen=True)
 class PortfolioState:
     """Typed snapshot of account/portfolio state, mapped by callers into the
     flat fields `risk/position_sizing.RiskInputs` expects. Kept separate from
@@ -159,6 +179,7 @@ class PortfolioState:
     daily_loss_fraction: float = 0.0
     drawdown_fraction: float = 0.0
     as_of: datetime | None = None
+    portfolio_source: str | None = None  # docs/milestones/26.md B4: audit-only provenance label
 
     def shares_held(self, symbol: str) -> int | None:
         return self.existing_positions.get(symbol, 0)
@@ -212,6 +233,71 @@ class PortfolioState:
             portfolio_exposure_fraction=sum(exposures.values()) if complete else None,
             as_of=as_of,
         )
+
+
+def build_portfolio_state(
+    snapshot: PortfolioAccountSnapshot,
+    *,
+    as_of: datetime,
+    maximum_account_age_seconds: int,
+    maximum_positions_age_seconds: int,
+    maximum_position_price_age_seconds: int,
+) -> PortfolioState:
+    """Explicit completeness-aware builder (docs/milestones/26.md B1/B2).
+
+    Unlike `PortfolioState.from_position_snapshots`, an empty `positions`
+    dict on `snapshot` only proves zero holdings when the snapshot itself
+    proves the account and positions queries were verified, complete, and
+    fresh as of `as_of` — otherwise exposure stays unknown, never a
+    favorable zero (architecture §2/§14).
+    """
+    existing_positions = {
+        symbol: p.quantity
+        for symbol, p in snapshot.positions.items()
+        if type(p.quantity) is int and p.quantity > 0
+    }
+
+    def _fresh(ts: datetime | None, maximum_age_seconds: int) -> bool:
+        return (
+            ts is not None and ts.tzinfo is not None and ts <= as_of
+            and (as_of - ts).total_seconds() <= maximum_age_seconds
+        )
+
+    complete = (
+        snapshot.account_verified
+        and snapshot.account_query_complete
+        and snapshot.positions_query_complete
+        and bool(snapshot.account_identity)
+        and snapshot.account_equity is not None and snapshot.account_equity > 0
+        and _fresh(snapshot.account_as_of, maximum_account_age_seconds)
+        and _fresh(snapshot.positions_as_of, maximum_positions_age_seconds)
+    )
+
+    exposures: dict[str, float] = {}
+    if complete:
+        account_equity = snapshot.account_equity
+        assert account_equity is not None  # narrowed by `complete` above
+        for symbol, p in snapshot.positions.items():
+            quantity = p.quantity
+            if type(quantity) is not int or quantity <= 0:
+                continue
+            price = p.market_price
+            if (
+                price is None or price <= 0
+                or not _fresh(p.price_as_of, maximum_position_price_age_seconds)
+            ):
+                complete = False
+                exposures = {}
+                break
+            exposures[symbol] = float(Decimal(quantity) * price / account_equity)
+
+    return PortfolioState(
+        account_equity=snapshot.account_equity, settled_cash=snapshot.settled_cash,
+        existing_positions=existing_positions, symbol_exposure_fraction=exposures,
+        symbol_exposure_complete=complete,
+        portfolio_exposure_fraction=sum(exposures.values()) if complete else None,
+        as_of=as_of, portfolio_source=snapshot.source,
+    )
 
 
 def utc_now() -> datetime:

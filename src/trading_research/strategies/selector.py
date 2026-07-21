@@ -7,6 +7,7 @@ not import anything from `research/`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from ..models.trading_models import PortfolioState
 from .config import ShortlistConfig
@@ -73,10 +74,15 @@ def _symbol_allocation_decision(
         if symbol in portfolio.existing_positions:
             return False, "symbol_exposure_unknown"
         current = 0.0
-    remaining = config.maximum_symbol_allocation_fraction - current
-    return remaining >= config.minimum_candidate_allocation_fraction, (
-        None if remaining >= config.minimum_candidate_allocation_fraction else "symbol_allocation_cap_reached"
-    )
+    # docs/milestones/26.md B6: float subtraction here can round a symbol's
+    # remaining room a hair under the true value near common allocation
+    # fractions (e.g. 0.08 - 0.07 == 0.009999999999999995 in binary float),
+    # wrongly excluding a symbol that has exactly enough room. Route the
+    # comparison through Decimal(str(...)) — an exact decimal parse of the
+    # same config/portfolio values — before deciding.
+    remaining = Decimal(str(config.maximum_symbol_allocation_fraction)) - Decimal(str(current))
+    minimum = Decimal(str(config.minimum_candidate_allocation_fraction))
+    return remaining >= minimum, (None if remaining >= minimum else "symbol_allocation_cap_reached")
 
 
 def select_shortlist(
