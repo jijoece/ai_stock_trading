@@ -166,6 +166,46 @@ def test_stale_or_missing_position_price_keeps_exposure_incomplete():
         assert result.excluded[0].reason == "symbol_exposure_unknown"
 
 
+def test_exposure_exactly_at_cap_is_excluded():
+    from dataclasses import replace
+    config = replace(SHORTLIST_CONFIG, maximum_symbol_allocation_fraction=0.08, minimum_candidate_allocation_fraction=0.01)
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.08}, symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, config, portfolio)
+    assert result.entries == ()
+    assert result.excluded[0].reason == "symbol_allocation_cap_reached"
+
+
+def test_exposure_with_insufficient_room_is_excluded_under_decimal_comparison():
+    from dataclasses import replace
+    config = replace(SHORTLIST_CONFIG, maximum_symbol_allocation_fraction=0.08, minimum_candidate_allocation_fraction=0.01)
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.071}, symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, config, portfolio)
+    assert result.entries == ()
+    assert result.excluded[0].reason == "symbol_allocation_cap_reached"
+
+
+def test_exposure_with_precise_room_is_eligible_despite_float_rounding():
+    """Milestone 26 B6: 0.08 - 0.07 == 0.009999999999999995 in binary float
+    (just under the 0.01 minimum), which would wrongly exclude a symbol
+    that has exactly enough room. The Decimal(str(...)) comparison must
+    include it."""
+    from dataclasses import replace
+    config = replace(SHORTLIST_CONFIG, maximum_symbol_allocation_fraction=0.08, minimum_candidate_allocation_fraction=0.01)
+    assert (config.maximum_symbol_allocation_fraction - 0.07) < config.minimum_candidate_allocation_fraction  # the float trap
+    portfolio = PortfolioState(
+        account_equity=Decimal("10000"), settled_cash=Decimal("100"),
+        symbol_exposure_fraction={"AAA": 0.07}, symbol_exposure_complete=True, as_of=NOW,
+    )
+    result = select_shortlist({"momentum_breakout": (_signal("AAA", 0.9),)}, config, portfolio)
+    assert result.symbols == ("AAA",)
+
+
 def test_freshness_tie_break_prefers_newer_data_as_of():
     """Milestone 24 Part B2: two otherwise-identical eligible signals (same
     strength, same data_quality) for different symbols — the one with the
