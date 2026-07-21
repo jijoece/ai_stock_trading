@@ -5,7 +5,7 @@ response. See `external_broker.py::recover_stranded_submission`.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -499,4 +499,191 @@ def test_recovery_not_applicable_when_not_stranded(tmp_path):
             runtime=_RecoveryRuntime(lookup_mode="found"), config=cfg, clock=lambda: NOW,
         )
     assert excinfo.value.code == "RECOVERY_NOT_APPLICABLE"
+    conn.close()
+
+
+# --- Milestone 27 B1/B2/B4: retry preparation atomicity and recovery --------
+
+
+def _strand_retry_at_submission_requested(db_path, cfg, monkeypatch) -> None:
+    """Reproduce the exact B1 crash window end to end, then close the
+    connection (simulated process death): attempt 0's retry-preparation
+    transaction (reservation rollover + SUBMISSION_REQUESTED checkpoint +
+    lookup consumption) commits, then the process crashes before
+    `runtime.submit_limit_order()` is ever called for the retry."""
+    _strand_at_submission_requested(db_path, cfg)
+
+    conn = connect(db_path)
+    recover_stranded_submission(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=_RecoveryRuntime(lookup_mode="not_found"), config=cfg, clock=lambda: NOW,
+    )
+    bridged = repo.load_latest_external_order_event_for_intent(conn, "BASELINE", "intent-1")
+    assert bridged["new_state"] == STATE_UNKNOWN
+    conn.close()
+
+    import trading_research.paper_books.external_broker as external_broker_module
+
+    def _crash_before_broker_call(*args, **kwargs):
+        raise BaseException("process died after retry preparation committed, before the broker call")
+
+    conn = connect(db_path)
+    monkeypatch.setattr(external_broker_module, "_submit_checkpointed_attempt", _crash_before_broker_call)
+    retry_runtime = _CrashBeforeBrokerCallRuntime()
+    with pytest.raises(BaseException):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="retry", runtime=retry_runtime, config=cfg, clock=lambda: NOW,
+        )
+    monkeypatch.undo()
+    assert retry_runtime.submit_calls == 0  # runtime.submit_limit_order was never reached
+
+    client_order_id, _ = derive_external_order_identity(repo.load_order_intent(conn, "BASELINE", "intent-1"))
+    prior_reservation = repo.load_latest_attempt_reservation(conn, client_order_id, 0, FINGERPRINT, "BASELINE")
+    assert prior_reservation["state"] == "SUPERSEDED_BY_RETRY"
+    new_reservation = repo.load_active_attempt_reservation(conn, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert new_reservation is not None and new_reservation["state"] == "RESERVED"
+    current = repo.load_latest_external_order_event_for_intent(conn, "BASELINE", "intent-1")
+    assert current["new_state"] == STATE_SUBMISSION_REQUESTED
+    assert current["attempt_number"] == 1
+    consumed_lookup = repo.load_latest_external_lookup(conn, "BASELINE", client_order_id)
+    assert consumed_lookup["consumed_by_retry_event_id"] == current["external_order_event_id"]
+    conn.close()
+
+
+def test_retry_crash_before_broker_call_leaves_valid_prepared_state(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_crash_prepared.sqlite3"
+    cfg = _config()
+    _strand_retry_at_submission_requested(db_path, cfg, monkeypatch)
+    # _strand_retry_at_submission_requested already asserts the durable
+    # prepared state (reservation rollover, checkpoint event, consumed
+    # lookup); this test exists to document the crash-window scenario by
+    # name per docs/milestones/27.md B4.
+
+
+def test_recovery_of_prepared_retry_finds_broker_order(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_crash_found.sqlite3"
+    cfg = _config()
+    _strand_retry_at_submission_requested(db_path, cfg, monkeypatch)
+
+    restarted = connect(db_path)
+    runtime = _RecoveryRuntime(lookup_mode="found")
+    recover_stranded_submission(
+        restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert runtime.submit_calls == 0  # no duplicate submit
+    client_order_id, _ = derive_external_order_identity(repo.load_order_intent(restarted, "BASELINE", "intent-1"))
+    reservation = repo.load_active_attempt_reservation(restarted, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert reservation["state"] == "SUBMITTED"
+    event = repo.load_latest_external_order_event_for_intent(restarted, "BASELINE", "intent-1")
+    assert event["new_state"] == STATE_FILLED
+    restarted.close()
+
+
+def test_recovery_of_prepared_retry_with_authoritative_not_found(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_crash_not_found.sqlite3"
+    cfg = _config()
+    _strand_retry_at_submission_requested(db_path, cfg, monkeypatch)
+
+    restarted = connect(db_path)
+    runtime = _RecoveryRuntime(lookup_mode="not_found")
+    recover_stranded_submission(
+        restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert runtime.submit_calls == 0  # no broker submission
+    client_order_id, _ = derive_external_order_identity(repo.load_order_intent(restarted, "BASELINE", "intent-1"))
+    reservation = repo.load_active_attempt_reservation(restarted, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert reservation["state"] == "RECONCILIATION_REQUIRED"
+    event = repo.load_latest_external_order_event_for_intent(restarted, "BASELINE", "intent-1")
+    assert event["new_state"] == STATE_UNKNOWN
+
+    # Next explicit retry remains possible once a fresh NOT_FOUND lookup exists.
+    fresh_lookup = repo.load_latest_external_lookup(restarted, "BASELINE", client_order_id)
+    assert fresh_lookup["consumed_by_retry_event_id"] is None
+    assert fresh_lookup["ambiguous_event_id"] == event["external_order_event_id"]
+    restarted.close()
+
+
+def test_recovery_of_prepared_retry_with_lookup_timeout(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_crash_timeout.sqlite3"
+    cfg = _config()
+    _strand_retry_at_submission_requested(db_path, cfg, monkeypatch)
+
+    restarted = connect(db_path)
+    runtime = _RecoveryRuntime(lookup_mode="timeout")
+    recover_stranded_submission(
+        restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=runtime, config=cfg, clock=lambda: NOW,
+    )
+    assert runtime.submit_calls == 0  # no broker submission
+    client_order_id, _ = derive_external_order_identity(repo.load_order_intent(restarted, "BASELINE", "intent-1"))
+    reservation = repo.load_active_attempt_reservation(restarted, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert reservation["state"] == "RECONCILIATION_REQUIRED"
+    restarted.close()
+
+
+def test_repeated_recovery_of_prepared_retry_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry_crash_repeat.sqlite3"
+    cfg = _config()
+    _strand_retry_at_submission_requested(db_path, cfg, monkeypatch)
+
+    restarted = connect(db_path)
+    client_order_id, _ = derive_external_order_identity(repo.load_order_intent(restarted, "BASELINE", "intent-1"))
+    first = recover_stranded_submission(
+        restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=_RecoveryRuntime(lookup_mode="not_found"), config=cfg, clock=lambda: NOW,
+    )
+    assert first["status"] != "error"
+    # The chain already moved off SUBMISSION_REQUESTED (to
+    # UNKNOWN_REQUIRES_RECONCILIATION) -- recovery only ever applies to a
+    # chain actually stranded there, so a second call fails closed with a
+    # bounded, typed error rather than silently forking a new event chain
+    # or reservation.
+    with pytest.raises(ExternalPaperError) as excinfo:
+        recover_stranded_submission(
+            restarted, book_id="BASELINE", paper_order_intent_id="intent-1",
+            runtime=_RecoveryRuntime(lookup_mode="not_found"), config=cfg, clock=lambda: NOW,
+        )
+    assert excinfo.value.code == "RECOVERY_NOT_APPLICABLE"
+    reservations = repo.list_attempt_reservations_for_attempt(restarted, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert len(reservations) == 1  # no duplicate reservation
+    events = repo.list_external_order_events(restarted, book_id="BASELINE", client_order_id=client_order_id)
+    assert len({e["external_order_event_id"] for e in events}) == len(events)  # no duplicate event-chain fork
+    restarted.close()
+
+
+def test_concurrent_retry_blocked_by_order_lease(tmp_path, monkeypatch):
+    """docs/milestones/27.md B4 concurrency: two operators attempt the same
+    retry -- one prepares the attempt, the other is blocked by the
+    order-scope lease before it can prepare or submit anything."""
+    db_path = tmp_path / "retry_concurrency.sqlite3"
+    cfg = _config()
+    _strand_at_submission_requested(db_path, cfg)
+
+    conn = connect(db_path)
+    recover_stranded_submission(
+        conn, book_id="BASELINE", paper_order_intent_id="intent-1",
+        runtime=_RecoveryRuntime(lookup_mode="not_found"), config=cfg, clock=lambda: NOW,
+    )
+    intent = repo.load_order_intent(conn, "BASELINE", "intent-1")
+    client_order_id, _ = derive_external_order_identity(intent)
+    lease_key = f"BASELINE:{client_order_id}"
+    held = repo.acquire_external_order_lease(
+        conn, lease_key=lease_key, book_id="BASELINE", client_order_id=client_order_id,
+        owner_id="other-operator", operation="RETRY", now=NOW.isoformat(),
+        expires_at=(NOW + timedelta(seconds=30)).isoformat(),
+    )
+    assert isinstance(held, int) and held >= 1
+
+    runtime = _RecoveryRuntime(lookup_mode="not_found")
+    with pytest.raises(ExternalPaperError, match="lease"):
+        retry_external_paper_order(
+            conn, book_id="BASELINE", paper_order_intent_id="intent-1", operator="alice",
+            reason="blocked by concurrent operator", runtime=runtime, config=cfg, clock=lambda: NOW,
+        )
+    assert runtime.submit_calls == 0
+    reservations = repo.list_attempt_reservations_for_attempt(conn, client_order_id, 1, FINGERPRINT, "BASELINE")
+    assert reservations == []  # exactly zero new reservations were prepared
     conn.close()
