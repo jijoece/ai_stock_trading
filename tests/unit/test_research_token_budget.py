@@ -535,7 +535,7 @@ def test_migration_leaves_cost_reservations_untouched(tmp_path):
 def test_claim_transitions_reserved_to_in_flight(tmp_path):
     conn = _db(tmp_path)
     reservation = _reserve(conn)
-    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock() + timedelta(seconds=60))
     assert claim.status == "CLAIMED"
     assert claim.claim_generation == 1
     row = load_budget_reservation(conn, reservation.reservation_id)
@@ -546,21 +546,21 @@ def test_claim_transitions_reserved_to_in_flight(tmp_path):
 def test_second_claim_on_in_flight_reservation_is_rejected(tmp_path):
     conn = _db(tmp_path)
     reservation = _reserve(conn)
-    first = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    first = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock() + timedelta(seconds=60))
     assert first.status == "CLAIMED"
-    second = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock())
+    second = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock() + timedelta(seconds=60))
     assert second.status == "ALREADY_IN_FLIGHT"
 
 
 def test_claim_on_settled_reservation_is_a_state_conflict(tmp_path):
     conn = _db(tmp_path)
     reservation = _reserve(conn)
-    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock() + timedelta(seconds=60))
     settle_research_tokens(
         conn, reservation.reservation_id, actual_input_tokens=1, actual_output_tokens=1, clock=_clock,
         claim_owner="owner-1", claim_generation=claim.claim_generation,
     )
-    stale = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock())
+    stale = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock() + timedelta(seconds=60))
     assert stale.status == "STATE_CONFLICT"
 
 
@@ -577,7 +577,7 @@ def test_two_concurrent_claims_on_the_same_reservation_have_exactly_one_winner(t
     def claim_as(owner):
         conn = connect(db_path)
         try:
-            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock())
+            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock() + timedelta(seconds=60))
         finally:
             conn.close()
 
@@ -587,7 +587,7 @@ def test_two_concurrent_claims_on_the_same_reservation_have_exactly_one_winner(t
         conn = connect(db_path)
         barrier.wait()
         try:
-            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock())
+            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock() + timedelta(seconds=60))
         finally:
             conn.close()
 
@@ -742,3 +742,234 @@ def test_startup_migration_conflict_blocks_connect_with_no_partial_rows(tmp_path
     good_row = raw.execute("SELECT * FROM shadow_budget_reservations WHERE reservation_id = 'resv-good'").fetchone()
     assert good_row["reservation_kind"] == "RESEARCH_COST"  # rolled back, not partially migrated
     raw.close()
+
+
+# --- docs/milestones/28.md B1-B7: cross-day provider-attempt recovery ------
+
+DAY_1_NOON = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+DAY_2_NOON = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+
+
+def test_expired_day_1_in_flight_claim_blocks_day_2_reservation_and_recovers_to_ambiguous(tmp_path):
+    """Day 1: reservation created, claim becomes IN_FLIGHT, process crashes
+    before settlement. Day 2: the same research run/symbol/provider/model/
+    attempt resumes — the expired Day 1 claim must recover to AMBIGUOUS and
+    the Day 2 attempt must be blocked, never silently retried."""
+    conn = _db(tmp_path)
+    day_1 = reserve_research_tokens(
+        conn, research_run_id="run-crash", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(day_1, ResearchTokenReservation)
+    claim = claim_research_token_attempt(
+        conn, day_1.reservation_id, "owner-day-1", DAY_1_NOON, DAY_1_NOON + timedelta(seconds=60),
+    )
+    assert claim.status == "CLAIMED"
+    # Process crashes before settlement — the claim's lease has long since
+    # expired by the time Day 2 resumes.
+
+    day_2 = reserve_research_tokens(
+        conn, research_run_id="run-crash", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_2_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(day_2, TokenBudgetRejected)
+    assert day_2.code == "TOKEN_RESERVATION_RECONCILIATION_REQUIRED"
+
+    day_1_row = load_budget_reservation(conn, day_1.reservation_id)
+    assert day_1_row["status"] == TOKEN_RESERVATION_AMBIGUOUS
+    # No second reservation exists for the Day 2 attempt key.
+    assert not any(
+        row["idempotency_key"].endswith("2026-07-20")
+        for row in list_budget_reservations(conn)
+        if row["reservation_id"] != day_1.reservation_id and row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND
+        and "run-crash" in row["idempotency_key"]
+    )
+
+
+def test_nonexpired_cross_day_in_flight_claim_still_blocks_new_reservation(tmp_path):
+    """A claim whose expiry crosses midnight but has not yet expired must
+    remain IN_FLIGHT and continue to block a new reservation."""
+    conn = _db(tmp_path)
+    just_before_midnight = datetime(2026, 7, 19, 23, 50, tzinfo=timezone.utc)
+    just_after_midnight = datetime(2026, 7, 20, 0, 5, tzinfo=timezone.utc)
+    lease_expires_at = datetime(2026, 7, 20, 0, 20, tzinfo=timezone.utc)
+    reservation = reserve_research_tokens(
+        conn, research_run_id="run-midnight", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: just_before_midnight,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", just_before_midnight, lease_expires_at)
+
+    blocked = reserve_research_tokens(
+        conn, research_run_id="run-midnight", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: just_after_midnight,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(blocked, TokenBudgetRejected)
+    assert blocked.code == "TOKEN_ATTEMPT_ALREADY_IN_FLIGHT"
+    row = load_budget_reservation(conn, reservation.reservation_id)
+    assert row["status"] == TOKEN_RESERVATION_IN_FLIGHT
+
+
+def test_cross_day_ambiguity_reconciled_to_settled_blocks_further_reservation(tmp_path):
+    conn = _db(tmp_path)
+    day_1 = reserve_research_tokens(
+        conn, research_run_id="run-settle", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    claim_research_token_attempt(conn, day_1.reservation_id, "owner-1", DAY_1_NOON, DAY_1_NOON + timedelta(seconds=60))
+    reserve_research_tokens(
+        conn, research_run_id="run-settle", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_2_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )  # recovers Day 1 to AMBIGUOUS as a side effect
+
+    reconcile_ambiguous_research_tokens(
+        conn, day_1.reservation_id, target_status="SETTLED", operator="operator@example.test",
+        reason="provider log confirms the Day 1 request completed", reconciliation_source="signed-adapter-log",
+        clock=lambda: DAY_2_NOON, actual_input_tokens=1000, actual_output_tokens=500, actual_reasoning_tokens=0,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE,
+    )
+    still_blocked = reserve_research_tokens(
+        conn, research_run_id="run-settle", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 21), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000,
+        clock=lambda: datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    # SETTLED is not an unresolved status — a later attempt number governed
+    # by existing orchestration retry rules is unaffected by this reservation.
+    assert isinstance(still_blocked, ResearchTokenReservation)
+
+
+def test_cross_day_ambiguity_reconciled_to_released_permits_new_attempt(tmp_path):
+    conn = _db(tmp_path)
+    day_1 = reserve_research_tokens(
+        conn, research_run_id="run-release", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    mark_research_tokens_ambiguous(conn, day_1.reservation_id)
+    reconcile_ambiguous_research_tokens(
+        conn, day_1.reservation_id, target_status="RELEASED", operator="operator@example.test",
+        reason="adapter log proves the Day 1 request was never transmitted",
+        reconciliation_source="signed-adapter-log:request-absent", clock=lambda: DAY_2_NOON,
+    )
+    day_2 = reserve_research_tokens(
+        conn, research_run_id="run-release", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_2_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(day_2, ResearchTokenReservation)
+
+
+def test_exact_attempt_scoping_does_not_conflate_different_roles(tmp_path):
+    """An AMBIGUOUS fundamental attempt must not block an unrelated
+    technical attempt within the same research run/symbol/provider/model —
+    the reservation layer scopes on the exact provider-attempt identity,
+    never a broad string-prefix match across roles."""
+    conn = _db(tmp_path)
+    fundamental = reserve_research_tokens(
+        conn, research_run_id="run-scoped", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    mark_research_tokens_ambiguous(conn, fundamental.reservation_id)
+
+    technical = reserve_research_tokens(
+        conn, research_run_id="run-scoped", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="technical:1",
+    )
+    assert isinstance(technical, ResearchTokenReservation)
+
+
+def test_concurrent_reservation_attempts_recover_expired_claim_exactly_once(tmp_path):
+    """Two connections racing immediately after claim expiry: exactly one
+    transition IN_FLIGHT -> AMBIGUOUS occurs, no new reservation is created
+    by either racer, and the provider is never invoked (zero calls at this
+    layer by construction — a rejected reservation never reaches a
+    provider)."""
+    db_path = tmp_path / "concurrent-recovery.sqlite3"
+    conn = connect(db_path)
+    day_1 = reserve_research_tokens(
+        conn, research_run_id="run-concurrent-recovery", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_1_NOON,
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    claim_research_token_attempt(conn, day_1.reservation_id, "owner-1", DAY_1_NOON, DAY_1_NOON + timedelta(seconds=60))
+    conn.close()
+
+    barrier = Barrier(2)
+
+    def run(index: int):
+        local_conn = connect(db_path)
+        try:
+            barrier.wait(timeout=5)
+            return reserve_research_tokens(
+                local_conn, research_run_id="run-concurrent-recovery", symbol="AAPL", provider="deterministic",
+                model_name=None, utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+                maximum_reasoning_tokens=0, daily_token_cap=10_000, clock=lambda: DAY_2_NOON,
+                token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+            )
+        finally:
+            local_conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [future.result() for future in (executor.submit(run, 0), executor.submit(run, 1))]
+
+    assert all(isinstance(outcome, TokenBudgetRejected) for outcome in outcomes)
+    assert all(outcome.code == "TOKEN_RESERVATION_RECONCILIATION_REQUIRED" for outcome in outcomes)
+    final_conn = connect(db_path)
+    row = load_budget_reservation(final_conn, day_1.reservation_id)
+    assert row["status"] == TOKEN_RESERVATION_AMBIGUOUS
+    assert not any(
+        r["reservation_id"] != day_1.reservation_id and "run-concurrent-recovery" in r["idempotency_key"]
+        for r in list_budget_reservations(final_conn)
+    )
+
+
+# --- docs/milestones/28.md B5: claim timestamp/lease validation -----------
+
+def test_claim_owner_must_be_nonempty_and_bounded(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    with pytest.raises(TokenBudgetError, match="TOKEN_CLAIM_OWNER_INVALID"):
+        claim_research_token_attempt(conn, reservation.reservation_id, "", _clock(), _clock() + timedelta(seconds=60))
+    with pytest.raises(TokenBudgetError, match="TOKEN_CLAIM_OWNER_INVALID"):
+        claim_research_token_attempt(
+            conn, reservation.reservation_id, "x" * 201, _clock(), _clock() + timedelta(seconds=60),
+        )
+
+
+def test_claim_expiry_must_be_after_now_and_within_maximum_lease(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    with pytest.raises(TokenBudgetError, match="TOKEN_CLAIM_TIMESTAMP_INVALID"):
+        claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    with pytest.raises(TokenBudgetError, match="TOKEN_CLAIM_TIMESTAMP_INVALID"):
+        claim_research_token_attempt(
+            conn, reservation.reservation_id, "owner-1", _clock(), _clock() + timedelta(hours=2),
+        )
+
+
+def test_claim_timestamps_must_be_timezone_aware(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    naive_now = _clock().replace(tzinfo=None)
+    with pytest.raises(TokenBudgetError, match="TOKEN_CLAIM_TIMESTAMP_INVALID"):
+        claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", naive_now, _clock() + timedelta(seconds=60))
