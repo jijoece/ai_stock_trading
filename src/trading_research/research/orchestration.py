@@ -702,6 +702,7 @@ def analyze_with_research_committee(
     require_decision: bool = True,
     attempt_controller: "ResearchAttemptController | None" = None,
     token_budget_controller: "ResearchTokenBudgetController | None" = None,
+    token_budget_required: bool = False,
 ) -> OrchestrationResult:
     """`attempt_controller` (docs/milestone-7.1.md Step 12, default `None` =
     every prior milestone's exact behavior): an optional
@@ -709,6 +710,11 @@ def analyze_with_research_committee(
     provider attempt, including retries. `research/orchestration.py` never
     imports `shadow` — a shadow-budget-aware implementation is injected by
     the caller (see `shadow/attempt_controller.py`).
+
+    `token_budget_required` (default `False`): when `True` and `token_budget_controller`
+    is `None`, returns `RUN_STATUS_ANALYSIS_INCOMPLETE` with incomplete_reasons=
+    ("TOKEN_BUDGET_CONTROLLER_REQUIRED",) before any provider call, instead of
+    silently falling back to direct provider invocation (docs/milestones/26.md A1).
 
     `require_decision` (default `True`, preserving fail-closed production behavior):
     when `True` and `configuration.roles` does not include the manager role, raises
@@ -760,6 +766,23 @@ def analyze_with_research_committee(
                 status=RUN_STATUS_ANALYST_REPORTS_COMPLETE_NO_MANAGER, decision=None, role_reports=reports,
                 attempts=(), incomplete_reasons=(), reused_existing_run=True,
             )
+
+    if token_budget_required and token_budget_controller is None:
+        # A configured daily token cap requires every fresh provider call to be
+        # wrapped by a token-budget controller (docs/milestones/26.md A1). Fail
+        # closed here, before any provider call and before `save_run_started`,
+        # rather than silently falling back to direct invocation.
+        if research_repository is not None:
+            research_repository.save_run_started(
+                research_run_id, snapshot.snapshot_id, provider_name, model_name, roles, run_mode,
+                configuration.config_hash, clock(),
+            )
+            research_repository.mark_run_finished(research_run_id, RUN_STATUS_ANALYSIS_INCOMPLETE, clock())
+        return OrchestrationResult(
+            research_run_id=research_run_id, snapshot_id=snapshot.snapshot_id,
+            status=RUN_STATUS_ANALYSIS_INCOMPLETE, decision=None, role_reports=(), attempts=(),
+            incomplete_reasons=("TOKEN_BUDGET_CONTROLLER_REQUIRED",), reused_existing_run=False,
+        )
 
     preflight_reasons = validate_snapshot_preconditions(
         snapshot, require_point_in_time_safe=configuration.require_point_in_time_safe,

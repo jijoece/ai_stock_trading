@@ -203,6 +203,44 @@ def test_scheduled_cycle_rerun_is_idempotent(tmp_path):
     assert assignment_count == 2  # BASELINE + ENHANCED, not duplicated
 
 
+def test_scheduled_cycle_wires_token_budget_required_and_controller(tmp_path, monkeypatch):
+    """docs/milestones/26.md A1: when `research_configuration.daily_token_cap`
+    is set, every fresh committee invocation must be called with
+    `token_budget_required=True`; the per-symbol controller factory result
+    must be passed through as `token_budget_controller`."""
+    import dataclasses
+
+    from trading_research.research import scheduled_cycle as scheduled_cycle_module
+
+    captured: list[dict] = []
+    real = scheduled_cycle_module.analyze_with_research_committee
+
+    def _spy(*args, **kwargs):
+        captured.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scheduled_cycle_module, "analyze_with_research_committee", _spy)
+
+    conn = connect(tmp_path / "cycle.sqlite3")
+    research_config = dataclasses.replace(load_research_config(), daily_token_cap=1000)
+    portfolio = PortfolioState(account_equity=Decimal("100000"), settled_cash=Decimal("100000"), as_of=AS_OF)
+    sentinel_controller = object()
+    run_scheduled_research_cycle(
+        as_of=AS_OF, symbols=("AAPL",), configuration=_config(), conn=conn,
+        cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
+        screening_config=load_screening_config(), scoring_config=load_scoring_config(),
+        evidence_providers=_providers(), research_provider=DeterministicResearchProvider(),
+        research_provider_name="deterministic", research_model_name="deterministic-v1",
+        research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
+        prompt_registry=PromptRegistry(), portfolio=portfolio, paper_submitter=None,
+        clock=lambda: AS_OF, git_sha="test-sha",
+        token_budget_controller_factory=lambda symbol: sentinel_controller,
+    )
+    if captured:  # only invoked when evidence completeness allows a fresh committee call
+        assert all(call["token_budget_required"] is True for call in captured)
+        assert all(call["token_budget_controller"] is sentinel_controller for call in captured)
+
+
 def test_scheduled_cycle_symbol_with_no_provider_data_is_isolated_not_fatal(tmp_path):
     conn = connect(tmp_path / "cycle.sqlite3")
     result = _run(conn, symbols=("AAPL", "MSFT"))

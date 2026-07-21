@@ -15,10 +15,12 @@ from trading_research.research.models import (
     TOKEN_ACCOUNTING_REASONING_SEPARATE,
 )
 from trading_research.strategies.research_budget import (
+    RESEARCH_TOKEN_RESERVATION_KIND,
     ResearchTokenReservation,
     TokenBudgetError,
     TokenBudgetRejected,
     mark_research_tokens_ambiguous,
+    migrate_legacy_token_reservations,
     reconcile_ambiguous_research_tokens,
     release_research_tokens,
     reserve_research_tokens,
@@ -328,3 +330,195 @@ def test_two_connections_cannot_reserve_past_daily_cap(tmp_path):
         )]
     assert sum(isinstance(outcome, ResearchTokenReservation) for outcome in outcomes) == 1
     assert sum(isinstance(outcome, TokenBudgetRejected) for outcome in outcomes) == 1
+
+
+# --- A2: ambiguous retries must be blocked across UTC dates, not just the current date ---
+
+
+def test_ambiguous_reservation_blocks_retry_on_a_later_utc_date(tmp_path):
+    conn = _db(tmp_path)
+    july_19 = reserve_research_tokens(
+        conn, research_run_id="run-cross-date", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000,
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(july_19, ResearchTokenReservation)
+    assert mark_research_tokens_ambiguous(conn, july_19.reservation_id) is True
+
+    july_20 = reserve_research_tokens(
+        conn, research_run_id="run-cross-date", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000,
+        clock=lambda: datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(july_20, TokenBudgetRejected)
+    assert july_20.code == "TOKEN_RESERVATION_RECONCILIATION_REQUIRED"
+
+
+def test_reconciled_to_released_permits_retry_on_a_later_date(tmp_path):
+    conn = _db(tmp_path)
+    july_19 = reserve_research_tokens(
+        conn, research_run_id="run-cross-date-2", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 19), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000,
+        clock=lambda: datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    mark_research_tokens_ambiguous(conn, july_19.reservation_id)
+    reconcile_ambiguous_research_tokens(
+        conn, july_19.reservation_id, target_status="RELEASED", operator="operator@example.test",
+        reason="adapter log proves request was never transmitted",
+        reconciliation_source="signed-adapter-log:request-absent", clock=_clock,
+    )
+    july_20 = reserve_research_tokens(
+        conn, research_run_id="run-cross-date-2", symbol="AAPL", provider="deterministic", model_name=None,
+        utc_date=date(2026, 7, 20), estimated_input_tokens=1000, maximum_output_tokens=500,
+        maximum_reasoning_tokens=0, daily_token_cap=10_000,
+        clock=lambda: datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+        token_accounting_policy=TOKEN_ACCOUNTING_NOT_APPLICABLE, research_attempt_identity="fundamental:1",
+    )
+    assert isinstance(july_20, ResearchTokenReservation)
+
+
+# --- A5: idempotent reuse must validate the immutable reservation payload ---
+
+
+def test_same_key_larger_output_allowance_fails_closed(tmp_path):
+    conn = _db(tmp_path)
+    _reserve(conn, research_run_id="run-payload", estimated_input_tokens=100, maximum_output_tokens=50)
+    with pytest.raises(TokenBudgetError, match="TOKEN_RESERVATION_PAYLOAD_MISMATCH"):
+        _reserve(conn, research_run_id="run-payload", estimated_input_tokens=100, maximum_output_tokens=999)
+
+
+def test_same_key_changed_reasoning_allowance_fails_closed(tmp_path):
+    conn = _db(tmp_path)
+    _reserve(
+        conn, research_run_id="run-payload-2", maximum_reasoning_tokens=10,
+        token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE,
+    )
+    with pytest.raises(TokenBudgetError, match="TOKEN_RESERVATION_PAYLOAD_MISMATCH"):
+        _reserve(
+            conn, research_run_id="run-payload-2", maximum_reasoning_tokens=999,
+            token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE,
+        )
+
+
+def test_same_key_identical_payload_reuses_reservation(tmp_path):
+    conn = _db(tmp_path)
+    first = _reserve(conn, research_run_id="run-payload-3", estimated_input_tokens=100, maximum_output_tokens=50)
+    second = _reserve(conn, research_run_id="run-payload-3", estimated_input_tokens=100, maximum_output_tokens=50)
+    assert isinstance(first, ResearchTokenReservation) and isinstance(second, ResearchTokenReservation)
+    assert first.reservation_id == second.reservation_id
+
+
+# --- A6: repeated reconciliation to the same target must validate evidence ---
+
+
+def test_repeated_reconciliation_with_conflicting_evidence_fails_closed(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn, token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE)
+    mark_research_tokens_ambiguous(conn, reservation.reservation_id)
+    reconcile_ambiguous_research_tokens(
+        conn, reservation.reservation_id, target_status="SETTLED", operator="operator@example.test",
+        reason="first pass", reconciliation_source="provider-usage-export:2026-07-11",
+        actual_input_tokens=10, actual_output_tokens=20, actual_reasoning_tokens=5,
+        token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE, provider_request_id="request-1", clock=_clock,
+    )
+    with pytest.raises(TokenBudgetError, match="TOKEN_RECONCILIATION_EVIDENCE_CONFLICT"):
+        reconcile_ambiguous_research_tokens(
+            conn, reservation.reservation_id, target_status="SETTLED", operator="operator@example.test",
+            reason="second pass with different numbers", reconciliation_source="provider-usage-export:2026-07-11",
+            actual_input_tokens=999, actual_output_tokens=20, actual_reasoning_tokens=5,
+            token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE, provider_request_id="request-1",
+            clock=_clock,
+        )
+
+
+def test_repeated_reconciliation_with_identical_evidence_is_idempotent(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn, token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE)
+    mark_research_tokens_ambiguous(conn, reservation.reservation_id)
+    kwargs = dict(
+        target_status="SETTLED", operator="operator@example.test", reason="matched export",
+        reconciliation_source="provider-usage-export:2026-07-11", actual_input_tokens=10, actual_output_tokens=20,
+        actual_reasoning_tokens=5, token_accounting_policy=TOKEN_ACCOUNTING_REASONING_SEPARATE,
+        provider_request_id="request-1", clock=_clock,
+    )
+    assert reconcile_ambiguous_research_tokens(conn, reservation.reservation_id, **kwargs) is True
+    assert reconcile_ambiguous_research_tokens(conn, reservation.reservation_id, **kwargs) is False
+
+
+# --- A4: legacy pre-PR #35 token reservation migration ---
+
+
+def test_legacy_token_reservation_migrates_to_research_tokens(tmp_path):
+    conn = _db(tmp_path)
+    legacy_key = "research_token_budget:run-legacy:AAPL:deterministic:none:attempt-1:2026-07-01"
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-legacy-1', ?, 'deterministic', '0', 500, 300, 0, 'SETTLED', '0', 100, 90, 0, 0, "
+        "'RESEARCH_COST', ?, ?)",
+        (legacy_key, "2026-07-01T12:00:00+00:00", "2026-07-01T12:05:00+00:00"),
+    )
+    conn.commit()
+
+    result = migrate_legacy_token_reservations(conn, clock=_clock)
+    assert result.migrated_reservation_ids == ("resv-legacy-1",)
+    assert result.conflicts == ()
+
+    row = load_budget_reservation(conn, "resv-legacy-1")
+    assert row["reservation_kind"] == RESEARCH_TOKEN_RESERVATION_KIND
+    assert row["budget_date"] == "2026-07-01"
+    assert row["token_accounting_policy"] == TOKEN_ACCOUNTING_REASONING_INCLUDED_IN_OUTPUT
+    assert row["reserved_output_tokens"] == 300  # combined allowance preserved exactly
+    assert row["reserved_reasoning_tokens"] == 0
+
+
+def test_migration_is_idempotent(tmp_path):
+    conn = _db(tmp_path)
+    legacy_key = "research_token_budget:run-legacy-2:AAPL:deterministic:none:attempt-1:2026-07-01"
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-legacy-2', ?, 'deterministic', '0', 500, 300, 0, 'RESERVED', '0', 0, 0, 0, 0, "
+        "'RESEARCH_COST', ?, NULL)",
+        (legacy_key, "2026-07-01T12:00:00+00:00"),
+    )
+    conn.commit()
+
+    first = migrate_legacy_token_reservations(conn, clock=_clock)
+    assert first.migrated_reservation_ids == ("resv-legacy-2",)
+    second = migrate_legacy_token_reservations(conn, clock=_clock)
+    assert second.migrated_reservation_ids == ()
+    assert second.already_migrated_reservation_ids == ("resv-legacy-2",)
+    assert second.conflicts == ()
+
+
+def test_migration_leaves_cost_reservations_untouched(tmp_path):
+    conn = _db(tmp_path)
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-cost-1', 'cost:run-x:AAPL', 'deterministic', '1.50', 0, 0, 0, 'SETTLED', '1.50', 0, 0, 0, "
+        "0, 'RESEARCH_COST', ?, ?)",
+        ("2026-07-01T12:00:00+00:00", "2026-07-01T12:05:00+00:00"),
+    )
+    conn.commit()
+    result = migrate_legacy_token_reservations(conn, clock=_clock)
+    assert result.migrated_reservation_ids == ()
+    row = load_budget_reservation(conn, "resv-cost-1")
+    assert row["reservation_kind"] == "RESEARCH_COST"
+    assert row["budget_date"] is None

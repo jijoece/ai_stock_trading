@@ -830,10 +830,22 @@ def run_research_cli(snapshot_id: str, provider_name: str, db_path: Path) -> dic
             return {"error": f"unknown provider {provider_name!r}"}
 
         repo = SQLiteResearchRepository(conn)
+        token_budget_controller = None
+        if research_config.daily_token_cap is not None:
+            from .research.token_budget import PersistentResearchTokenBudgetController
+
+            token_budget_controller = PersistentResearchTokenBudgetController(
+                conn=conn, daily_token_cap=research_config.daily_token_cap,
+                maximum_reasoning_tokens=research_config.token_budget_maximum_reasoning_tokens,
+                token_accounting_policy=research_config.token_budget_accounting_policy,
+                clock=lambda: datetime.now(timezone.utc),
+            )
         result = analyze_with_research_committee(
             snapshot, provider=provider, provider_name=provider_name, model_name=model_name,
             prompt_registry=PromptRegistry(), research_repository=repo, configuration=research_config,
             clock=lambda: datetime.now(timezone.utc), run_mode=provider_name,
+            token_budget_controller=token_budget_controller,
+            token_budget_required=research_config.daily_token_cap is not None,
         )
 
     return {
@@ -1380,6 +1392,26 @@ def fetch_evidence_cli(symbol: str, as_of_str: str | None, db_path: Path, provid
     }
 
 
+def _build_token_budget_controller_factory(research_config, conn):
+    """Per-symbol `ResearchTokenBudgetController` factory for scheduled-cycle
+    CLI paths (docs/milestones/26.md A1). Returns `None` (legacy direct-
+    invocation path preserved) unless `research.token_budget.daily_token_cap`
+    is explicitly configured — never hard-codes a production cap."""
+    if research_config.daily_token_cap is None:
+        return None
+    from .research.token_budget import PersistentResearchTokenBudgetController
+
+    def factory(symbol: str):
+        return PersistentResearchTokenBudgetController(
+            conn=conn, daily_token_cap=research_config.daily_token_cap,
+            maximum_reasoning_tokens=research_config.token_budget_maximum_reasoning_tokens,
+            token_accounting_policy=research_config.token_budget_accounting_policy,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+
+    return factory
+
+
 def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, symbols: list[str] | None) -> dict:
     """`run-research-cycle` CLI command (Milestone 6). `--provider-mode
     fixture` (offline) is available by default; `--provider-mode real`
@@ -1431,6 +1463,7 @@ def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, sy
                 as_of=as_of, maximum_price_age_seconds=0,
             ),
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
+            token_budget_controller_factory=_build_token_budget_controller_factory(research_config, conn),
         )
 
     return {
@@ -1497,6 +1530,7 @@ def resume_research_cycle_cli(cycle_id: str, db_path: Path) -> dict:
                 as_of=as_of, maximum_price_age_seconds=0,
             ),
             paper_submitter=None, clock=lambda: datetime.now(timezone.utc), git_sha=_git_sha(),
+            token_budget_controller_factory=_build_token_budget_controller_factory(research_config, conn),
         )
 
     return {
