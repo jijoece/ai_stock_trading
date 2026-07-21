@@ -1464,6 +1464,26 @@ def _build_token_budget_controller_factory(research_config, conn):
     return factory
 
 
+def recover_expired_token_claims_cli(db_path: Path) -> dict:
+    """`recover-expired-token-claims` CLI command (docs/milestones/28.md B4):
+    bounded operator visibility into expired provider-attempt claim
+    recovery. `reserve_research_tokens` already performs this recovery
+    atomically, scoped to the exact provider attempt it is about to
+    reserve, before ever creating a new reservation — this command exists
+    only so an operator can inspect/force recovery across every reservation
+    without invoking a provider, settling, or releasing usage, or retrying
+    research."""
+    from .strategies.research_budget import recover_expired_token_claims
+
+    with session(db_path) as conn:
+        recovered_reservation_ids = recover_expired_token_claims(conn, now=datetime.now(timezone.utc))
+
+    return {
+        "recovered_count": len(recovered_reservation_ids),
+        "recovered_reservation_ids": list(recovered_reservation_ids),
+    }
+
+
 def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, symbols: list[str] | None) -> dict:
     """`run-research-cycle` CLI command (Milestone 6). `--provider-mode
     fixture` (offline) is available by default; `--provider-mode real`
@@ -2757,6 +2777,13 @@ def main(argv: list[str] | None = None) -> int:
     p_resume_cycle = sub.add_parser("resume-research-cycle", help="Resume a previously started scheduled research cycle by cycle_id (Milestone 6)")
     p_resume_cycle.add_argument("--cycle-id", required=True)
 
+    sub.add_parser(
+        "recover-expired-token-claims",
+        help="Bounded operator visibility into expired provider-attempt token claims — transitions "
+             "expired IN_FLIGHT reservations to AMBIGUOUS; never invokes a provider, settles, releases, "
+             "or retries research (docs/milestones/28.md B4)",
+    )
+
     p_eval_cycle = sub.add_parser("evaluate-research-cycle", help="Compute forward-performance evaluations for every recommendation a cycle produced (Milestone 6)")
     p_eval_cycle.add_argument("--cycle-id", required=True)
 
@@ -3277,6 +3304,12 @@ def main(argv: list[str] | None = None) -> int:
         outcome = resume_research_cycle_cli(args.cycle_id, cfg.research_database_path)
         print(json.dumps(outcome, indent=2, default=str))
         return 0 if "error" not in outcome else 2
+
+    if args.command == "recover-expired-token-claims":
+        cfg = load_config()
+        outcome = recover_expired_token_claims_cli(cfg.research_database_path)
+        print(json.dumps(outcome, indent=2, default=str))
+        return 0
 
     if args.command == "evaluate-research-cycle":
         cfg = load_config()
