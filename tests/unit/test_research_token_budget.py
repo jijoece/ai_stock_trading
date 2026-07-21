@@ -6,6 +6,7 @@ import pytest
 
 from trading_research.storage.database import connect
 from trading_research.storage.shadow_operations_repositories import (
+    list_budget_reservations,
     list_token_budget_reconciliations,
     load_budget_reservation,
 )
@@ -16,12 +17,16 @@ from trading_research.research.models import (
 )
 from trading_research.strategies.research_budget import (
     RESEARCH_TOKEN_RESERVATION_KIND,
+    TOKEN_RESERVATION_AMBIGUOUS,
+    TOKEN_RESERVATION_IN_FLIGHT,
     ResearchTokenReservation,
     TokenBudgetError,
     TokenBudgetRejected,
+    claim_research_token_attempt,
     mark_research_tokens_ambiguous,
     migrate_legacy_token_reservations,
     reconcile_ambiguous_research_tokens,
+    recover_expired_token_claims,
     release_research_tokens,
     reserve_research_tokens,
     settle_research_tokens,
@@ -522,3 +527,218 @@ def test_migration_leaves_cost_reservations_untouched(tmp_path):
     row = load_budget_reservation(conn, "resv-cost-1")
     assert row["reservation_kind"] == "RESEARCH_COST"
     assert row["budget_date"] is None
+
+
+# --- Milestone 27 A1: fenced provider-attempt claim ------------------------------
+
+
+def test_claim_transitions_reserved_to_in_flight(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    assert claim.status == "CLAIMED"
+    assert claim.claim_generation == 1
+    row = load_budget_reservation(conn, reservation.reservation_id)
+    assert row["status"] == TOKEN_RESERVATION_IN_FLIGHT
+    assert row["claim_owner"] == "owner-1"
+
+
+def test_second_claim_on_in_flight_reservation_is_rejected(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    first = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    assert first.status == "CLAIMED"
+    second = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock())
+    assert second.status == "ALREADY_IN_FLIGHT"
+
+
+def test_claim_on_settled_reservation_is_a_state_conflict(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", _clock(), _clock())
+    settle_research_tokens(
+        conn, reservation.reservation_id, actual_input_tokens=1, actual_output_tokens=1, clock=_clock,
+        claim_owner="owner-1", claim_generation=claim.claim_generation,
+    )
+    stale = claim_research_token_attempt(conn, reservation.reservation_id, "owner-2", _clock(), _clock())
+    assert stale.status == "STATE_CONFLICT"
+
+
+def test_two_concurrent_claims_on_the_same_reservation_have_exactly_one_winner(tmp_path):
+    """One reservation must authorize exactly one provider call
+    (docs/milestones/27.md A1/A3): both workers reuse the same idempotency
+    key/reservation, but only one may win the fenced RESERVED -> IN_FLIGHT
+    claim."""
+    db_path = tmp_path / "claim-race.sqlite3"
+    setup_conn = connect(db_path)
+    reservation = _reserve(setup_conn)
+    setup_conn.close()
+
+    def claim_as(owner):
+        conn = connect(db_path)
+        try:
+            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock())
+        finally:
+            conn.close()
+
+    barrier = Barrier(2)
+
+    def run(owner):
+        conn = connect(db_path)
+        barrier.wait()
+        try:
+            return claim_research_token_attempt(conn, reservation.reservation_id, owner, _clock(), _clock())
+        finally:
+            conn.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = [future.result() for future in (
+            pool.submit(run, "owner-a"), pool.submit(run, "owner-b"),
+        )]
+    assert sum(outcome.status == "CLAIMED" for outcome in outcomes) == 1
+    assert sum(outcome.status == "ALREADY_IN_FLIGHT" for outcome in outcomes) == 1
+
+    final_conn = connect(db_path)
+    assert len(list_budget_reservations(final_conn)) == 1
+
+
+def test_expired_claim_recovers_to_ambiguous_not_auto_retried(tmp_path):
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    claimed_at = _clock()
+    expires_at = claimed_at + timedelta(seconds=1)
+    claim_research_token_attempt(conn, reservation.reservation_id, "owner-1", claimed_at, expires_at)
+
+    after_expiry = expires_at + timedelta(seconds=1)
+    recovered = recover_expired_token_claims(conn, now=after_expiry)
+    assert recovered == (reservation.reservation_id,)
+    row = load_budget_reservation(conn, reservation.reservation_id)
+    assert row["status"] == TOKEN_RESERVATION_AMBIGUOUS
+
+    # Idempotent: nothing left to recover on a second pass.
+    assert recover_expired_token_claims(conn, now=after_expiry) == ()
+
+
+def test_stale_claim_owner_cannot_settle_after_expiry_recovery(tmp_path):
+    """docs/milestones/27.md A3 "Stale worker fencing": worker A claims
+    generation 1; the claim expires; recovery moves the reservation to
+    AMBIGUOUS; worker A's later settlement attempt is rejected and the
+    reservation remains AMBIGUOUS."""
+    conn = _db(tmp_path)
+    reservation = _reserve(conn)
+    claimed_at = _clock()
+    expires_at = claimed_at + timedelta(seconds=1)
+    claim = claim_research_token_attempt(conn, reservation.reservation_id, "owner-a", claimed_at, expires_at)
+
+    recover_expired_token_claims(conn, now=expires_at + timedelta(seconds=1))
+    row = load_budget_reservation(conn, reservation.reservation_id)
+    assert row["status"] == TOKEN_RESERVATION_AMBIGUOUS
+
+    with pytest.raises(TokenBudgetError) as excinfo:
+        settle_research_tokens(
+            conn, reservation.reservation_id, actual_input_tokens=1, actual_output_tokens=1, clock=_clock,
+            claim_owner="owner-a", claim_generation=claim.claim_generation,
+        )
+    assert excinfo.value.code == "TOKEN_RESERVATION_STATE_CONFLICT"
+    row_after = load_budget_reservation(conn, reservation.reservation_id)
+    assert row_after["status"] == TOKEN_RESERVATION_AMBIGUOUS
+
+
+# --- Milestone 27 A2: automatic legacy token migration at startup ----------------
+
+
+def test_startup_migration_runs_automatically_without_manual_call(tmp_path):
+    db_path = tmp_path / "startup-legacy.sqlite3"
+    conn = connect(db_path)
+    legacy_key = "research_token_budget:run-startup:AAPL:deterministic:none:attempt-1:2026-07-01"
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-startup-legacy', ?, 'deterministic', '0', 500, 300, 0, 'SETTLED', '0', 100, 90, 0, 0, "
+        "'RESEARCH_COST', ?, ?)",
+        (legacy_key, "2026-07-01T12:00:00+00:00", "2026-07-01T12:05:00+00:00"),
+    )
+    conn.commit()
+    # Simulate a database that predates Milestone 27's migration 12 (the
+    # legacy row already existed; migration 12 has never run against it).
+    conn.execute("DELETE FROM schema_version WHERE version = 12")
+    conn.commit()
+    conn.close()
+
+    reopened = connect(db_path)
+    row = load_budget_reservation(reopened, "resv-startup-legacy")
+    assert row["reservation_kind"] == RESEARCH_TOKEN_RESERVATION_KIND
+    assert row["budget_date"] == "2026-07-01"
+    live_reserved = _live_tokens_reserved_for_date_via_reserve(reopened)
+    assert live_reserved > 0  # counts against the daily cap without a manual migration call
+    reopened.close()
+
+    # Reopening again must not rewrite or double-count the already-migrated row.
+    reopened_again = connect(db_path)
+    row_again = load_budget_reservation(reopened_again, "resv-startup-legacy")
+    assert row_again["reservation_kind"] == RESEARCH_TOKEN_RESERVATION_KIND
+    assert row_again["budget_date"] == "2026-07-01"
+    assert len(list_budget_reservations(reopened_again)) == 1
+
+
+def _live_tokens_reserved_for_date_via_reserve(conn) -> int:
+    """A settled RESEARCH_TOKENS row still counts against the daily cap --
+    prove it the same way `reserve_research_tokens` would, by attempting a
+    reservation on the migrated row's own budget date (2026-07-01) that
+    would overshoot unless the migrated row is counted."""
+    probe_clock = lambda: datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+    rejected = reserve_research_tokens(
+        conn, research_run_id="run-cap-probe", symbol="MSFT", provider="deterministic", model_name=None,
+        estimated_input_tokens=700, maximum_output_tokens=0, maximum_reasoning_tokens=0,
+        daily_token_cap=800, clock=probe_clock, research_attempt_identity="attempt-1",
+    )
+    assert isinstance(rejected, TokenBudgetRejected)
+    return rejected.remaining_tokens
+
+
+def test_startup_migration_conflict_blocks_connect_with_no_partial_rows(tmp_path):
+    db_path = tmp_path / "startup-legacy-conflict.sqlite3"
+    conn = connect(db_path)
+    good_key = "research_token_budget:run-good:AAPL:deterministic:none:attempt-1:2026-07-01"
+    bad_key = "research_token_budget:run-bad:AAPL:deterministic:none:attempt-1:not-a-date"
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-good', ?, 'deterministic', '0', 500, 300, 0, 'SETTLED', '0', 100, 90, 0, 0, "
+        "'RESEARCH_COST', ?, ?)",
+        (good_key, "2026-07-01T12:00:00+00:00", "2026-07-01T12:05:00+00:00"),
+    )
+    conn.execute(
+        "INSERT INTO shadow_budget_reservations "
+        "(reservation_id, idempotency_key, cycle_intent, reserved_estimated_cost_usd, reserved_input_tokens, "
+        "reserved_output_tokens, reserved_latency_seconds, status, consumed_cost_usd, consumed_input_tokens, "
+        "consumed_output_tokens, consumed_latency_seconds, emergency_margin_breached, reservation_kind, "
+        "created_at, settled_at) "
+        "VALUES ('resv-bad', ?, 'deterministic', '0', 500, 300, 0, 'SETTLED', '0', 100, 90, 0, 0, "
+        "'RESEARCH_COST', ?, NULL)",
+        # Naive (non-tz-aware) created_at: `_legacy_budget_date` cannot derive a
+        # budget date from it, and the key's own date suffix ("not-a-date") is
+        # unparseable too, so this row is an unresolvable migration conflict.
+        (bad_key, "2026-07-01T12:00:00"),
+    )
+    conn.commit()
+    conn.execute("DELETE FROM schema_version WHERE version = 12")
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(TokenBudgetError) as excinfo:
+        connect(db_path)
+    assert excinfo.value.code == "TOKEN_MIGRATION_CONFLICT"
+
+    import sqlite3
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    good_row = raw.execute("SELECT * FROM shadow_budget_reservations WHERE reservation_id = 'resv-good'").fetchone()
+    assert good_row["reservation_kind"] == "RESEARCH_COST"  # rolled back, not partially migrated
+    raw.close()
