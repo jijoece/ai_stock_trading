@@ -23,6 +23,7 @@ from ..storage.shadow_operations_repositories import (
     insert_token_budget_reconciliation,
 )
 from ..storage.transactions import transaction
+from ..utc import TimestampError, canonical_utc, canonical_utc_iso
 from .config import ShortlistConfig
 from .selector import ShortlistEntry
 
@@ -129,6 +130,12 @@ _LIVE_TOKEN_STATUSES = (
     TOKEN_RESERVATION_RESERVED, TOKEN_RESERVATION_IN_FLIGHT,
     TOKEN_RESERVATION_SETTLED, TOKEN_RESERVATION_AMBIGUOUS,
 )
+_UNRESOLVED_PROVIDER_ATTEMPT_STATUSES = (TOKEN_RESERVATION_IN_FLIGHT, TOKEN_RESERVATION_AMBIGUOUS)
+
+# docs/milestones/28.md B5: bounded claim identity and lease duration —
+# never an unbounded owner string, never an unbounded lease.
+MAXIMUM_TOKEN_CLAIM_OWNER_LENGTH = 200
+MAXIMUM_TOKEN_CLAIM_LEASE_SECONDS = 3600
 
 Clock = Callable[[], datetime]
 
@@ -309,26 +316,62 @@ def reserve_research_tokens(
                 )
             return _reservation_from_row(existing)
         # Stable provider-attempt identity (research_run_id, symbol, provider,
-        # model) — deliberately excludes the UTC budget-date suffix so an
-        # unresolved AMBIGUOUS reservation from a prior date still blocks a
-        # retry today (docs/milestones/26.md A2: "An unresolved July 19
-        # attempt can therefore be retried on July 20 under a new
-        # reservation" was the bug). Matches on the run/symbol/provider/model
-        # rather than the specific attempt_number: an unresolved ambiguity
-        # anywhere in this research run's provider work must block every
-        # further attempt for it, not just a retry of the exact same attempt
-        # number — this is unchanged, pre-existing blocking scope.
+        # model, role) — deliberately excludes the UTC budget-date suffix so
+        # an unresolved reservation from a prior date still blocks a retry
+        # today (docs/milestones/26.md A2 / docs/milestones/28.md B1-B2:
+        # "An unresolved July 19 attempt can therefore be retried on July 20
+        # under a new reservation" was the bug — including for a still-live
+        # IN_FLIGHT claim, not just AMBIGUOUS). Scoped to the role (the part
+        # of `research_attempt_identity` before its first ":", e.g.
+        # "fundamental" out of "fundamental:1") rather than the specific
+        # attempt_number: an unresolved attempt anywhere in this role's
+        # provider work must block every further attempt for it, not just a
+        # retry of the exact same attempt number — but a different role
+        # (e.g. "technical") is a genuinely different provider attempt and
+        # must never be conflated by a broader string-prefix match
+        # (docs/milestones/28.md B7 "exact attempt scoping").
+        provider_attempt_role = research_attempt_identity.split(":", 1)[0]
         provider_attempt_key = (
             f"{RESEARCH_TOKEN_RESERVATION_PREFIX}:{research_run_id}:{symbol}:{provider}:"
-            f"{model_name or 'none'}:"
+            f"{model_name or 'none'}:{provider_attempt_role}:"
         )
+        # docs/milestones/28.md B3: recover any expired IN_FLIGHT claim for
+        # this exact provider attempt atomically, in the same transaction
+        # that will decide whether a new reservation may be created — never
+        # a separate recovery transaction followed by an unprotected
+        # reservation race. A still-live (non-expired) IN_FLIGHT claim is
+        # left untouched and continues to block below.
+        for row in list_budget_reservations(conn):
+            if (
+                row.get("reservation_kind") != RESEARCH_TOKEN_RESERVATION_KIND
+                or not row["idempotency_key"].startswith(provider_attempt_key)
+                or row["status"] != TOKEN_RESERVATION_IN_FLIGHT
+                or row.get("claim_expires_at") is None
+                or row["claim_expires_at"] >= now.isoformat()
+            ):
+                continue
+            conn.execute(
+                "UPDATE shadow_budget_reservations SET status = ? "
+                "WHERE reservation_id = ? AND status = ? AND claim_owner = ? AND claim_generation = ?",
+                (
+                    TOKEN_RESERVATION_AMBIGUOUS, row["reservation_id"], TOKEN_RESERVATION_IN_FLIGHT,
+                    row["claim_owner"], row["claim_generation"],
+                ),
+            )
         unresolved = next((
             row for row in list_budget_reservations(conn)
             if row.get("reservation_kind") == RESEARCH_TOKEN_RESERVATION_KIND
-            and row["status"] == TOKEN_RESERVATION_AMBIGUOUS
+            and row["status"] in _UNRESOLVED_PROVIDER_ATTEMPT_STATUSES
             and row["idempotency_key"].startswith(provider_attempt_key)
         ), None)
         if unresolved is not None:
+            if unresolved["status"] == TOKEN_RESERVATION_IN_FLIGHT:
+                return TokenBudgetRejected(
+                    idempotency_key=key,
+                    reason="a provider attempt is already in flight for this reservation",
+                    remaining_tokens=0, requested_tokens=requested_total,
+                    code="TOKEN_ATTEMPT_ALREADY_IN_FLIGHT",
+                )
             return TokenBudgetRejected(
                 idempotency_key=key,
                 reason="ambiguous token reservation requires operator reconciliation",
@@ -417,15 +460,33 @@ def claim_research_token_attempt(
     that flips exactly one row may invoke the provider. `owner_id` must be a
     bounded, generated identifier (never a machine username, credential, or
     raw process environment value)."""
-    if not owner_id:
-        raise TokenBudgetError("owner_id must be non-empty")
+    if not owner_id or len(owner_id) > MAXIMUM_TOKEN_CLAIM_OWNER_LENGTH:
+        raise TokenBudgetError(
+            f"owner_id must be non-empty and at most {MAXIMUM_TOKEN_CLAIM_OWNER_LENGTH} characters",
+            code="TOKEN_CLAIM_OWNER_INVALID",
+        )
+    try:
+        now = canonical_utc(now)
+        expires_at = canonical_utc(expires_at)
+    except TimestampError as exc:
+        raise TokenBudgetError(str(exc), code="TOKEN_CLAIM_TIMESTAMP_INVALID") from exc
+    lease_seconds = (expires_at - now).total_seconds()
+    if lease_seconds <= 0:
+        raise TokenBudgetError(
+            "claim_expires_at must be after now", code="TOKEN_CLAIM_TIMESTAMP_INVALID",
+        )
+    if lease_seconds > MAXIMUM_TOKEN_CLAIM_LEASE_SECONDS:
+        raise TokenBudgetError(
+            f"claim lease duration {lease_seconds}s exceeds maximum {MAXIMUM_TOKEN_CLAIM_LEASE_SECONDS}s",
+            code="TOKEN_CLAIM_TIMESTAMP_INVALID",
+        )
     with transaction(conn):
         cursor = conn.execute(
             "UPDATE shadow_budget_reservations SET status = ?, claim_owner = ?, "
             "claim_generation = claim_generation + 1, claimed_at = ?, claim_expires_at = ? "
             "WHERE reservation_id = ? AND status = ? AND reservation_kind = ?",
             (
-                TOKEN_RESERVATION_IN_FLIGHT, owner_id, now.isoformat(), expires_at.isoformat(),
+                TOKEN_RESERVATION_IN_FLIGHT, owner_id, canonical_utc_iso(now), canonical_utc_iso(expires_at),
                 reservation_id, TOKEN_RESERVATION_RESERVED, RESEARCH_TOKEN_RESERVATION_KIND,
             ),
         )
@@ -454,12 +515,16 @@ def recover_expired_token_claims(conn, *, now: datetime) -> tuple[str, ...]:
     (`IN_FLIGHT`) and claim-generation check as every other fenced
     transition, so a claim owner that renews/settles concurrently is never
     overwritten."""
+    try:
+        now = canonical_utc(now)
+    except TimestampError as exc:
+        raise TokenBudgetError(str(exc), code="TOKEN_CLAIM_TIMESTAMP_INVALID") from exc
     recovered: list[str] = []
     with transaction(conn):
         expired = conn.execute(
             "SELECT reservation_id, claim_owner, claim_generation FROM shadow_budget_reservations "
             "WHERE status = ? AND reservation_kind = ? AND claim_expires_at IS NOT NULL AND claim_expires_at < ?",
-            (TOKEN_RESERVATION_IN_FLIGHT, RESEARCH_TOKEN_RESERVATION_KIND, now.isoformat()),
+            (TOKEN_RESERVATION_IN_FLIGHT, RESEARCH_TOKEN_RESERVATION_KIND, canonical_utc_iso(now)),
         ).fetchall()
         for row in expired:
             cursor = conn.execute(
