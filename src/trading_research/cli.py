@@ -1339,40 +1339,81 @@ PORTFOLIO_MAXIMUM_POSITIONS_AGE_SECONDS = 300
 PORTFOLIO_MAXIMUM_POSITION_PRICE_AGE_SECONDS = 300
 
 
-def _build_portfolio_state(provider_mode: str, conn, as_of):
+def _select_real_mode_book_id(config_path: str | Path | None = None) -> str | None:
+    """The one authoritative, already-configured paper book for real-mode
+    portfolio reads (docs/milestones/28.md A5). Returns `None` — never an
+    arbitrary guess — when paper books are disabled, when zero books are
+    enabled, or when more than one book is enabled (ambiguous)."""
+    from .paper_books.config import load_paper_books_config
+
+    try:
+        paper_books_config = load_paper_books_config(config_path)
+    except Exception:
+        return None
+    if not paper_books_config.enabled:
+        return None
+    enabled_book_ids = [
+        book.book_id
+        for book in (paper_books_config.baseline, paper_books_config.enhanced)
+        if paper_books_config.is_book_enabled(book.book_id)
+    ]
+    if len(enabled_book_ids) != 1:
+        return None
+    return enabled_book_ids[0]
+
+
+def _build_portfolio_state(provider_mode: str, conn, as_of, *, clock=None):
     """Build the one authoritative `PortfolioState` for a research cycle
-    (docs/milestones/26.md B3/B7) — called once per cycle and reused for
-    every candidate symbol by `run_scheduled_research_cycle`, never
-    fetched or synthesized per-symbol.
+    (docs/milestones/26.md B3/B7, docs/milestones/28.md PR A) — called once
+    per cycle and reused for every candidate symbol by
+    `run_scheduled_research_cycle`, never fetched or synthesized per-symbol.
 
     Fixture mode uses an explicit, clearly-labeled fixture snapshot. Real
-    mode reads the local paper-book ledger, the one authoritative portfolio
-    source already present in this repository; when it cannot prove a
-    verified, complete, fresh snapshot, the resulting `PortfolioState` has
-    `symbol_exposure_complete=False` rather than a fabricated account —
-    `strategies/selector.py` already excludes candidates on that signal.
+    mode reads the authoritative book-scoped paper-book position/cash-ledger
+    state for the one configured book (never the legacy singleton
+    `paper/ledger.py::PaperLedger`, which would seed a synthetic $100,000
+    account); when it cannot prove a verified, complete, fresh snapshot, the
+    resulting `PortfolioState` has `symbol_exposure_complete=False` rather
+    than a fabricated account — `strategies/selector.py` already excludes
+    candidates on that signal.
+
+    `clock`, when passed, is the same instant the caller is treating as
+    "now" for this cycle (a fresh/live cycle's own `as_of`) — this makes the
+    account-read timestamp coincide with the evaluation timestamp instead of
+    drifting a few milliseconds later, which would otherwise spuriously
+    fail the current-cycle freshness proof. `resume_research_cycle_cli`
+    intentionally omits it: a resumed cycle's `as_of` is the *original*,
+    potentially stale, cycle timestamp, and the real read clock must be used
+    so a materially later read correctly fails closed
+    (`historical_portfolio_snapshot_unavailable`) instead of relabeling
+    today's account as the earlier cycle's state.
     """
     from .evidence_providers.portfolio_context import (
-        LedgerPortfolioAccountSnapshotProvider,
+        BookScopedPortfolioAccountSnapshotProvider,
         fixture_portfolio_account_snapshot,
+        unverified_portfolio_account_snapshot,
     )
     from .models.trading_models import build_portfolio_state
-    from .paper.ledger import PaperLedger
     from .research.scheduled_cycle import PROVIDER_MODE_FIXTURE
 
     if provider_mode == PROVIDER_MODE_FIXTURE:
         snapshot = fixture_portfolio_account_snapshot(as_of)
     else:
-        try:
-            snapshot = LedgerPortfolioAccountSnapshotProvider(PaperLedger(conn)).fetch(as_of)
-        except Exception:
-            # No authoritative portfolio source available (docs/milestones/26.md
-            # B3) — fail closed to an unverified snapshot, never a fabricated
-            # account. `build_portfolio_state` below turns this into
-            # `symbol_exposure_complete=False`.
-            from .evidence_providers.portfolio_context import unverified_portfolio_account_snapshot
-
-            snapshot = unverified_portfolio_account_snapshot()
+        book_id = _select_real_mode_book_id()
+        if book_id is None:
+            snapshot = unverified_portfolio_account_snapshot(source="paper_book")
+        else:
+            try:
+                provider = BookScopedPortfolioAccountSnapshotProvider(
+                    conn, book_id=book_id, clock=clock or (lambda: datetime.now(timezone.utc)),
+                )
+                snapshot = provider.fetch(as_of)
+            except Exception:
+                # No authoritative portfolio source available (docs/milestones/26.md
+                # B3) — fail closed to an unverified snapshot, never a fabricated
+                # account. `build_portfolio_state` below turns this into
+                # `symbol_exposure_complete=False`.
+                snapshot = unverified_portfolio_account_snapshot(source="paper_book")
     return build_portfolio_state(
         snapshot, as_of=as_of,
         maximum_account_age_seconds=PORTFOLIO_MAXIMUM_ACCOUNT_AGE_SECONDS,
@@ -1502,10 +1543,13 @@ def run_research_cycle_cli(as_of_str: str, db_path: Path, provider_mode: str, sy
         from .universe.tickers import default_universe
 
         registry, used_providers = _build_evidence_provider_registry(provider_mode, cfg=load_config(), conn=conn)
-        # docs/milestones/26.md B3/B7: built once per cycle from the
-        # authoritative source for `provider_mode` and reused for every
-        # candidate symbol — never a fabricated $100,000 account.
-        portfolio = _build_portfolio_state(provider_mode, conn, as_of)
+        # docs/milestones/26.md B3/B7, docs/milestones/28.md A4: built once
+        # per cycle from the authoritative source for `provider_mode` and
+        # reused for every candidate symbol — never a fabricated $100,000
+        # account. `clock=lambda: as_of` treats this fresh cycle's `as_of`
+        # as "now" so the account read coincides with the evaluation
+        # instant rather than drifting a moment later.
+        portfolio = _build_portfolio_state(provider_mode, conn, as_of, clock=lambda: as_of)
         result = run_scheduled_research_cycle(
             as_of=as_of, symbols=candidate_symbols, configuration=cycle_config, conn=conn,
             cycle_repository=SQLiteResearchCycleRepository(conn), universe=default_universe(),
@@ -1927,10 +1971,13 @@ def run_due_shadow_cycle_cli(
             research_provider_name=research_provider_name, research_model_name=research_model_name,
             research_configuration=research_config, research_repository=SQLiteResearchRepository(conn),
             prompt_registry=PromptRegistry(),
-            # docs/milestones/26.md B3/B7: built once per due cycle from the
-            # authoritative source for `provider_mode` and reused for every
-            # candidate symbol — never a fabricated $100,000 account.
-            portfolio=_build_portfolio_state(provider_mode, conn, as_of),
+            # docs/milestones/26.md B3/B7, docs/milestones/28.md A4: built
+            # once per due cycle from the authoritative source for
+            # `provider_mode` and reused for every candidate symbol — never
+            # a fabricated $100,000 account. `clock=lambda: as_of` treats
+            # this fresh due cycle's `as_of` as "now" (see
+            # `_build_portfolio_state`'s docstring).
+            portfolio=_build_portfolio_state(provider_mode, conn, as_of, clock=lambda: as_of),
             paper_submitter=None, git_sha=_git_sha(),
         )
 

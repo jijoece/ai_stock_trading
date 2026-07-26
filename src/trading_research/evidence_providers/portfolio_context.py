@@ -13,18 +13,23 @@ ledger has none to redact — it is a single local simulated account).
 """
 from __future__ import annotations
 
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable
 
 from ..models.trading_models import PortfolioAccountSnapshot, PortfolioPositionSnapshot
 from ..paper.ledger import PaperLedger
+from ..paper_books import cash_ledger as book_cash_ledger
+from ..storage import paper_books_repositories as book_repo
 
 FIXTURE_ACCOUNT_IDENTITY = "fixture:local"
 LEDGER_ACCOUNT_IDENTITY = "paper_ledger:local"
 
 SOURCE_FIXTURE = "fixture"
 SOURCE_PAPER_LEDGER = "paper_ledger"
+SOURCE_PAPER_BOOK = "paper_book"
 SOURCE_UNKNOWN = "unknown"
 
 
@@ -40,13 +45,33 @@ def fixture_portfolio_account_snapshot(as_of: datetime) -> PortfolioAccountSnaps
     )
 
 
-def unverified_portfolio_account_snapshot() -> PortfolioAccountSnapshot:
+def unverified_portfolio_account_snapshot(source: str = SOURCE_PAPER_LEDGER) -> PortfolioAccountSnapshot:
     return PortfolioAccountSnapshot(
         account_equity=None, settled_cash=None, account_as_of=None, positions={},
         positions_as_of=None, account_identity=None, account_verified=False,
         account_query_complete=False, positions_query_complete=False,
-        source=SOURCE_PAPER_LEDGER,
+        source=source,
     )
+
+
+def book_account_identity(book_id: str) -> str:
+    """Bounded, non-broker-identifying account identity (docs/milestones/28.md
+    A2) — never a raw broker account id, never the shared legacy
+    `paper_ledger:local` identity that conflated every real-mode read."""
+    return f"paper_book:{book_id}"
+
+
+@contextmanager
+def _book_scoped_read_transaction(conn: sqlite3.Connection):
+    """Narrowly scoped read-only transaction (docs/milestones/28.md A3): reads
+    cash and positions from one consistent database snapshot and never
+    commits — the transaction is always rolled back, so this can never
+    persist a write even if a future edit accidentally introduces one."""
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.rollback()
 
 
 class LedgerPortfolioAccountSnapshotProvider:
@@ -108,6 +133,89 @@ class LedgerPortfolioAccountSnapshotProvider:
             account_query_complete=True, positions_query_complete=True,
             source=SOURCE_PAPER_LEDGER,
         )
+
+
+class BookScopedPortfolioAccountSnapshotProvider:
+    """Real-mode authoritative account-snapshot source (docs/milestones/28.md
+    PR A) — reads the same book-scoped position/cash-ledger state used by
+    external-paper fills and paper-book risk validation, instead of the
+    legacy singleton `paper/ledger.py::PaperLedger`.
+
+    Strictly read-only: never constructs `PaperLedger`, never seeds cash,
+    never settles, never commits. Requires an explicit `book_id` and requires
+    that book to already exist (opened by `paper_books/cash_ledger.py::open_book`
+    through the normal paper-book lifecycle) — an uninitialized book yields an
+    unverified snapshot rather than a synthetic account.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        book_id: str,
+        clock: Callable[[], datetime] | None = None,
+        maximum_query_age_seconds: int = 300,
+    ):
+        self._conn = conn
+        self._book_id = book_id
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._maximum_query_age_seconds = maximum_query_age_seconds
+
+    def fetch(self, as_of: datetime) -> PortfolioAccountSnapshot:
+        retrieved_at = self._clock()
+        if (
+            as_of.tzinfo is None
+            or as_of > retrieved_at
+            or (retrieved_at - as_of).total_seconds() > self._maximum_query_age_seconds
+        ):
+            return unverified_portfolio_account_snapshot(source=SOURCE_PAPER_BOOK)
+
+        try:
+            with _book_scoped_read_transaction(self._conn):
+                if not book_repo.book_exists(self._conn, self._book_id):
+                    return unverified_portfolio_account_snapshot(source=SOURCE_PAPER_BOOK)
+                settled = book_cash_ledger.settled_cash(self._conn, self._book_id)
+                positions = book_repo.list_positions(self._conn, self._book_id, open_only=True)
+        except Exception:
+            return unverified_portfolio_account_snapshot(source=SOURCE_PAPER_BOOK)  # fail closed, never fabricated
+
+        position_snapshots: dict[str, PortfolioPositionSnapshot] = {}
+        for p in positions:
+            quantity = int(Decimal(p["quantity"]))
+            if quantity <= 0:
+                continue
+            price_raw = p["latest_valuation_price"]
+            market_price = Decimal(price_raw) if price_raw is not None else None
+            timestamp_raw = p["valuation_timestamp"]
+            price_as_of = _parse_utc_timestamp(timestamp_raw) if timestamp_raw else None
+            position_snapshots[p["symbol"]] = PortfolioPositionSnapshot(
+                quantity=quantity, market_price=market_price, price_as_of=price_as_of,
+            )
+
+        if not position_snapshots:
+            account_equity = settled
+        elif all(
+            ps.market_price is not None and ps.market_price > 0 for ps in position_snapshots.values()
+        ):
+            position_value = sum(
+                Decimal(ps.quantity) * ps.market_price for ps in position_snapshots.values()  # type: ignore[operator]
+            )
+            account_equity = settled + position_value
+        else:
+            account_equity = None  # docs/milestones/28.md A2: never mark equity complete without every mark
+
+        return PortfolioAccountSnapshot(
+            account_equity=account_equity, settled_cash=settled, account_as_of=retrieved_at,
+            positions=position_snapshots, positions_as_of=retrieved_at,
+            account_identity=book_account_identity(self._book_id), account_verified=True,
+            account_query_complete=True, positions_query_complete=True,
+            source=SOURCE_PAPER_BOOK,
+        )
+
+
+def _parse_utc_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 class LedgerPortfolioContextProvider:
